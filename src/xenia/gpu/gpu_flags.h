@@ -9,6 +9,7 @@
 
 #ifndef XENIA_GPU_GPU_FLAGS_H_
 #define XENIA_GPU_GPU_FLAGS_H_
+
 #include "xenia/base/cvar.h"
 
 DECLARE_path(trace_gpu_prefix);
@@ -29,11 +30,21 @@ DECLARE_bool(non_seamless_cube_map);
 
 DECLARE_bool(half_pixel_offset);
 
-DECLARE_int32(query_occlusion_sample_lower_threshold);
-
-DECLARE_int32(query_occlusion_sample_upper_threshold);
-
 DECLARE_bool(occlusion_query_enable);
+
+DECLARE_int32(occlusion_query_fake_lower_threshold);
+
+DECLARE_int32(occlusion_query_fake_upper_threshold);
+
+DECLARE_bool(occlusion_query_fast);
+
+DECLARE_int32(occlusion_query_fast_cached_delta);
+
+DECLARE_int32(occlusion_query_fast_sequence_grace);
+
+DECLARE_bool(occlusion_query_log);
+
+DECLARE_int32(occlusion_query_pool_size);
 
 void SetOcclusionQueryEnable(bool value);
 

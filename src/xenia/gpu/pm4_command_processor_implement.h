@@ -1146,14 +1146,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   return true;
 }
 
-static uint32_t samples = cvars::query_occlusion_sample_upper_threshold;
-
-#if !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = xe::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t event_type = initiator & 0x3F;
@@ -1166,36 +1161,90 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(event_type);
 
-  if (cvars::query_occlusion_sample_lower_threshold < 0) {
+  uint32_t report_address =
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  // Base of the BEGIN/END report pair in guest memory.
+  uint32_t report_record_base =
+      xe::gpu::XenosZPDReport::GetRecordBase(report_address);
+  xe_gpu_depth_sample_counts* end_report =
+      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+          report_record_base);
+
+  // Guest marks END by leaving the 0xFFFFFEED pending sentinel in the report.
+  bool guest_marks_end =
+      end_report && xe::gpu::XenosZPDReport::IsReportPending(end_report);
+
+  if (cvars::occlusion_query_enable && zpd_report_controller_) {
+    COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
+    if (COMMAND_PROCESSOR::IsHostZPDQueryPoolReady()) {
+      if (!report_record_base) {
+        return true;
+      }
+
+      bool logical_active = active_host_zpd_query_segment_.logical_active;
+
+      if (logical_active) {
+        // A new write ends the current logical report first. It ends the
+        // active lifetime or starts a new one if nothing is active.
+        COMMAND_PROCESSOR::EndGuestZPDReport(report_address, false);
+        return true;
+      }
+
+      // No active report and no pending END sentinel. Treat this as BEGIN.
+      if (!guest_marks_end) {
+        COMMAND_PROCESSOR::BeginGuestZPDReport(report_address);
+        return true;
+      }
+
+      if (COMMAND_PROCESSOR::IsFastZPDPathEnabled()) {
+        // Guest marked END, but there is no active logical report. Clear the
+        // pending state with a cached delta so polling code does not sit on
+        // the sentinel forever.
+        uint32_t cached_delta =
+            static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
+        {
+          std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+          auto existing_cached_delta =
+              fast_zpd_report_cached_values_.find(report_record_base);
+          if (existing_cached_delta != fast_zpd_report_cached_values_.end()) {
+            cached_delta = existing_cached_delta->second;
+          } else {
+            fast_zpd_report_cached_values_.emplace(report_record_base,
+                                                   cached_delta);
+          }
+        }
+
+        COMMAND_PROCESSOR::CommitGuestZPDReportData(0, report_record_base,
+                                                    cached_delta, false);
+      }
+      return true;
+    }
+
+    // Some titles handle an unavailable result better than a wait. Let the
+    // backend decide whether to drop this write.
+    if (COMMAND_PROCESSOR::ShouldDropHostZPDReportIfUnavailable()) {
+      return true;
+    }
+  }
+
+  // Fake sample count fallback.
+  if (cvars::occlusion_query_fake_lower_threshold < 0 || !report_record_base ||
+      !guest_marks_end) {
     return true;
   }
-  // Occlusion queries:
-  // This command is send on query begin and end.
-  // As a workaround report some fixed amount of passed samples.
-  auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
-  // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-  // and used to detect a finished query.
-  bool is_end_via_z_pass = pSampleCounts->ZPass_A == kQueryFinished &&
-                           pSampleCounts->ZPass_B == kQueryFinished;
-  // Older versions of D3D also checks for ZFail (4D5307D5).
-  bool is_end_via_z_fail = pSampleCounts->ZFail_A == kQueryFinished &&
-                           pSampleCounts->ZFail_B == kQueryFinished;
-  std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-  if (is_end_via_z_pass || is_end_via_z_fail) {
-    pSampleCounts->ZPass_A = samples;
-    pSampleCounts->Total_A = samples;
+
+  if (fake_zpd_sample_count_ <=
+      static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold)) {
+    fake_zpd_sample_count_ =
+        static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold);
+  } else {
+    --fake_zpd_sample_count_;
   }
 
-  samples =
-      samples <= static_cast<uint32_t>(
-                     cvars::query_occlusion_sample_lower_threshold)
-          ? static_cast<uint32_t>(cvars::query_occlusion_sample_upper_threshold)
-          : samples - 1;
-
+  // The result is ready. Write the sample count back to the report.
+  XenosZPDReport::WriteSampleCount(end_report, fake_zpd_sample_count_);
   return true;
 }
-#endif  // !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
     uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,
@@ -1287,9 +1336,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    bool viz_query_active =
-        viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z;
-    if (!viz_query_active || SupportsGuestOcclusionQueries()) {
+    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render

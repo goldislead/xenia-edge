@@ -22,11 +22,14 @@
 #include "xenia/emulator.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
+#include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_report_controller.h"
+#include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
@@ -143,63 +146,6 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
     return;
   }
   render_target_cache_->RestoreEdramSnapshot(snapshot);
-}
-
-void D3D12CommandProcessor::PrepareForWait() {
-  CheckSubmissionCompletion(0);
-  CommandProcessor::PrepareForWait();
-}
-
-void D3D12CommandProcessor::ReturnFromWait() {
-  CheckSubmissionCompletion(0);
-  CommandProcessor::ReturnFromWait();
-}
-
-bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(uint32_t packet,
-                                                               uint32_t count) {
-  if (!cvars::occlusion_query_enable || !occlusion_query_resources_available_) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet, count);
-  }
-
-  const uint32_t kQueryFinished = xe::byte_swap(0xFFFFFEED);
-  assert_true(count == 1);
-  uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
-  D3D12CommandProcessor::WriteEventInitiator(initiator & 0x3F);
-
-  // Get the current query ID from the PA_SC_VIZ_QUERY register
-  auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-
-  uint32_t sample_count_addr =
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  auto* sample_counts =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
-          sample_count_addr);
-  if (!sample_counts) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet, count);
-  }
-
-  bool is_end_via_z_pass = sample_counts->ZPass_A == kQueryFinished &&
-                           sample_counts->ZPass_B == kQueryFinished;
-  bool is_end_via_z_fail = sample_counts->ZFail_A == kQueryFinished &&
-                           sample_counts->ZFail_B == kQueryFinished;
-  bool is_end = is_end_via_z_pass || is_end_via_z_fail;
-
-  if (!is_end) {
-    if (!BeginGuestOcclusionQuery(sample_count_addr)) {
-      return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet,
-                                                                  count);
-    }
-    // Don't clear sample_counts here - the query is async and games may poll it
-    return true;
-  }
-
-  if (!EndGuestOcclusionQuery(sample_count_addr, sample_counts)) {
-    // Query failed - fall back to fake implementation
-    occlusion_query_stats_.queries_failed++;
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet, count);
-  }
-
-  return true;
 }
 
 bool D3D12CommandProcessor::PushTransitionBarrier(
@@ -1725,7 +1671,8 @@ bool D3D12CommandProcessor::SetupContext() {
                           uint32_t(SystemBindlessView::kGammaRampPWLSRV)));
   }
 
-  InitializeOcclusionQueryResources();
+  zpd_host_query_pool_ = std::make_unique<D3D12ZPDQueryPool>();
+  EnsureZPDHostQueryResources();
 
   pix_capture_requested_.store(false, std::memory_order_relaxed);
   pix_capturing_ = false;
@@ -1738,6 +1685,9 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+
+  ShutdownZPDHostQueryResources();
+  zpd_host_query_pool_.reset();
 
   for (auto& pair : readback_buffers_) {
     for (int i = 0; i < 2; i++) {
@@ -1760,8 +1710,6 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ui::d3d12::util::ReleaseAndNull(memexport_readback_buffer_);
   memexport_readback_buffer_size_ = 0;
-
-  ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
@@ -3824,8 +3772,7 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
 
   texture_cache_->CompletedSubmissionUpdated(completed_submission);
 
-  // Process async occlusion queries that completed
-  ProcessReadyOcclusionQueries(completed_submission);
+  ProcessCompletedHostZPDQueryResolves(completed_submission);
 }
 
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -3886,6 +3833,12 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // fulfilled).
     deferred_command_list_.Reset();
 
+    // Resume the active query segment.
+    if (cvars::occlusion_query_enable &&
+        active_host_zpd_query_segment_.logical_active) {
+      ResumeActiveHostZPDQuerySegment(false);
+    }
+
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3914,28 +3867,41 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
 
-    // Log occlusion query stats every 100 frames
-    if (cvars::occlusion_query_enable && occlusion_query_resources_available_ &&
-        frame_current_ - occlusion_query_stats_.last_log_frame >= 100) {
+    // Log report stats every 100 frames.
+    if (cvars::occlusion_query_enable && cvars::occlusion_query_log &&
+        zpd_host_query_pool_ && zpd_host_query_pool_->capacity() &&
+        zpd_report_controller_ &&
+        frame_current_ - guest_zpd_report_stats_.last_log_frame >= 100) {
+      XenosReportController::Stats report_stats =
+          zpd_report_controller_->stats();
       XELOGI(
           "Occlusion Query Stats (last 100 frames): "
-          "Begun={}, Ended={}, Failed={}, Sync={}, "
-          "CursorWraps={}, MaxCursor={}/{}",
-          occlusion_query_stats_.queries_begun,
-          occlusion_query_stats_.queries_ended,
-          occlusion_query_stats_.queries_failed,
-          occlusion_query_stats_.queries_resolved_sync,
-          occlusion_query_stats_.cursor_wraps,
-          occlusion_query_stats_.max_cursor_value, kMaxOcclusionQueries);
+          "LogicalBegun={}, LogicalEnded={}, SegBegun={}, SegEnded={}, "
+          "Resolved={}, ResolveDiscardedStale={}, WritesRetired={}, "
+          "WritesDiscardedStale={}, WritesSavedByGrace={}, "
+          "PoolExhausted={}, Failed={}",
+          guest_zpd_report_stats_.logical_begun,
+          guest_zpd_report_stats_.logical_ended,
+          guest_zpd_report_stats_.segments_begun,
+          guest_zpd_report_stats_.segments_ended,
+          guest_zpd_report_stats_.resolves_completed,
+          guest_zpd_report_stats_.resolves_discarded_stale,
+          report_stats.writes_retired, report_stats.writes_discarded_stale,
+          report_stats.writes_saved_by_grace,
+          guest_zpd_report_stats_.pool_exhausted,
+          guest_zpd_report_stats_.failed);
 
-      // Reset stats for next interval
-      occlusion_query_stats_.queries_begun = 0;
-      occlusion_query_stats_.queries_ended = 0;
-      occlusion_query_stats_.queries_failed = 0;
-      occlusion_query_stats_.queries_resolved_sync = 0;
-      occlusion_query_stats_.cursor_wraps = 0;
-      occlusion_query_stats_.max_cursor_value = 0;
-      occlusion_query_stats_.last_log_frame = frame_current_;
+      zpd_report_controller_->ResetStats();
+
+      guest_zpd_report_stats_.logical_begun = 0;
+      guest_zpd_report_stats_.logical_ended = 0;
+      guest_zpd_report_stats_.segments_begun = 0;
+      guest_zpd_report_stats_.segments_ended = 0;
+      guest_zpd_report_stats_.resolves_completed = 0;
+      guest_zpd_report_stats_.resolves_discarded_stale = 0;
+      guest_zpd_report_stats_.pool_exhausted = 0;
+      guest_zpd_report_stats_.failed = 0;
+      guest_zpd_report_stats_.last_log_frame = frame_current_;
     }
 
     // Reset bindings that depend on the data stored in the pools.
@@ -4021,18 +3987,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
-    // We can't close the command list with an active query - D3D12 requirement
-    // Force-end it and wait for the result immediately to avoid data loss
-    if (active_occlusion_query_.valid && cvars::occlusion_query_enable &&
-        occlusion_query_resources_available_) {
-      // Translate the address to get the pointer
-      auto* sample_counts =
-          memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
-              active_occlusion_query_.sample_count_address);
-      // Call EndGuestOcclusionQuery which will do a synchronous wait
-      // This ensures we get the complete result before closing the submission
-      EndGuestOcclusionQuery(active_occlusion_query_.sample_count_address,
-                             sample_counts);
+    // D3D12 query spans can't cross command list boundaries.
+    // Split the active segment here and resume it in the next submission.
+    if (cvars::occlusion_query_enable) {
+      SplitActiveHostZPDQuerySegment();
+      RecordHostZPDQueryResolveBatch();
     }
 
     pipeline_cache_->EndSubmission();
@@ -5760,276 +5719,174 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
   return memexport_readback_buffer_;
 }
 
-bool D3D12CommandProcessor::InitializeOcclusionQueryResources() {
-  active_occlusion_query_ = {};
-  occlusion_query_cursor_ = 0;
-  occlusion_query_stats_ = {};
-  pending_occlusion_queries_.clear();
-  occlusion_query_resources_available_ = false;
-  occlusion_query_heap_.Reset();
-  occlusion_query_readback_.Reset();
-
-  ID3D12Device* device = GetD3D12Provider().GetDevice();
-  if (!device) {
-    return false;
-  }
-
-  D3D12_QUERY_HEAP_DESC heap_desc;
-  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
-  heap_desc.Count = kMaxOcclusionQueries;
-  heap_desc.NodeMask = 0;
-  if (FAILED(device->CreateQueryHeap(&heap_desc,
-                                     IID_PPV_ARGS(&occlusion_query_heap_)))) {
-    XELOGW(
-        "D3D12CommandProcessor: Failed to create the occlusion query heap, "
-        "falling back to fake sample counts.");
-    return false;
-  }
-
-  D3D12_RESOURCE_DESC buffer_desc;
-  ui::d3d12::util::FillBufferResourceDesc(
-      buffer_desc, sizeof(uint64_t) * kMaxOcclusionQueries,
-      D3D12_RESOURCE_FLAG_NONE);
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesReadback,
-          GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
-          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-          IID_PPV_ARGS(&occlusion_query_readback_)))) {
-    XELOGW(
-        "D3D12CommandProcessor: Failed to allocate the occlusion query "
-        "readback buffer, falling back to fake sample counts.");
-    occlusion_query_heap_.Reset();
-    return false;
-  }
-
-  // Map the readback buffer persistently for the lifetime of the resource
-  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kMaxOcclusionQueries};
-  void* mapping = nullptr;
-  if (FAILED(occlusion_query_readback_->Map(0, &read_range, &mapping))) {
-    XELOGW(
-        "D3D12CommandProcessor: Failed to map the occlusion query readback "
-        "buffer, falling back to fake sample counts.");
-    occlusion_query_readback_.Reset();
-    occlusion_query_heap_.Reset();
-    return false;
-  }
-  occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
-
-  occlusion_query_resources_available_ = true;
-  return true;
-}
-
-void D3D12CommandProcessor::ShutdownOcclusionQueryResources() {
-  DisableHostOcclusionQueries();
-
-  if (occlusion_query_readback_ && occlusion_query_readback_mapping_) {
-    occlusion_query_readback_->Unmap(0, nullptr);
-    occlusion_query_readback_mapping_ = nullptr;
-  }
-
-  occlusion_query_heap_.Reset();
-  occlusion_query_readback_.Reset();
-}
-
-void D3D12CommandProcessor::DisableHostOcclusionQueries() {
-  // End any active query first to avoid D3D12 validation errors
-  if (active_occlusion_query_.valid && occlusion_query_heap_) {
-    if (BeginSubmission(true)) {
-      deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(),
-                                         D3D12_QUERY_TYPE_OCCLUSION,
-                                         active_occlusion_query_.host_index);
-      // Don't resolve - we're abandoning the result
-      EndSubmission(false);
-    }
-  }
-  active_occlusion_query_ = {};
-  pending_occlusion_queries_.clear();
-  occlusion_query_cursor_ = 0;
-}
-
-bool D3D12CommandProcessor::AcquireOcclusionQueryIndex(
-    uint32_t& host_index_out) {
-  if (occlusion_query_cursor_ >= kMaxOcclusionQueries) {
-    // Reset cursor - all queries complete synchronously now
-    occlusion_query_cursor_ = 0;
-    occlusion_query_stats_.cursor_wraps++;
-  }
-  host_index_out = occlusion_query_cursor_++;
-
-  // Track max cursor value to see how many slots are actually used
-  if (occlusion_query_cursor_ > occlusion_query_stats_.max_cursor_value) {
-    occlusion_query_stats_.max_cursor_value = occlusion_query_cursor_;
-  }
-
-  return true;
-}
-
-bool D3D12CommandProcessor::BeginGuestOcclusionQuery(
-    uint32_t sample_count_address) {
-  if (!cvars::occlusion_query_enable || !occlusion_query_resources_available_) {
-    return false;
-  }
-
-  if (active_occlusion_query_.valid) {
-    // Can't begin a new query while one is active - this would violate D3D12
-    // rules
-    XELOGW(
-        "D3D12CommandProcessor: Occlusion query begin issued while another "
-        "query is active at address 0x{:08X}",
-        active_occlusion_query_.sample_count_address);
-    // Just end the current query without starting a new one
-    const uint32_t host_index = active_occlusion_query_.host_index;
-    active_occlusion_query_.valid = false;
-    active_occlusion_query_.cache_serviced = false;
-
-    // End the orphaned query to avoid D3D12 errors
-    if (submission_open_ && host_index != UINT32_MAX) {
-      deferred_command_list_.D3DEndQuery(
-          occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index);
-      // Don't resolve - we're abandoning this query
-    }
-    // Try again now that the active query is cleared
-  }
-
-  uint32_t host_index = 0;
-  if (!AcquireOcclusionQueryIndex(host_index)) {
-    return false;
-  }
-  if (!BeginSubmission(true)) {
-    return false;
-  }
-  deferred_command_list_.D3DBeginQuery(occlusion_query_heap_.Get(),
-                                       D3D12_QUERY_TYPE_OCCLUSION, host_index);
-
-  auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-
-  active_occlusion_query_.sample_count_address = sample_count_address;
-  active_occlusion_query_.query_id = viz_query.viz_query_id;
-  active_occlusion_query_.host_index = host_index;
-  active_occlusion_query_.valid = true;
-  active_occlusion_query_.cache_serviced = false;
-
-  occlusion_query_stats_.queries_begun++;
-  return true;
-}
-
-bool D3D12CommandProcessor::EndGuestOcclusionQuery(
-    uint32_t sample_count_address,
-    xenos::xe_gpu_depth_sample_counts* sample_counts) {
-  if (!cvars::occlusion_query_enable || !occlusion_query_resources_available_) {
-    return false;
-  }
-
-  // Check if we have an active query
-  if (!active_occlusion_query_.valid) {
-    // No active query - might have been ended at submission boundary
-    return false;
-  }
-
-  const uint32_t host_index = active_occlusion_query_.host_index;
-
-  // Mark as invalid BEFORE ending to prevent restart in BeginSubmission
-  active_occlusion_query_.valid = false;
-  active_occlusion_query_.cache_serviced = false;
-
-  // Issue END query
-  if (!BeginSubmission(true)) {
-    return false;
-  }
-
-  deferred_command_list_.D3DEndQuery(occlusion_query_heap_.Get(),
-                                     D3D12_QUERY_TYPE_OCCLUSION, host_index);
-  InsertDebugMarker("Occlusion Query Readback: index %u", host_index);
-  deferred_command_list_.D3DResolveQueryData(
-      occlusion_query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, host_index, 1,
-      occlusion_query_readback_.Get(), sizeof(uint64_t) * host_index);
-
-  // Force submission and sync wait - guest expects result immediately
-  if (!EndSubmission(false)) {
-    return false;
-  }
-
-  uint64_t query_submission = GetCurrentSubmission() - 1;
-
-  // Wait for GPU to complete - CheckSubmissionCompletion handles the waiting
-  // internally via the completion timeline
-  CheckSubmissionCompletion(query_submission);
-  if (GetCompletedSubmission() < query_submission) {
-    XELOGE("Failed to wait for occlusion query completion");
-    occlusion_query_stats_.queries_failed++;
-    return false;
-  }
-
-  // Read result and write to guest memory
-  if (!occlusion_query_readback_mapping_) {
-    XELOGE("Occlusion query readback buffer not mapped");
-    occlusion_query_stats_.queries_failed++;
-    return false;
-  }
-
-  uint64_t samples = occlusion_query_readback_mapping_[host_index];
-  samples = NormalizeOcclusionSamples(samples);
-  WriteGuestOcclusionResult(sample_counts, samples);
-
-  occlusion_query_stats_.queries_resolved_sync++;
-  occlusion_query_stats_.queries_ended++;
-  return true;
-}
-
-uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(
-    uint64_t samples) const {
-  if (samples == 0 || !texture_cache_) {
-    return samples;
-  }
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
-  if (scale <= 1) {
-    return samples;
-  }
-  return (samples + (scale >> 1)) / scale;
-}
-
-void D3D12CommandProcessor::WriteGuestOcclusionResult(
-    xenos::xe_gpu_depth_sample_counts* sample_counts, uint64_t samples) {
-  if (!sample_counts) {
-    return;
-  }
-  uint32_t clamped =
-      samples > uint64_t(UINT32_MAX) ? UINT32_MAX : uint32_t(samples);
-  sample_counts->Total_A = clamped;
-  sample_counts->Total_B = 0;
-  sample_counts->ZPass_A = clamped;
-  sample_counts->ZPass_B = 0;
-  sample_counts->ZFail_A = 0;
-  sample_counts->ZFail_B = 0;
-  sample_counts->StencilFail_A = 0;
-  sample_counts->StencilFail_B = 0;
-}
-
-void D3D12CommandProcessor::ProcessReadyOcclusionQueries(
-    uint64_t completed_submission) {
-  if (!cvars::occlusion_query_enable || !occlusion_query_resources_available_ ||
-      pending_occlusion_queries_.empty()) {
+void D3D12CommandProcessor::EnsureZPDHostQueryResources() {
+  if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
     return;
   }
 
-  // Process all queries whose submission has completed
-  while (!pending_occlusion_queries_.empty() &&
-         pending_occlusion_queries_.front().submission <=
-             completed_submission) {
-    PendingOcclusionQuery query = pending_occlusion_queries_.front();
-    pending_occlusion_queries_.pop_front();
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+  uint32_t requested_capacity =
+      GetClampedHostZPDPoolCapacity(cvars::occlusion_query_pool_size);
+  bool can_recreate = !active_host_zpd_query_segment_.logical_active &&
+                      !active_host_zpd_query_segment_.segment_active &&
+                      !zpd_host_query_pool_->has_pending_resolve_batch() &&
+                      host_zpd_query_resolves_in_flight_.empty();
+  zpd_host_query_pool_->EnsureInitialized(GetD3D12Provider(),
+                                          requested_capacity, can_recreate);
+}
 
-    // Read result from persistent mapping
-    uint64_t samples = occlusion_query_readback_mapping_[query.host_index];
-    samples = NormalizeOcclusionSamples(samples);
-
-    // Write to guest memory
-    WriteGuestOcclusionResult(query.sample_counts, samples);
-
-    // Note: Don't increment stats here - caller decides if async or sync
+void D3D12CommandProcessor::ShutdownZPDHostQueryResources() {
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+  active_host_zpd_query_segment_ = {};
+  logical_zpd_reports_.clear();
+  fast_zpd_report_cached_values_.clear();
+  host_zpd_query_resolves_in_flight_.clear();
+  if (zpd_host_query_pool_) {
+    zpd_host_query_pool_->Shutdown();
   }
+}
+
+bool D3D12CommandProcessor::IsHostZPDQueryPoolReady() const {
+  return zpd_host_query_pool_ && zpd_host_query_pool_->is_initialized();
+}
+
+bool D3D12CommandProcessor::CanOpenHostZPDQueryNow() const {
+  return submission_open_;
+}
+
+CommandProcessor::HostZPDQueryOpenResult
+D3D12CommandProcessor::OpenHostZPDQuery(uint32_t& out_host_index,
+                                        uint32_t& out_host_generation,
+                                        bool can_close_submission) {
+  // If no submission is open, wait for the normal resume path.
+  if (!submission_open_) {
+    return HostZPDQueryOpenResult::kDeferred;
+  }
+
+  EnsureZPDHostQueryResources();
+  if (!zpd_host_query_pool_ || !zpd_host_query_pool_->is_initialized()) {
+    return HostZPDQueryOpenResult::kFailed;
+  }
+
+  bool is_pool_exhausted;
+  {
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
+  }
+
+  if (is_pool_exhausted) {
+    ProcessCompletedHostZPDQueryResolves(GetCompletedSubmission());
+    {
+      std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+      is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
+    }
+  }
+
+  if (is_pool_exhausted) {
+    if (cvars::occlusion_query_fast) {
+      return HostZPDQueryOpenResult::kPoolExhausted;
+    }
+
+    if (!host_zpd_query_resolves_in_flight_.empty()) {
+      uint64_t wait_for = host_zpd_query_resolves_in_flight_.front().submission;
+      uint64_t completed_submission = GetCompletedSubmission();
+      if (wait_for > completed_submission) {
+        if (wait_for >= GetCurrentSubmission()) {
+          if (can_close_submission && submission_open_) {
+            if (!EndSubmission(false)) {
+              return HostZPDQueryOpenResult::kFailed;
+            }
+          }
+          // Let the normal resume path reopen the submission before trying
+          // again.
+          return HostZPDQueryOpenResult::kDeferred;
+        }
+        completion_timeline_->AwaitSubmissionAndUpdateCompleted(wait_for);
+        ProcessCompletedHostZPDQueryResolves(GetCompletedSubmission());
+      }
+    }
+  }
+
+  if (!submission_open_) {
+    return HostZPDQueryOpenResult::kDeferred;
+  }
+  if (!zpd_host_query_pool_->has_free_indices()) {
+    return HostZPDQueryOpenResult::kDeferred;
+  }
+  if (!zpd_host_query_pool_->AcquireQueryIndex(out_host_index)) {
+    return HostZPDQueryOpenResult::kFailed;
+  }
+
+  out_host_generation = 0;
+  zpd_host_query_pool_->BeginQuery(deferred_command_list_, out_host_index);
+  return HostZPDQueryOpenResult::kOpened;
+}
+
+bool D3D12CommandProcessor::CloseHostZPDQuery(uint32_t host_index,
+                                              uint32_t host_generation,
+                                              uint64_t& out_submission) {
+  if (!submission_open_ || !zpd_host_query_pool_) {
+    return false;
+  }
+
+  zpd_host_query_pool_->EndQuery(deferred_command_list_, host_index);
+  {
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    zpd_host_query_pool_->QueueQueryResolve(host_index);
+  }
+  out_submission = GetCurrentSubmission();
+  return true;
+}
+
+uint64_t D3D12CommandProcessor::GetHostZPDQueryResult(uint32_t host_index) {
+  return zpd_host_query_pool_
+             ? zpd_host_query_pool_->GetQueryReadbackValue(host_index)
+             : 0;
+}
+
+void D3D12CommandProcessor::ReleaseHostZPDQuery(uint32_t host_index,
+                                                uint32_t host_generation) {
+  if (zpd_host_query_pool_) {
+    zpd_host_query_pool_->ReleaseQueryIndex(host_index);
+  }
+}
+
+uint64_t D3D12CommandProcessor::GetHostZPDCurrentSubmission() const {
+  return GetCurrentSubmission();
+}
+
+uint64_t D3D12CommandProcessor::GetHostZPDCompletedSubmission() const {
+  return GetCompletedSubmission();
+}
+
+void D3D12CommandProcessor::AwaitHostZPDSubmissionAndUpdateCompleted(
+    uint64_t submission) {
+  completion_timeline_->AwaitSubmissionAndUpdateCompleted(submission);
+}
+
+bool D3D12CommandProcessor::CanEndHostZPDSubmissionImmediately() const {
+  return CanEndSubmissionImmediately();
+}
+
+bool D3D12CommandProcessor::EndHostZPDSubmission(bool is_swap) {
+  return EndSubmission(is_swap);
+}
+
+uint32_t D3D12CommandProcessor::GetZPDReportDrawResolutionScaleX() const {
+  return texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+}
+
+uint32_t D3D12CommandProcessor::GetZPDReportDrawResolutionScaleY() const {
+  return texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+}
+
+// Resolve the queued indices into the mapped readback buffer.
+void D3D12CommandProcessor::RecordHostZPDQueryResolveBatch() {
+  if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
+    return;
+  }
+  zpd_host_query_pool_->FlushResolveBatch(deferred_command_list_,
+                                          submission_open_);
 }
 
 void D3D12CommandProcessor::WriteGammaRampSRV(
@@ -6054,10 +5911,7 @@ void D3D12CommandProcessor::WriteGammaRampSRV(
 }
 
 #define COMMAND_PROCESSOR D3D12CommandProcessor
-#define XE_GPU_OVERRIDES_EVENT_WRITE_ZPD
-
 #include "../pm4_command_processor_implement.h"
-#undef XE_GPU_OVERRIDES_EVENT_WRITE_ZPD
 #undef COMMAND_PROCESSOR
 }  // namespace d3d12
 }  // namespace gpu

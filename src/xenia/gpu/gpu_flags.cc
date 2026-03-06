@@ -80,22 +80,52 @@ DEFINE_bool(
     "when MSAA is used with fullscreen passes.",
     "GPU");
 
-DEFINE_int32(query_occlusion_sample_lower_threshold, 80,
-             "If set to -1 no sample counts are written, games may hang. Else, "
-             "the sample count of every tile will be incremented on every "
-             "EVENT_WRITE_ZPD by this number. Setting this to 0 means "
-             "everything is reported as occluded.",
+DEFINE_bool(occlusion_query_enable, false,
+            "Use real host occlusion queries instead of faking results.\n"
+            "Still experimental. Some games improve a lot. Others may "
+            "experience missing objects, slow lens flare updates, or hangs.",
+            "GPU");
+DEFINE_bool(
+    occlusion_query_fast, true,
+    "Enable the fast path for hardware occlusion queries.\n"
+    "Uses cached delta writes and a one submission delay so guest polling "
+    "doesn't stall while the real resolve catches up. Some games need this "
+    "disabled to handle occlusion correctly.",
+    "GPU");
+DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
+             "Lower end of the fake sample count value written on "
+             "EVENT_WRITE_ZPD when real occlusion queries are off.\n"
+             "-1 writes nothing, resulting in some games that sit and hang.\n"
+             "0 means the fake result stays fully occluded.",
+             "GPU");
+DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
+             "Upper end of the fake sample count value written on "
+             "EVENT_WRITE_ZPD when real occlusion queries are off.\n"
+             "Keep this higher than occlusion_query_fake_lower_threshold.\n"
+             "Ignored if occlusion_query_fake_lower_threshold is -1.",
              "GPU");
 DEFINE_int32(
-    query_occlusion_sample_upper_threshold, 100,
-    "Set to higher number than query_occlusion_sample_lower_threshold. This "
-    "value is ignored if query_occlusion_sample_lower_threshold is set to -1.",
+    occlusion_query_fast_cached_delta, 1,
+    "When hardware occlusion is enabled and fast readback is active, use this "
+    "delta for speculative writes until a real result is cached.\n"
+    "Leave this at 1 unless a game clearly needs a different visible fallback.",
     "GPU");
-
-DEFINE_bool(occlusion_query_enable, false,
-            "Use hardware occlusion queries instead of fake results. More "
-            "accurate but causes GPU stalls and performance issues.",
+DEFINE_int32(
+    occlusion_query_fast_sequence_grace, 0,
+    "When hardware occlusion is enabled and fast readback is active, allow "
+    "slightly late results to match if the record sequence is still within "
+    "this grace distance. This can help with aggressive slot reuse, but it can "
+    "also accept stale results and cause artifacts.",
+    "GPU");
+DEFINE_bool(occlusion_query_log, false,
+            "Log hardware occlusion query lifetime and summary stats.\n"
+            "Only useful for debugging and testing.",
             "GPU");
+DEFINE_int32(occlusion_query_pool_size, 8192,
+             "Number of host occlusion query slots to allocate.\n"
+             "The default should be enough for most games. Raise it only if a "
+             "game burns through the pool and starts stalling or hanging.",
+             "GPU");
 
 void SetOcclusionQueryEnable(bool value) {
   OVERRIDE_bool(occlusion_query_enable, value);

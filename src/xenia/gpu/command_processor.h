@@ -10,19 +10,25 @@
 #ifndef XENIA_GPU_COMMAND_PROCESSOR_H_
 #define XENIA_GPU_COMMAND_PROCESSOR_H_
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_report_controller.h"
+#include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 #include "xenia/ui/presenter.h"
@@ -49,10 +55,17 @@ enum class ReadbackResolveMode {
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
-// Occlusion query pool size for both D3D12 and Vulkan backends.
-// Queries complete synchronously with GPU stalls.
-// 512 slots = 4KB of readback buffer memory.
-constexpr uint32_t kMaxOcclusionQueries = 512;
+// ZPD query resolves are always 64-bit sample counts.
+constexpr uint32_t kHostZPDResolveStrideBytes = 8;
+
+// Clamps the pool size and rounds it up for bitmask wrapping.
+inline uint32_t GetClampedHostZPDPoolCapacity(int32_t capacity) {
+  static constexpr int32_t kHostZPDPoolCapacityMin = 16;
+  static constexpr int32_t kHostZPDPoolCapacityMax = 524288;
+  uint32_t requested_capacity = static_cast<uint32_t>(
+      std::clamp(capacity, kHostZPDPoolCapacityMin, kHostZPDPoolCapacityMax));
+  return xe::next_pow2(requested_capacity);
+}
 
 class GraphicsSystem;
 class Shader;
@@ -281,6 +294,128 @@ class CommandProcessor {
 
   virtual void OnPrimaryBufferEnd() {}
 
+  // ZPD report handling lives here.
+  //
+  // In this code, "report" means the 360 memory record, and "query" means the
+  // API object that produces the sample count.
+  //
+  // Backends own the pool and submission side. This class owns the logical
+  // lifetime and the writeback flow.
+  enum class HostZPDQueryOpenResult {
+    kOpened,         // Opened successfully.
+    kDeferred,       // Delayed for now.
+    kPoolExhausted,  // Pool is out of queries.
+    kFailed,         // Open failed.
+  };
+
+  // One logical ZPD report.
+  struct LogicalGuestZPDReport {
+    uint32_t begin_report_address = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    uint64_t accumulated_samples = 0;
+    uint64_t last_segment_end_submission = 0;
+    uint32_t pending_segments = 0;
+    bool ended = false;
+  };
+
+  // One active query segment for a logical ZPD report.
+  struct ActiveHostZPDQuerySegment {
+    XenosReportController::ReportHandle report_handle =
+        XenosReportController::kInvalidReportHandle;
+    uint32_t begin_report_address = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_report_address = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool segment_active = false;
+    bool segment_pending_begin = false;
+    bool logical_active = false;
+  };
+
+  // Pending resolve for retired query segments.
+  struct PendingHostZPDQueryResolve {
+    uint64_t submission = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    XenosReportController::ReportHandle report_handle =
+        XenosReportController::kInvalidReportHandle;
+  };
+
+  // Guest ZPD report counters. Logged by the backend every 100 frames.
+  struct GuestZPDReportStats {
+    uint64_t logical_begun = 0;
+    uint64_t logical_ended = 0;
+    uint64_t segments_begun = 0;
+    uint64_t segments_ended = 0;
+    uint64_t resolves_completed = 0;
+    uint64_t resolves_discarded_stale = 0;
+    uint64_t pool_exhausted = 0;
+    uint64_t failed = 0;
+    uint64_t last_log_frame = 0;
+  };
+
+  // Query resources.
+  virtual void EnsureZPDHostQueryResources() {}
+  virtual void ShutdownZPDHostQueryResources() {}
+  virtual bool IsHostZPDQueryPoolReady() const { return false; }
+  virtual bool CanOpenHostZPDQueryNow() const { return true; }
+  // Opens a query.
+  virtual HostZPDQueryOpenResult OpenHostZPDQuery(uint32_t& out_host_index,
+                                                  uint32_t& out_host_generation,
+                                                  bool can_close_submission) {
+    return HostZPDQueryOpenResult::kFailed;
+  }
+  // Closes a query and returns the submission it lands on.
+  virtual bool CloseHostZPDQuery(uint32_t host_index, uint32_t host_generation,
+                                 uint64_t& out_submission) {
+    return false;
+  }
+  virtual uint64_t GetHostZPDQueryResult(uint32_t host_index) { return 0; }
+  virtual void ReleaseHostZPDQuery(uint32_t host_index,
+                                   uint32_t host_generation) {}
+  // Checks the generation before using the result.
+  virtual bool IsHostZPDQueryResultValid(uint32_t host_index,
+                                         uint32_t host_generation) const {
+    return true;
+  }
+
+  // Submission and readback.
+  // Prepares completed resolves for readback.
+  virtual void PrepareHostZPDReadback(uint64_t completed_submission,
+                                      uint64_t settle_margin) {}
+  virtual bool ShouldDropHostZPDReportIfUnavailable() const { return false; }
+  virtual uint64_t GetHostZPDCurrentSubmission() const { return 0; }
+  virtual uint64_t GetHostZPDCompletedSubmission() const { return 0; }
+  virtual void AwaitHostZPDSubmissionAndUpdateCompleted(uint64_t submission) {}
+  virtual bool CanEndHostZPDSubmissionImmediately() const { return false; }
+  virtual bool EndHostZPDSubmission(bool is_swap) { return false; }
+  virtual void PrepareToWaitForHostZPDSubmission() {}
+  virtual uint32_t GetZPDReportDrawResolutionScaleX() const { return 1; }
+  virtual uint32_t GetZPDReportDrawResolutionScaleY() const { return 1; }
+
+  // Logical report state.
+  bool BeginGuestZPDReport(uint32_t report_address);
+  bool EndGuestZPDReport(uint32_t report_address, bool guest_forced_end);
+  void ResumeActiveHostZPDQuerySegment(bool can_close_submission);
+  void SplitActiveHostZPDQuerySegment();
+  void ProcessCompletedHostZPDQueryResolves(uint64_t completed_submission);
+  void CommitGuestZPDReportData(uint32_t begin_record,
+                                uint32_t report_record_base,
+                                uint32_t delta_value, bool write_begin_record);
+  bool IsFastZPDPathEnabled() const;
+  // Applies draw resolution scaling before the final write.
+  uint32_t NormalizeZPDReportSampleCount(uint64_t samples) const;
+  // Controller callback for writes that can retire now.
+  static void CommitGuestZPDReportCallback(
+      XenosReportController::ReportHandle report_handle,
+      uint32_t report_record_base, uint32_t delta_value,
+      bool write_begin_report, void* callback_context);
+  // Controller callback for writes that still need more progress.
+  static void WaitAndResolveZPDReportCallback(
+      XenosReportController::ReportHandle report_handle,
+      void* callback_context);
+
 #include "pm4_command_processor_declare.h"
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type,
@@ -296,13 +431,12 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
-  virtual bool SupportsGuestOcclusionQueries() const { return false; }
 
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
-  bool debug_markers_enabled() const { return false; }
-  void PushDebugMarker(const char* format, ...) {}
-  void PopDebugMarker() {}
-  void InsertDebugMarker(const char* format, ...) {}
+  virtual bool debug_markers_enabled() const { return false; }
+  virtual void PushDebugMarker(const char* format, ...) {}
+  virtual void PopDebugMarker() {}
+  virtual void InsertDebugMarker(const char* format, ...) {}
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
@@ -316,6 +450,21 @@ class CommandProcessor {
   kernel::KernelState* kernel_state_ = nullptr;
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+
+  mutable std::mutex zpd_report_mutex_;
+  std::unique_ptr<XenosReportController> zpd_report_controller_;
+  std::unordered_map<XenosReportController::ReportHandle, LogicalGuestZPDReport>
+      logical_zpd_reports_;
+  ActiveHostZPDQuerySegment active_host_zpd_query_segment_{};
+  std::deque<PendingHostZPDQueryResolve> host_zpd_query_resolves_in_flight_;
+
+  // Cached END delta for the fast path until the real resolve is ready.
+  // Keyed by record base.
+  std::unordered_map<uint32_t, uint32_t> fast_zpd_report_cached_values_;
+
+  // Rolling count for the no-hardware path.
+  uint32_t fake_zpd_sample_count_ = 0;
+  GuestZPDReportStats guest_zpd_report_stats_;
 
   TraceWriter trace_writer_;
   enum class TraceState {
