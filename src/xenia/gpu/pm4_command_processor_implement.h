@@ -1146,14 +1146,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   return true;
 }
 
-static uint32_t samples = cvars::query_occlusion_sample_upper_threshold;
+static uint32_t samples = cvars::occlusion_query_fake_upper_threshold;
 
 #if !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // Set by D3D as BE but struct ABI is LE
-  const uint32_t kQueryFinished = xe::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t event_type = initiator & 0x3F;
@@ -1166,31 +1164,51 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(event_type);
 
-  if (cvars::query_occlusion_sample_lower_threshold < 0) {
+  if (cvars::occlusion_query_fake_lower_threshold < 0) {
     return true;
   }
-  // Occlusion queries:
-  // This command is send on query begin and end.
-  // As a workaround report some fixed amount of passed samples.
-  auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
-  // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
-  // and used to detect a finished query.
-  bool is_end_via_z_pass = pSampleCounts->ZPass_A == kQueryFinished &&
-                           pSampleCounts->ZPass_B == kQueryFinished;
-  // Older versions of D3D also checks for ZFail (4D5307D5).
-  bool is_end_via_z_fail = pSampleCounts->ZFail_A == kQueryFinished &&
-                           pSampleCounts->ZFail_B == kQueryFinished;
-  std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
-  if (is_end_via_z_pass || is_end_via_z_fail) {
-    pSampleCounts->ZPass_A = samples;
-    pSampleCounts->Total_A = samples;
+
+  // Occlusion query fake sample-count fallback.
+  // This command is sent on query BEGIN and END.
+  // Use the same address and sentinel rules as the hardware report.
+  uint32_t sample_count_address_raw =
+      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  uint32_t record_base =
+      xe::gpu::XenosOcclusionReport::RecordBase(sample_count_address_raw);
+  if (!record_base) {
+    return true;
   }
 
+  xe_gpu_depth_sample_counts* record =
+      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(record_base);
+  if (!record) {
+    return true;
+  }
+
+  // The guest writes the pending sentinel on END.
+  // BEGIN leaves the report in the cleared state.
+  // Only create a result once the report actually looks pending.
+  if (!xe::gpu::XenosOcclusionReport::IsReportPending(record)) {
+    return true;
+  }
+
+  std::memset(record, 0, sizeof(xe_gpu_depth_sample_counts));
+
+  // Write to all words so guests polling any field or reading 64-bit totals,
+  // can see a finished report.
+  record->Total_A = samples;
+  record->Total_B = samples;
+  record->ZPass_A = samples;
+  record->ZPass_B = samples;
+  record->ZFail_A = samples;
+  record->ZFail_B = samples;
+  record->StencilFail_A = samples;
+  record->StencilFail_B = samples;
+
   samples =
-      samples <= static_cast<uint32_t>(
-                     cvars::query_occlusion_sample_lower_threshold)
-          ? static_cast<uint32_t>(cvars::query_occlusion_sample_upper_threshold)
+      samples <=
+              static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold)
+          ? static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold)
           : samples - 1;
 
   return true;
@@ -1287,9 +1305,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    bool viz_query_active =
-        viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z;
-    if (!viz_query_active || SupportsGuestOcclusionQueries()) {
+    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render

@@ -49,11 +49,6 @@ enum class ReadbackResolveMode {
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
-// Occlusion query pool size for both D3D12 and Vulkan backends.
-// Queries complete synchronously with GPU stalls.
-// 512 slots = 4KB of readback buffer memory.
-constexpr uint32_t kMaxOcclusionQueries = 512;
-
 class GraphicsSystem;
 class Shader;
 
@@ -296,7 +291,6 @@ class CommandProcessor {
     return false;
   }
   virtual bool IssueCopy() { return false; }
-  virtual bool SupportsGuestOcclusionQueries() const { return false; }
 
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
   bool debug_markers_enabled() const { return false; }

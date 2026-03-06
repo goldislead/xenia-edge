@@ -11,9 +11,11 @@
 #define XENIA_GPU_D3D12_D3D12_COMMAND_PROCESSOR_H_
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -21,6 +23,7 @@
 #include <vector>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/bit_map.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
@@ -34,6 +37,7 @@
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_report_controller.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/d3d12/d3d12_descriptor_heap_pool.h"
@@ -79,13 +83,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
-
-  void PrepareForWait() override;
-  void ReturnFromWait() override;
-  bool SupportsGuestOcclusionQueries() const override {
-    return occlusion_query_resources_available_ &&
-           cvars::occlusion_query_enable;
-  }
 
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(
@@ -509,17 +506,21 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
-  bool InitializeOcclusionQueryResources();
+  void EnsureOcclusionQueryResources();
+  void EnsureOcclusionQueryResourcesLocked();
   void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address,
-                              xenos::xe_gpu_depth_sample_counts* sample_counts);
-  void ProcessReadyOcclusionQueries(uint64_t completed_submission);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(
-      xenos::xe_gpu_depth_sample_counts* sample_counts, uint64_t samples);
+  void ShutdownOcclusionQueryResourcesLocked();
+  bool BeginGuestOcclusionQuery(uint32_t sample_count_address_raw);
+  bool EndGuestOcclusionQuery(uint32_t sample_count_address_raw,
+                              bool forced_end);
+  void ResumeActiveOcclusionQuerySegment(bool allow_submission_close);
+  void SplitActiveOcclusionQuerySegment();
+  void QueueOcclusionQueryResolveBatchIndexLocked(uint32_t host_index);
+  void FlushOcclusionQueryResolveBatch();
+  void ProcessCompletedOcclusionQueryResolves(uint64_t completed_submission);
+  void WriteOcclusionReportData(uint32_t begin_record, uint32_t sink_record,
+                                uint32_t value, bool write_begin_record);
+  uint32_t NormalizeOcclusionSamples(uint64_t samples) const;
 
   bool device_removed_ = false;
 
@@ -723,39 +724,68 @@ class D3D12CommandProcessor final : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
   uint64_t fxaa_source_texture_submission_ = 0;
 
-  // Occlusion query resources.
+  // Occlusion query state. The controller handles the guest lifetime rules.
+  // This side mostly owns the host query pool, the resolve/readback plumbing,
+  // and the bits needed to stitch host results back onto guest records.
+  mutable std::mutex occlusion_query_mutex_;
+  std::unique_ptr<XenosReportController> occlusion_report_controller_;
+
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_;
-  uint64_t* occlusion_query_readback_mapping_ = nullptr;  // Persistent mapping
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t query_id = 0;  // VIZ_QUERY ID (0-63)
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-    bool cache_serviced = false;  // True if using cached result, no D3D12 query
-  } active_occlusion_query_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_resolve_buffer_;
+  D3D12_RESOURCE_STATES occlusion_query_resolve_buffer_state_ =
+      D3D12_RESOURCE_STATE_COPY_DEST;
+  uint64_t* occlusion_query_readback_mapping_ = nullptr;
 
-  // Pending async queries (resolved when submission completes)
-  struct PendingOcclusionQuery {
-    uint32_t host_index;
-    uint64_t submission;
-    uint32_t sample_count_address;
-    xenos::xe_gpu_depth_sample_counts*
-        sample_counts;  // Cached pointer (nullptr for cache-only updates)
-    uint32_t query_id;
+  uint32_t occlusion_query_capacity_ = 0;
+  std::vector<uint32_t> occlusion_query_free_indices_;
+
+  xe::BitMap occlusion_query_resolve_batch_index_map_;
+  uint32_t occlusion_query_resolve_batch_index_count_ = 0;
+
+  struct LogicalOcclusionQuery {
+    uint32_t begin_address_raw = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    uint64_t accumulated_samples = 0;
+    uint32_t pending_segments = 0;
+    XenosReportController::PendingWrite pending_write;
+    bool ended = false;
   };
-  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
+  std::unordered_map<XenosReportController::QueryHandle, LogicalOcclusionQuery>
+      occlusion_queries_;
 
-  // Query statistics (logged every 100 frames)
+  struct ActiveOcclusionQuerySegment {
+    XenosReportController::QueryHandle query =
+        XenosReportController::kInvalidQuery;
+    uint32_t begin_address_raw = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_address_raw = 0;
+    uint32_t host_index = UINT32_MAX;
+    bool segment_active = false;
+    bool logical_active = false;
+  } active_occlusion_query_segment_;
+
+  struct OcclusionQueryResolve {
+    uint64_t submission = 0;
+    uint32_t host_index = 0;
+    XenosReportController::QueryHandle query =
+        XenosReportController::kInvalidQuery;
+  };
+  std::deque<OcclusionQueryResolve> occlusion_query_resolves_in_flight_;
+
+  // Speculative END values for fast readback.
+  std::unordered_map<uint32_t, uint32_t> occlusion_query_fast_cached_values_;
+
   struct OcclusionQueryStats {
-    uint64_t queries_begun = 0;
-    uint64_t queries_ended = 0;
-    uint64_t queries_failed = 0;
-    uint64_t queries_resolved_sync = 0;  // Required GPU stall
-    uint64_t cursor_wraps = 0;
-    uint32_t max_cursor_value = 0;
+    uint64_t logical_begun = 0;
+    uint64_t logical_ended = 0;
+    uint64_t segments_begun = 0;
+    uint64_t segments_ended = 0;
+    uint64_t resolves_completed = 0;
+    uint64_t resolves_discarded_stale = 0;
+    uint64_t pool_exhausted = 0;
+    uint64_t failed = 0;
     uint64_t last_log_frame = 0;
   } occlusion_query_stats_;
 

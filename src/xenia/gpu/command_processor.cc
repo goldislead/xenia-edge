@@ -22,6 +22,7 @@
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/texture_info.h"
+#include "xenia/gpu/xenos_occlusion_report.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #if !defined(NDEBUG)

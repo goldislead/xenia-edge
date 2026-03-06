@@ -16,15 +16,18 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/bit_map.h"
 #include "xenia/base/hash.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
@@ -36,6 +39,7 @@
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/gpu/xenos_report_controller.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
 #include "xenia/ui/vulkan/vulkan_descriptor_pool_chain.h"
@@ -153,12 +157,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
       std::function<void()> completion_callback = nullptr) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
-
-  void PrepareForWait() override;
-  void ReturnFromWait() override;
-  bool SupportsGuestOcclusionQueries() const override {
-    return occlusion_query_resources_available_;
-  }
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(
@@ -464,17 +462,23 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void DestroyScratchBuffer();
 
-  void ProcessReadyOcclusionQueries(
-      uint64_t completed_submission_hint = UINT64_MAX);
-  bool InitializeOcclusionQueryResources();
+  void EnsureOcclusionQueryResources();
+  void EnsureOcclusionQueryResourcesLocked();
   void ShutdownOcclusionQueryResources();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address);
-  bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
-  void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(uint32_t sample_count_address,
-                                 uint64_t samples);
+  void ShutdownOcclusionQueryResourcesLocked();
+  bool BeginGuestOcclusionQuery(uint32_t sample_count_address_raw);
+  bool EndGuestOcclusionQuery(uint32_t sample_count_address_raw,
+                              bool forced_end);
+  void ResumeActiveOcclusionQuerySegment(bool allow_submission_close);
+  void SplitActiveOcclusionQuerySegment();
+  void QueueOcclusionQueryResolveBatchIndexLocked(uint32_t host_index);
+  void QueueOcclusionQueryResetPendingIndex(uint32_t host_index);
+  void QueueAllOcclusionQueryResetPendingIndices(uint32_t count);
+  void ResetPendingOcclusionQueryPoolIndices();
+  void ProcessCompletedOcclusionQueryResolves(uint64_t completed_submission);
+  void WriteOcclusionReportData(uint32_t begin_record, uint32_t sink_record,
+                                uint32_t value, bool write_begin_record);
+  uint32_t NormalizeOcclusionSamples(uint64_t samples) const;
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
@@ -887,24 +891,79 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Per-memexport double-buffered readback for fast mode (delayed sync)
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
 
-  // Occlusion query support.
+  // Occlusion query state. The controller handles the guest lifetime rules.
+  // This side mostly owns the host query pool, the resolve/readback plumbing,
+  // the reset bookkeeping Vulkan needs, and the bits needed to stitch host
+  // results back onto guest records.
+  mutable std::mutex occlusion_query_mutex_;
+  std::unique_ptr<XenosReportController> occlusion_report_controller_;
+
   VkQueryPool occlusion_query_pool_ = VK_NULL_HANDLE;
+  VkBuffer occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
   VkBuffer occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-  uint8_t* occlusion_query_readback_mapping_ = nullptr;
-  uint32_t occlusion_query_cursor_ = 0;
-  bool occlusion_query_resources_available_ = false;
-  struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool valid = false;
-  } active_occlusion_query_;
-  struct PendingOcclusionQuery {
-    uint32_t host_index;
-    uint64_t submission;
-    uint32_t sample_count_address;
+  uint64_t* occlusion_query_readback_mapping_ = nullptr;
+  bool occlusion_query_readback_is_coherent_ = true;
+
+  uint32_t occlusion_query_capacity_ = 0;
+  std::vector<uint32_t> occlusion_query_free_indices_;
+  std::vector<uint32_t> occlusion_query_index_generations_;
+
+  xe::BitMap occlusion_query_resolve_batch_index_map_;
+  uint32_t occlusion_query_resolve_batch_index_count_ = 0;
+
+  xe::BitMap occlusion_query_reset_pending_index_map_;
+  uint32_t occlusion_query_reset_pending_index_count_ = 0;
+
+  struct LogicalOcclusionQuery {
+    uint32_t begin_address_raw = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_record = 0;
+    uint64_t accumulated_samples = 0;
+    uint32_t pending_segments = 0;
+    XenosReportController::PendingWrite pending_write;
+    bool ended = false;
   };
-  std::deque<PendingOcclusionQuery> pending_occlusion_queries_;
+  std::unordered_map<XenosReportController::QueryHandle, LogicalOcclusionQuery>
+      occlusion_queries_;
+
+  struct ActiveOcclusionQuerySegment {
+    XenosReportController::QueryHandle query =
+        XenosReportController::kInvalidQuery;
+    uint32_t begin_address_raw = 0;
+    uint32_t begin_record = 0;
+    uint32_t end_address_raw = 0;
+    uint32_t host_index = UINT32_MAX;
+    uint32_t host_generation = 0;
+    bool segment_active = false;
+    bool segment_pending_begin = false;
+    bool logical_active = false;
+  } active_occlusion_query_segment_{};
+
+  struct OcclusionQueryResolve {
+    uint32_t host_index = UINT32_MAX;
+    uint32_t host_generation = 0;
+    uint64_t submission = 0;
+    XenosReportController::QueryHandle query =
+        XenosReportController::kInvalidQuery;
+  };
+  std::deque<OcclusionQueryResolve> occlusion_query_resolves_in_flight_;
+
+  // Speculative END values for fast readback.
+  std::unordered_map<uint32_t, uint32_t> occlusion_query_fast_cached_values_;
+
+  struct OcclusionQueryStats {
+    uint64_t logical_begun = 0;
+    uint64_t logical_ended = 0;
+    uint64_t segments_begun = 0;
+    uint64_t segments_ended = 0;
+    uint64_t resolves_completed = 0;
+    uint64_t resolves_discarded_stale = 0;
+    uint64_t pool_exhausted = 0;
+    uint64_t failed = 0;
+    uint64_t last_log_frame = 0;
+  } occlusion_query_stats_;
 
   // Debug marker support for RenderDoc/debug tools.
   bool debug_markers_enabled_ = false;
