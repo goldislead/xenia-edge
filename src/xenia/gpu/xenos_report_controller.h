@@ -16,11 +16,15 @@
 namespace xe {
 namespace gpu {
 
-// Tracks guest report generations and validates final report writes.
+// Retires guest occlusion report writes in a safe order after the backend has
+// finished producing the final values.
 class XenosReportController {
  public:
   using QueryHandle = uint32_t;
   static constexpr QueryHandle kInvalidQuery = 0;
+
+  using WriteReport = void (*)(QueryHandle query, uint32_t sink_base,
+                               uint32_t value, void* context);
 
   struct Stats {
     uint64_t writes_enqueued = 0;
@@ -31,26 +35,7 @@ class XenosReportController {
     uint64_t writes_saved_by_grace = 0;
   };
 
-  struct PendingWrite {
-    QueryHandle query = kInvalidQuery;
-    uint32_t begin_record = 0;
-    uint64_t begin_sequence_id = 0;
-    uint32_t sink_record = 0;
-    uint64_t sink_sequence_id = 0;
-    uint32_t mirror_record = 0;
-    uint64_t mirror_sequence_id = 0;
-    bool valid = false;
-  };
-
-  struct RetiredWrite {
-    uint32_t begin_record = 0;
-    uint32_t sink_record = 0;
-    uint32_t mirror_record = 0;
-    uint32_t value = 0;
-    bool valid = false;
-  };
-
-  XenosReportController();
+  XenosReportController(WriteReport write_report, void* context);
   ~XenosReportController();
 
   XenosReportController(const XenosReportController&) = delete;
@@ -58,11 +43,12 @@ class XenosReportController {
 
   void Reset();
 
-  QueryHandle BeginQuery(uint32_t begin_address);
-  PendingWrite EndQuery(QueryHandle query, uint32_t sink_address,
-                        bool observe_pair = true, uint32_t mirror_address = 0);
-  RetiredWrite CompleteQuery(const PendingWrite& pending_write, uint32_t value);
-  void AbandonQuery(QueryHandle query);
+  QueryHandle BeginQuery(uint32_t begin_record);
+  void ObserveBeginEndPair(uint32_t begin_record, uint32_t end_record);
+  void EnqueueWrite(uint32_t sink_record, QueryHandle query,
+                    uint32_t mirror_record = 0);
+  void MarkQueryCompleted(QueryHandle query, uint32_t value);
+  void Update();
 
   const Stats& stats() const { return stats_; }
   void ResetStats();

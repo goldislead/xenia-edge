@@ -478,7 +478,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void ProcessCompletedOcclusionQueryResolves(uint64_t completed_submission);
   void WriteOcclusionReportData(uint32_t begin_record, uint32_t sink_record,
                                 uint32_t value, bool write_begin_record);
+  void WriteOcclusionReport(XenosReportController::QueryHandle query,
+                            uint32_t sink_base, uint32_t value);
   uint32_t NormalizeOcclusionSamples(uint64_t samples) const;
+  static void WriteOcclusionReportThunk(
+      XenosReportController::QueryHandle query, uint32_t sink_base,
+      uint32_t value, void* context);
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
@@ -922,7 +927,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t end_record = 0;
     uint64_t accumulated_samples = 0;
     uint32_t pending_segments = 0;
-    XenosReportController::PendingWrite pending_write;
     bool ended = false;
   };
   std::unordered_map<XenosReportController::QueryHandle, LogicalOcclusionQuery>

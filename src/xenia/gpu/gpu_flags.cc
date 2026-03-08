@@ -118,7 +118,6 @@ DEFINE_bool(occlusion_query_log, false,
             "GPU");
 DEFINE_int32(occlusion_query_pool_size, 8192,
              "Number of host occlusion query slots to allocate.\n"
-             "Number must be a power of 2.\n"
              "The default should be enough for most games. Raise it only if a "
              "game burns through the pool and starts stalling or hanging.",
              "GPU");

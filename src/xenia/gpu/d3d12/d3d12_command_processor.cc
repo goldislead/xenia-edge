@@ -1738,7 +1738,8 @@ bool D3D12CommandProcessor::SetupContext() {
   }
 
   // Report controller for occlusion queries.
-  occlusion_report_controller_ = std::make_unique<XenosReportController>();
+  occlusion_report_controller_ = std::make_unique<XenosReportController>(
+      &D3D12CommandProcessor::WriteOcclusionReportThunk, this);
   EnsureOcclusionQueryResources();
 
   pix_capture_requested_.store(false, std::memory_order_relaxed);
@@ -4099,6 +4100,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     completion_timeline_->SignalAndAdvance(direct_queue);
 
+    // Publish any pending guest occlusion report writes.
+    if (occlusion_report_controller_) {
+      occlusion_report_controller_->Update();
+    }
+
     submission_open_ = false;
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
@@ -5943,6 +5949,10 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(
     return false;
   }
 
+  {
+    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
+    EnsureOcclusionQueryResourcesLocked();
+  }
   if (!occlusion_query_heap_ || !occlusion_query_resolve_buffer_ ||
       !occlusion_query_readback_mapping_ || !occlusion_report_controller_) {
     return false;
@@ -5979,7 +5989,6 @@ bool D3D12CommandProcessor::BeginGuestOcclusionQuery(
     logical.end_record = begin_record;
     logical.accumulated_samples = 0;
     logical.pending_segments = 0;
-    logical.pending_write = {};
     logical.ended = false;
 
     // Mirror the currently active segment state
@@ -6030,7 +6039,6 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
                        LogicalOcclusionQuery>::iterator it =
         occlusion_queries_.find(query);
     if (it == occlusion_queries_.end()) {
-      occlusion_report_controller_->AbandonQuery(query);
       active_occlusion_query_segment_ = {};
       return false;
     }
@@ -6041,7 +6049,7 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
 
     begin_record = logical.begin_record;
 
-    // If no segments are pending, the query can be finished right now.
+    // If no segments are pending, finish immediately.
     if (logical.pending_segments == 0) {
       immediate_complete = true;
       immediate_samples = logical.accumulated_samples;
@@ -6059,38 +6067,22 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
     }
   }
 
-  uint32_t mirror_record = 0;
-  if (!forced_end && begin_record && record_base &&
-      XenosOcclusionReport::IsCommonHalfSplitPair(begin_record, record_base)) {
-    mirror_record = begin_record;
+  // Let the controller see the BEGIN/END pair from this lifetime. That helps
+  // later when guests bounce between the same report slots in ugly ways.
+  if (!forced_end) {
+    occlusion_report_controller_->ObserveBeginEndPair(
+        active_occlusion_query_segment_.begin_address_raw,
+        sample_count_address_raw);
   }
 
-  XenosReportController::PendingWrite pending_write =
-      occlusion_report_controller_->EndQuery(query, record_base, !forced_end,
-                                             mirror_record);
-  XenosReportController::RetiredWrite retired_write;
-
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    std::unordered_map<XenosReportController::QueryHandle,
-                       LogicalOcclusionQuery>::iterator it =
-        occlusion_queries_.find(query);
-    if (it != occlusion_queries_.end()) {
-      if (immediate_complete) {
-        occlusion_queries_.erase(it);
-      } else {
-        it->second.pending_write = pending_write;
-      }
-    }
-  }
+  // Queue the guest memory write before retiring the query so immediate
+  // completions can flush it in the same update.
+  occlusion_report_controller_->EnqueueWrite(
+      record_base, active_occlusion_query_segment_.query);
 
   if (immediate_complete) {
-    if (pending_write.valid) {
-      retired_write = occlusion_report_controller_->CompleteQuery(
-          pending_write, final_value);
-    } else {
-      occlusion_report_controller_->AbandonQuery(query);
-    }
+    occlusion_report_controller_->MarkQueryCompleted(query, final_value);
+    occlusion_report_controller_->Update();
   }
 
   // Fast readback can leave the END record pending until the resolve lands.
@@ -6115,21 +6107,11 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
                              is_common_half_split_pair);
   }
 
-  if (retired_write.valid) {
-    WriteOcclusionReportData(retired_write.begin_record,
-                             retired_write.sink_record, retired_write.value,
-                             retired_write.mirror_record ==
-                                 retired_write.begin_record);
-  }
-
   occlusion_query_stats_.logical_ended++;
 
-  if (forced_end && cvars::occlusion_query_log) {
-    XELOGI("OQ: Forced END for sink 0x{:08X}", record_base);
-  }
-
-  // Logical query is no longer accepting new host segments.
-  active_occlusion_query_segment_.logical_active = false;
+  // Drop the active logical/segment state. The logical query itself stays in
+  // the map until the controller retires the guest write.
+  active_occlusion_query_segment_ = {};
 
   return true;
 }
@@ -6411,7 +6393,6 @@ void D3D12CommandProcessor::ProcessCompletedOcclusionQueryResolves(
   struct CompletedReportQuery {
     XenosReportController::QueryHandle query =
         XenosReportController::kInvalidQuery;
-    XenosReportController::PendingWrite pending_write;
     uint32_t value = 0;
   };
 
@@ -6474,32 +6455,22 @@ void D3D12CommandProcessor::ProcessCompletedOcclusionQueryResolves(
 
         CompletedReportQuery completed_report_query;
         completed_report_query.query = resolve.query;
-        completed_report_query.pending_write = logical.pending_write;
         completed_report_query.value = final_value;
         completed_report_queries.push_back(completed_report_query);
-        occlusion_queries_.erase(it);
         occlusion_query_stats_.resolves_completed++;
       }
     }
   }
 
-  for (const CompletedReportQuery& completed_report_query :
-       completed_report_queries) {
-    XenosReportController::RetiredWrite retired_write;
-    if (completed_report_query.pending_write.valid) {
-      retired_write = occlusion_report_controller_->CompleteQuery(
-          completed_report_query.pending_write, completed_report_query.value);
-    } else {
-      occlusion_report_controller_->AbandonQuery(completed_report_query.query);
-    }
-
-    if (retired_write.valid) {
-      WriteOcclusionReportData(retired_write.begin_record,
-                               retired_write.sink_record, retired_write.value,
-                               retired_write.mirror_record ==
-                                   retired_write.begin_record);
+  if (!completed_report_queries.empty()) {
+    for (const CompletedReportQuery& completed_report_query :
+         completed_report_queries) {
+      occlusion_report_controller_->MarkQueryCompleted(
+          completed_report_query.query, completed_report_query.value);
     }
   }
+
+  occlusion_report_controller_->Update();
 }
 
 // Write a report value back to guest memory.
@@ -6527,6 +6498,42 @@ void D3D12CommandProcessor::WriteOcclusionReportData(uint32_t begin_record,
 
   XenosOcclusionReport::WriteGuestBeginEnd(begin, sink, value,
                                            write_begin_record);
+}
+
+// Write the finalized BEGIN/END sample count into guest report records and
+// retire the logical query.
+void D3D12CommandProcessor::WriteOcclusionReport(
+    XenosReportController::QueryHandle query, uint32_t sink_base,
+    uint32_t value) {
+  uint32_t begin_record = 0;
+  {
+    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
+    std::unordered_map<XenosReportController::QueryHandle,
+                       LogicalOcclusionQuery>::iterator it =
+        occlusion_queries_.find(query);
+    if (it != occlusion_queries_.end()) {
+      begin_record = it->second.begin_record;
+      occlusion_queries_.erase(it);
+    }
+  }
+
+  uint32_t sink_record = XenosOcclusionReport::RecordBase(sink_base);
+  if (!sink_record) {
+    // Nothing left to write here. Destination is stale or the lifetime was
+    // already discarded.
+    return;
+  }
+
+  WriteOcclusionReportData(begin_record, sink_record, value, true);
+}
+
+// Controller callback.
+void D3D12CommandProcessor::WriteOcclusionReportThunk(
+    XenosReportController::QueryHandle query, uint32_t sink_base,
+    uint32_t value, void* context) {
+  D3D12CommandProcessor* processor =
+      reinterpret_cast<D3D12CommandProcessor*>(context);
+  processor->WriteOcclusionReport(query, sink_base, value);
 }
 
 // Convert the raw hardware sample count into the 32-bit guest value,

@@ -1347,7 +1347,8 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Report controller for occlusion queries.
-  occlusion_report_controller_ = std::make_unique<XenosReportController>();
+  occlusion_report_controller_ = std::make_unique<XenosReportController>(
+      &VulkanCommandProcessor::WriteOcclusionReportThunk, this);
   EnsureOcclusionQueryResources();
 
   // Just not to expose uninitialized memory.
@@ -5058,6 +5059,8 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(
     return false;
   }
 
+  EnsureOcclusionQueryResources();
+
   if (occlusion_query_pool_ == VK_NULL_HANDLE ||
       !occlusion_query_readback_mapping_) {
     return false;
@@ -5097,7 +5100,6 @@ bool VulkanCommandProcessor::BeginGuestOcclusionQuery(
     logical.end_record = begin_record;
     logical.accumulated_samples = 0;
     logical.pending_segments = 0;
-    logical.pending_write = {};
     logical.ended = false;
     occlusion_queries_[query] = logical;
   }
@@ -5176,7 +5178,6 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(
         occlusion_queries_.find(query);
     if (it == occlusion_queries_.end()) {
       active_occlusion_query_segment_ = {};
-      occlusion_report_controller_->AbandonQuery(query);
       return false;
     }
 
@@ -5204,41 +5205,23 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(
     }
   }
 
-  uint32_t mirror_record = 0;
-  if (!forced_end && begin_record && record_base &&
-      XenosOcclusionReport::IsCommonHalfSplitPair(begin_record, record_base)) {
-    mirror_record = begin_record;
+  occlusion_query_stats_.logical_ended++;
+
+  if (!forced_end) {
+    occlusion_report_controller_->ObserveBeginEndPair(
+        active_occlusion_query_segment_.begin_address_raw,
+        sample_count_address_raw);
   }
 
-  XenosReportController::PendingWrite pending_write =
-      occlusion_report_controller_->EndQuery(query, record_base, !forced_end,
-                                             mirror_record);
-  XenosReportController::RetiredWrite retired_write;
-
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    std::unordered_map<XenosReportController::QueryHandle,
-                       LogicalOcclusionQuery>::iterator it =
-        occlusion_queries_.find(query);
-    if (it != occlusion_queries_.end()) {
-      if (immediate_complete) {
-        occlusion_queries_.erase(it);
-      } else {
-        it->second.pending_write = pending_write;
-      }
-    }
-  }
+  // Queue the guest memory write before retiring the query so immediate
+  // completions can flush it in the same update.
+  occlusion_report_controller_->EnqueueWrite(
+      record_base, active_occlusion_query_segment_.query);
 
   if (immediate_complete) {
-    if (pending_write.valid) {
-      retired_write = occlusion_report_controller_->CompleteQuery(pending_write,
-                                                                  final_value);
-    } else {
-      occlusion_report_controller_->AbandonQuery(query);
-    }
+    occlusion_report_controller_->MarkQueryCompleted(query, final_value);
+    occlusion_report_controller_->Update();
   }
-
-  occlusion_query_stats_.logical_ended++;
 
   // With fast readback, write a cached delta to unblock guest polling
   // while the real resolve is still in flight.
@@ -5259,13 +5242,6 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(
     // titles poll both halves and get upset if one side still looks pending.
     WriteOcclusionReportData(begin_record, record_base, cached_delta,
                              is_common_half_split_pair);
-  }
-
-  if (retired_write.valid) {
-    WriteOcclusionReportData(retired_write.begin_record,
-                             retired_write.sink_record, retired_write.value,
-                             retired_write.mirror_record ==
-                                 retired_write.begin_record);
   }
 
   active_occlusion_query_segment_.logical_active = false;
@@ -5583,16 +5559,10 @@ void VulkanCommandProcessor::ProcessCompletedOcclusionQueryResolves(
     return;
   }
 
-  struct CompletedReportQuery {
-    XenosReportController::QueryHandle query =
-        XenosReportController::kInvalidQuery;
-    XenosReportController::PendingWrite pending_write;
-    uint32_t value = 0;
-  };
-
   uint64_t settle_margin =
       GetReadbackResolveMode() == ReadbackResolveMode::kFast ? 1 : 0;
-  std::vector<CompletedReportQuery> completed_report_queries;
+  std::vector<std::pair<XenosReportController::QueryHandle, uint32_t>>
+      completed_report_queries;
 
   {
     std::unique_lock<std::mutex> lock(occlusion_query_mutex_);
@@ -5672,35 +5642,20 @@ void VulkanCommandProcessor::ProcessCompletedOcclusionQueryResolves(
         if (logical.end_record) {
           occlusion_query_fast_cached_values_[logical.end_record] = final_value;
         }
-
-        CompletedReportQuery completed_report_query;
-        completed_report_query.query = resolve.query;
-        completed_report_query.pending_write = logical.pending_write;
-        completed_report_query.value = final_value;
-        completed_report_queries.push_back(completed_report_query);
-        occlusion_queries_.erase(it);
+        completed_report_queries.emplace_back(resolve.query, final_value);
         occlusion_query_stats_.resolves_completed++;
       }
     }
   }
 
-  for (const CompletedReportQuery& completed_report_query :
-       completed_report_queries) {
-    XenosReportController::RetiredWrite retired_write;
-    if (completed_report_query.pending_write.valid) {
-      retired_write = occlusion_report_controller_->CompleteQuery(
-          completed_report_query.pending_write, completed_report_query.value);
-    } else {
-      occlusion_report_controller_->AbandonQuery(completed_report_query.query);
-    }
-
-    if (retired_write.valid) {
-      WriteOcclusionReportData(retired_write.begin_record,
-                               retired_write.sink_record, retired_write.value,
-                               retired_write.mirror_record ==
-                                   retired_write.begin_record);
+  if (!completed_report_queries.empty()) {
+    for (const auto& completed_report_query : completed_report_queries) {
+      occlusion_report_controller_->MarkQueryCompleted(
+          completed_report_query.first, completed_report_query.second);
     }
   }
+
+  occlusion_report_controller_->Update();
 }
 
 // Write a report value back to guest memory.
@@ -5728,6 +5683,63 @@ void VulkanCommandProcessor::WriteOcclusionReportData(uint32_t begin_record,
 
   XenosOcclusionReport::WriteGuestBeginEnd(begin, sink, value,
                                            write_begin_record);
+}
+
+// Write the finished BEGIN/END sample count to guest memory and retire the
+// logical query on the backend side.
+void VulkanCommandProcessor::WriteOcclusionReport(
+    XenosReportController::QueryHandle query, uint32_t sink_base,
+    uint32_t value) {
+  uint32_t begin_record = 0;
+
+  {
+    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
+    std::unordered_map<XenosReportController::QueryHandle,
+                       LogicalOcclusionQuery>::iterator it =
+        occlusion_queries_.find(query);
+    if (it != occlusion_queries_.end()) {
+      begin_record = it->second.begin_record;
+      occlusion_queries_.erase(it);
+    }
+  }
+
+  uint32_t sink_record = XenosOcclusionReport::RecordBase(sink_base);
+  if (!sink_record) {
+    // Nothing left to write here. Destination is stale or the lifetime was
+    // already discarded.
+    return;
+  }
+
+  WriteOcclusionReportData(begin_record, sink_record, value, true);
+}
+
+// Controller callback.
+void VulkanCommandProcessor::WriteOcclusionReportThunk(
+    XenosReportController::QueryHandle query, uint32_t sink_base,
+    uint32_t value, void* context) {
+  reinterpret_cast<VulkanCommandProcessor*>(context)->WriteOcclusionReport(
+      query, sink_base, value);
+}
+
+// Convert the raw hardware sample count into the 32-bit guest value, and scale
+// it back down if upscaling.
+uint32_t VulkanCommandProcessor::NormalizeOcclusionSamples(
+    uint64_t samples) const {
+  if (samples == 0) {
+    return 0;
+  }
+
+  if (!texture_cache_) {
+    return static_cast<uint32_t>(std::min<uint64_t>(samples, UINT32_MAX));
+  }
+
+  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
+  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
+  uint64_t scale = scale_x * scale_y;
+
+  uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
+
+  return static_cast<uint32_t>(std::min<uint64_t>(normalized, UINT32_MAX));
 }
 
 void VulkanCommandProcessor::InitializeTrace() {
