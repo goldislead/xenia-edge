@@ -1146,9 +1146,6 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   return true;
 }
 
-static uint32_t samples = cvars::occlusion_query_fake_upper_threshold;
-
-#if !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
@@ -1164,56 +1161,90 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(event_type);
 
-  if (cvars::occlusion_query_fake_lower_threshold < 0) {
-    return true;
-  }
-
-  // Occlusion query fake sample-count fallback.
-  // This command is sent on query BEGIN and END.
-  // Use the same address and sentinel rules as the hardware report.
-  uint32_t sample_count_address_raw =
+  uint32_t report_address =
       register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  uint32_t record_base =
-      xe::gpu::XenosOcclusionReport::RecordBase(sample_count_address_raw);
-  if (!record_base) {
+  // Base of the BEGIN/END report pair in guest memory.
+  uint32_t report_record_base =
+      xe::gpu::XenosZPDReport::GetRecordBase(report_address);
+  xe_gpu_depth_sample_counts* end_report =
+      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+          report_record_base);
+
+  // Guest marks END by leaving the 0xFFFFFEED pending sentinel in the report.
+  bool guest_marks_end =
+      end_report && xe::gpu::XenosZPDReport::IsReportPending(end_report);
+
+  if (cvars::occlusion_query_enable && zpd_report_controller_) {
+    COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
+    if (COMMAND_PROCESSOR::IsHostZPDQueryPoolReady()) {
+      if (!report_record_base) {
+        return true;
+      }
+
+      bool logical_active = active_host_zpd_query_segment_.logical_active;
+
+      if (logical_active) {
+        // A new write ends the current logical report first. It ends the
+        // active lifetime or starts a new one if nothing is active.
+        COMMAND_PROCESSOR::EndGuestZPDReport(report_address, false);
+        return true;
+      }
+
+      // No active report and no pending END sentinel. Treat this as BEGIN.
+      if (!guest_marks_end) {
+        COMMAND_PROCESSOR::BeginGuestZPDReport(report_address);
+        return true;
+      }
+
+      if (COMMAND_PROCESSOR::IsFastZPDPathEnabled()) {
+        // Guest marked END, but there is no active logical report. Clear the
+        // pending state with a cached delta so polling code does not sit on
+        // the sentinel forever.
+        uint32_t cached_delta =
+            static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
+        {
+          std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+          auto existing_cached_delta =
+              fast_zpd_report_cached_values_.find(report_record_base);
+          if (existing_cached_delta != fast_zpd_report_cached_values_.end()) {
+            cached_delta = existing_cached_delta->second;
+          } else {
+            fast_zpd_report_cached_values_.emplace(report_record_base,
+                                                   cached_delta);
+          }
+        }
+
+        COMMAND_PROCESSOR::CommitGuestZPDReportData(0, report_record_base,
+                                                    cached_delta, false);
+      }
+      return true;
+    }
+
+    // Some titles handle an unavailable result better than a wait. Let the
+    // backend decide whether to drop this write.
+    if (COMMAND_PROCESSOR::ShouldDropHostZPDReportIfUnavailable()) {
+      return true;
+    }
+  }
+
+  // Fake sample count fallback.
+  if (cvars::occlusion_query_fake_lower_threshold < 0 || !report_record_base ||
+      !guest_marks_end) {
     return true;
   }
 
-  xe_gpu_depth_sample_counts* record =
-      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(record_base);
-  if (!record) {
-    return true;
+  if (fake_zpd_sample_count_ <=
+      static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold)) {
+    fake_zpd_sample_count_ =
+        static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold);
+  } else {
+    --fake_zpd_sample_count_;
   }
 
-  // The guest writes the pending sentinel on END.
-  // BEGIN leaves the report in the cleared state.
-  // Only create a result once the report actually looks pending.
-  if (!xe::gpu::XenosOcclusionReport::IsReportPending(record)) {
-    return true;
-  }
-
-  std::memset(record, 0, sizeof(xe_gpu_depth_sample_counts));
-
-  // Write to all words so guests polling any field or reading 64-bit totals,
-  // can see a finished report.
-  record->Total_A = samples;
-  record->Total_B = samples;
-  record->ZPass_A = samples;
-  record->ZPass_B = samples;
-  record->ZFail_A = samples;
-  record->ZFail_B = samples;
-  record->StencilFail_A = samples;
-  record->StencilFail_B = samples;
-
-  samples =
-      samples <=
-              static_cast<uint32_t>(cvars::occlusion_query_fake_lower_threshold)
-          ? static_cast<uint32_t>(cvars::occlusion_query_fake_upper_threshold)
-          : samples - 1;
-
+  // The result is ready. Write the sample count back to the report.
+  XenosZPDReport::WriteSampleCount(end_report, fake_zpd_sample_count_);
   return true;
 }
-#endif  // !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
     uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,

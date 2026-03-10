@@ -9,6 +9,7 @@
 
 #ifndef XENIA_GPU_GPU_FLAGS_H_
 #define XENIA_GPU_GPU_FLAGS_H_
+
 #include "xenia/base/cvar.h"
 
 DECLARE_path(trace_gpu_prefix);
@@ -34,6 +35,8 @@ DECLARE_bool(occlusion_query_enable);
 DECLARE_int32(occlusion_query_fake_lower_threshold);
 
 DECLARE_int32(occlusion_query_fake_upper_threshold);
+
+DECLARE_bool(occlusion_query_fast);
 
 DECLARE_int32(occlusion_query_fast_cached_delta);
 

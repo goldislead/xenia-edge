@@ -82,11 +82,16 @@ DEFINE_bool(
 
 DEFINE_bool(occlusion_query_enable, false,
             "Use real host occlusion queries instead of faking results.\n"
-            "Needs fast or full readback to be useful. Full readback may "
-            "may required for stable results in some games.\n"
-            "Still experimental. Some games improve a lot. Others may show "
-            "missing objects, slow lens flare updates, or hangs.",
+            "Still experimental. Some games improve a lot. Others may "
+            "experience missing objects, slow lens flare updates, or hangs.",
             "GPU");
+DEFINE_bool(
+    occlusion_query_fast, true,
+    "Enable the fast path for hardware occlusion queries.\n"
+    "Uses cached delta writes and a one submission delay so guest polling "
+    "doesn't stall while the real resolve catches up. Some games need this "
+    "disabled to handle occlusion correctly.",
+    "GPU");
 DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
              "Lower end of the fake sample count value written on "
              "EVENT_WRITE_ZPD when real occlusion queries are off.\n"
@@ -121,6 +126,7 @@ DEFINE_int32(occlusion_query_pool_size, 8192,
              "The default should be enough for most games. Raise it only if a "
              "game burns through the pool and starts stalling or hanging.",
              "GPU");
+
 void SetOcclusionQueryEnable(bool value) {
   OVERRIDE_bool(occlusion_query_enable, value);
 }

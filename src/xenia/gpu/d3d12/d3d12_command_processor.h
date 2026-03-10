@@ -37,7 +37,6 @@
 #include "xenia/gpu/dxbc_shader_translator.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
-#include "xenia/gpu/xenos_report_controller.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/d3d12/d3d12_descriptor_heap_pool.h"
@@ -60,6 +59,8 @@ struct MemExportRange {
   uint32_t base_address_dwords;
   uint32_t size_dwords;
 };
+class D3D12ZPDQueryPool;
+
 class D3D12CommandProcessor final : public CommandProcessor {
  protected:
 #define OVERRIDING_BASE_CMDPROCESSOR
@@ -506,26 +507,29 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
-  void EnsureOcclusionQueryResources();
-  void EnsureOcclusionQueryResourcesLocked();
-  void ShutdownOcclusionQueryResources();
-  void ShutdownOcclusionQueryResourcesLocked();
-  bool BeginGuestOcclusionQuery(uint32_t sample_count_address_raw);
-  bool EndGuestOcclusionQuery(uint32_t sample_count_address_raw,
-                              bool forced_end);
-  void ResumeActiveOcclusionQuerySegment(bool allow_submission_close);
-  void SplitActiveOcclusionQuerySegment();
-  void QueueOcclusionQueryResolveBatchIndexLocked(uint32_t host_index);
-  void FlushOcclusionQueryResolveBatch();
-  void ProcessCompletedOcclusionQueryResolves(uint64_t completed_submission);
-  void WriteOcclusionReportData(uint32_t begin_record, uint32_t sink_record,
-                                uint32_t value, bool write_begin_record);
-  void WriteOcclusionReport(XenosReportController::QueryHandle query,
-                            uint32_t sink_base, uint32_t value);
-  uint32_t NormalizeOcclusionSamples(uint64_t samples) const;
-  static void WriteOcclusionReportThunk(
-      XenosReportController::QueryHandle query, uint32_t sink_base,
-      uint32_t value, void* context);
+  // ZPD query pool and submission state.
+  void EnsureZPDHostQueryResources() override;
+  void ShutdownZPDHostQueryResources() override;
+  bool IsHostZPDQueryPoolReady() const override;
+  bool CanOpenHostZPDQueryNow() const override;
+  HostZPDQueryOpenResult OpenHostZPDQuery(uint32_t& out_host_index,
+                                          uint32_t& out_host_generation,
+                                          bool can_close_submission) override;
+  bool CloseHostZPDQuery(uint32_t host_index, uint32_t host_generation,
+                         uint64_t& out_submission) override;
+  uint64_t GetHostZPDQueryResult(uint32_t host_index) override;
+  void ReleaseHostZPDQuery(uint32_t host_index,
+                           uint32_t host_generation) override;
+  uint64_t GetHostZPDCurrentSubmission() const override;
+  uint64_t GetHostZPDCompletedSubmission() const override;
+  void AwaitHostZPDSubmissionAndUpdateCompleted(uint64_t submission) override;
+  bool CanEndHostZPDSubmissionImmediately() const override;
+  bool EndHostZPDSubmission(bool is_swap) override;
+  uint32_t GetZPDReportDrawResolutionScaleX() const override;
+  uint32_t GetZPDReportDrawResolutionScaleY() const override;
+
+  // Records the pending resolve batch on the current command list.
+  void RecordHostZPDQueryResolveBatch();
 
   bool device_removed_ = false;
 
@@ -572,6 +576,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
+
+  std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
@@ -728,70 +734,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Kept in NON_PIXEL_SHADER_RESOURCE state.
   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
   uint64_t fxaa_source_texture_submission_ = 0;
-
-  // Occlusion query state. The controller handles the guest lifetime rules.
-  // This side mostly owns the host query pool, the resolve/readback plumbing,
-  // and the bits needed to stitch host results back onto guest records.
-  mutable std::mutex occlusion_query_mutex_;
-  std::unique_ptr<XenosReportController> occlusion_report_controller_;
-
-  Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_readback_buffer_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> occlusion_query_resolve_buffer_;
-  D3D12_RESOURCE_STATES occlusion_query_resolve_buffer_state_ =
-      D3D12_RESOURCE_STATE_COPY_DEST;
-  uint64_t* occlusion_query_readback_mapping_ = nullptr;
-
-  uint32_t occlusion_query_capacity_ = 0;
-  std::vector<uint32_t> occlusion_query_free_indices_;
-
-  xe::BitMap occlusion_query_resolve_batch_index_map_;
-  uint32_t occlusion_query_resolve_batch_index_count_ = 0;
-
-  struct LogicalOcclusionQuery {
-    uint32_t begin_address_raw = 0;
-    uint32_t begin_record = 0;
-    uint32_t end_record = 0;
-    uint64_t accumulated_samples = 0;
-    uint32_t pending_segments = 0;
-    bool ended = false;
-  };
-  std::unordered_map<XenosReportController::QueryHandle, LogicalOcclusionQuery>
-      occlusion_queries_;
-
-  struct ActiveOcclusionQuerySegment {
-    XenosReportController::QueryHandle query =
-        XenosReportController::kInvalidQuery;
-    uint32_t begin_address_raw = 0;
-    uint32_t begin_record = 0;
-    uint32_t end_address_raw = 0;
-    uint32_t host_index = UINT32_MAX;
-    bool segment_active = false;
-    bool logical_active = false;
-  } active_occlusion_query_segment_;
-
-  struct OcclusionQueryResolve {
-    uint64_t submission = 0;
-    uint32_t host_index = 0;
-    XenosReportController::QueryHandle query =
-        XenosReportController::kInvalidQuery;
-  };
-  std::deque<OcclusionQueryResolve> occlusion_query_resolves_in_flight_;
-
-  // Speculative END values for fast readback.
-  std::unordered_map<uint32_t, uint32_t> occlusion_query_fast_cached_values_;
-
-  struct OcclusionQueryStats {
-    uint64_t logical_begun = 0;
-    uint64_t logical_ended = 0;
-    uint64_t segments_begun = 0;
-    uint64_t segments_ended = 0;
-    uint64_t resolves_completed = 0;
-    uint64_t resolves_discarded_stale = 0;
-    uint64_t pool_exhausted = 0;
-    uint64_t failed = 0;
-    uint64_t last_log_frame = 0;
-  } occlusion_query_stats_;
 
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;

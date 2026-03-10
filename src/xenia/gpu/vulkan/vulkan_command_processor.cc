@@ -31,9 +31,10 @@
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
+#include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
-#include "xenia/gpu/xenos_occlusion_report.h"
 #include "xenia/gpu/xenos_report_controller.h"
+#include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
@@ -180,74 +181,6 @@ void VulkanCommandProcessor::InitializeShaderStorage(
 }
 
 void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
-
-bool VulkanCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(
-    uint32_t packet, uint32_t count) {
-  if (!cvars::occlusion_query_enable || !occlusion_report_controller_) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet, count);
-  }
-  assert_true(count == 1);
-
-  EnsureOcclusionQueryResources();
-  if (occlusion_query_pool_ == VK_NULL_HANDLE ||
-      !occlusion_query_readback_mapping_ || occlusion_query_capacity_ == 0) {
-    return CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(packet, count);
-  }
-
-  uint32_t sample_count_address_raw =
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
-  uint32_t event_type_raw = initiator & 0x3F;
-  VulkanCommandProcessor::WriteEventInitiator(event_type_raw);
-
-  uint32_t record_base =
-      XenosOcclusionReport::RecordBase(sample_count_address_raw);
-  if (!record_base) {
-    return true;
-  }
-
-  xenos::xe_gpu_depth_sample_counts* report =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
-          record_base);
-  bool guest_marks_end =
-      report && XenosOcclusionReport::IsReportPending(report);
-
-  bool logical_active = active_occlusion_query_segment_.logical_active;
-
-  if (!guest_marks_end) {
-    // No pending sentinel. Treat this as a BEGIN.
-    if (!logical_active) {
-      BeginGuestOcclusionQuery(sample_count_address_raw);
-    } else {
-      EndGuestOcclusionQuery(sample_count_address_raw, false);
-    }
-    return true;
-  }
-
-  if (logical_active) {
-    // Pending sentinel while a query is active. Treat this as END.
-    EndGuestOcclusionQuery(sample_count_address_raw, false);
-    return true;
-  }
-
-  uint32_t cached_delta =
-      static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    std::unordered_map<uint32_t, uint32_t>::iterator it_cache =
-        occlusion_query_fast_cached_values_.find(record_base);
-    if (it_cache == occlusion_query_fast_cached_values_.end()) {
-      occlusion_query_fast_cached_values_.emplace(record_base, cached_delta);
-    } else {
-      cached_delta = it_cache->second;
-    }
-  }
-
-  // Guest marked END, but there is no active logical query. We must clear the
-  // pending state to avoid forever polling.
-  WriteOcclusionReportData(0, record_base, cached_delta, false);
-  return true;
-}
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
@@ -1346,10 +1279,8 @@ bool VulkanCommandProcessor::SetupContext() {
             resolve_downscale_descriptor_set_layout_);
   }
 
-  // Report controller for occlusion queries.
-  occlusion_report_controller_ = std::make_unique<XenosReportController>(
-      &VulkanCommandProcessor::WriteOcclusionReportThunk, this);
-  EnsureOcclusionQueryResources();
+  zpd_host_query_pool_ = std::make_unique<VulkanZPDQueryPool>();
+  EnsureZPDHostQueryResources();
 
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
@@ -1360,8 +1291,8 @@ bool VulkanCommandProcessor::SetupContext() {
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
 
-  ShutdownOcclusionQueryResources();
-  occlusion_report_controller_.reset();
+  ShutdownZPDHostQueryResources();
+  zpd_host_query_pool_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2536,8 +2467,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
   in_render_pass_ = true;
 
-  // If a logical query is active, begin its host segment.
-  ResumeActiveOcclusionQuerySegment(false);
+  // Resume the active query segment.
+  ResumeActiveHostZPDQuerySegment(false);
 }
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -2643,7 +2574,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
   in_render_pass_ = true;
 
-  ResumeActiveOcclusionQuerySegment(false);
+  ResumeActiveHostZPDQuerySegment(false);
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
@@ -2651,12 +2582,12 @@ void VulkanCommandProcessor::EndRenderPass() {
   if (!in_render_pass_) {
     return;
   }
-  // Ensure no occlusion query segment remains open.
+  // Don't leave a query segment open here.
   if (cvars::occlusion_query_enable &&
-      active_occlusion_query_segment_.segment_active) {
-    SplitActiveOcclusionQuerySegment();
-    if (active_occlusion_query_segment_.logical_active) {
-      active_occlusion_query_segment_.segment_pending_begin = true;
+      active_host_zpd_query_segment_.segment_active) {
+    SplitActiveHostZPDQuerySegment();
+    if (active_host_zpd_query_segment_.logical_active) {
+      active_host_zpd_query_segment_.segment_pending_begin = true;
     }
   }
   // Use current_render_pass_ to determine which end command to use.
@@ -2669,8 +2600,6 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
-  // Reset any indices recycled by completed occlusion queries.
-  ResetPendingOcclusionQueryPoolIndices();
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -4739,1007 +4668,199 @@ VkBuffer VulkanCommandProcessor::RequestReadbackBuffer(uint32_t size) {
   return memexport_readback_buffer_;
 }
 
-// Make sure the host OQ pool and the resolve/readback buffers exist, and
-// that they still line up with the current pool size.
-void VulkanCommandProcessor::EnsureOcclusionQueryResources() {
-  if (!cvars::occlusion_query_enable) {
+void VulkanCommandProcessor::EnsureZPDHostQueryResources() {
+  if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-  EnsureOcclusionQueryResourcesLocked();
-}
-
-// Caller already holds the mutex.
-void VulkanCommandProcessor::EnsureOcclusionQueryResourcesLocked() {
-  if (!cvars::occlusion_query_enable) {
-    return;
-  }
-
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
   uint32_t requested_capacity =
-      XenosOcclusionReport::ClampPoolCapacity(cvars::occlusion_query_pool_size);
-
-  bool have_resources = occlusion_query_pool_ != VK_NULL_HANDLE &&
-                        occlusion_query_resolve_buffer_ != VK_NULL_HANDLE &&
-                        occlusion_query_readback_buffer_ != VK_NULL_HANDLE &&
-                        occlusion_query_readback_mapping_ &&
-                        occlusion_query_capacity_ != 0;
-
-  if (have_resources && occlusion_query_capacity_ == requested_capacity) {
-    return;
-  }
-
-  if (have_resources) {
-    bool busy = active_occlusion_query_segment_.logical_active ||
-                active_occlusion_query_segment_.segment_active ||
-                occlusion_query_reset_pending_index_count_ != 0 ||
-                occlusion_query_resolve_batch_index_count_ != 0 ||
-                !occlusion_query_resolves_in_flight_.empty();
-    if (busy) {
-      return;
-    }
-  }
-
-  // If partially initialized, tear down first so sizes stay consistent.
-  if (occlusion_query_pool_ != VK_NULL_HANDLE ||
-      occlusion_query_resolve_buffer_ != VK_NULL_HANDLE ||
-      occlusion_query_readback_buffer_ != VK_NULL_HANDLE ||
-      occlusion_query_readback_memory_ != VK_NULL_HANDLE) {
-    ShutdownOcclusionQueryResourcesLocked();
-  }
-
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  if (!vulkan_device) {
-    return;
-  }
-
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-
-  // Create query pool.
-  VkQueryPoolCreateInfo pool_info;
-  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-  pool_info.pNext = nullptr;
-  pool_info.flags = 0;
-  pool_info.queryType = VK_QUERY_TYPE_OCCLUSION;
-  pool_info.queryCount = requested_capacity;
-  pool_info.pipelineStatistics = 0;
-  VkResult create_pool_result = dfn.vkCreateQueryPool(
-      device, &pool_info, nullptr, &occlusion_query_pool_);
-  if (create_pool_result != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to create occlusion query pool, "
-        "falling back to fake sample counts.");
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  // vkCmdCopyQueryPoolResults writes here first, then we copy to the readback
-  // buffer in one batch.
-  VkBufferCreateInfo resolve_buffer_info;
-  resolve_buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  resolve_buffer_info.pNext = nullptr;
-  resolve_buffer_info.flags = 0;
-  resolve_buffer_info.size =
-      VkDeviceSize(XenosOcclusionReport::kQueryResultStrideBytes) *
-      requested_capacity;
-  resolve_buffer_info.usage =
-      VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  resolve_buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  resolve_buffer_info.queueFamilyIndexCount = 0;
-  resolve_buffer_info.pQueueFamilyIndices = nullptr;
-
-  if (dfn.vkCreateBuffer(device, &resolve_buffer_info, nullptr,
-                         &occlusion_query_resolve_buffer_) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to create occlusion query resolve "
-        "buffer, falling back to fake sample counts.");
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  VkMemoryRequirements resolve_mem_reqs;
-  dfn.vkGetBufferMemoryRequirements(device, occlusion_query_resolve_buffer_,
-                                    &resolve_mem_reqs);
-
-  VkMemoryAllocateInfo resolve_alloc_info;
-  resolve_alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  resolve_alloc_info.pNext = nullptr;
-  resolve_alloc_info.allocationSize = resolve_mem_reqs.size;
-  resolve_alloc_info.memoryTypeIndex = ui::vulkan::util::ChooseMemoryType(
-      vulkan_device->memory_types(), resolve_mem_reqs.memoryTypeBits,
-      ui::vulkan::util::MemoryPurpose::kDeviceLocal);
-
-  if (resolve_alloc_info.memoryTypeIndex == UINT32_MAX ||
-      dfn.vkAllocateMemory(device, &resolve_alloc_info, nullptr,
-                           &occlusion_query_resolve_memory_) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to allocate occlusion query resolve "
-        "memory, falling back to fake sample counts.");
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  if (dfn.vkBindBufferMemory(device, occlusion_query_resolve_buffer_,
-                             occlusion_query_resolve_memory_,
-                             0) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to bind occlusion query resolve buffer "
-        "memory, falling back to fake sample counts.");
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-    occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  VkBufferCreateInfo readback_buffer_info;
-  readback_buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  readback_buffer_info.pNext = nullptr;
-  readback_buffer_info.flags = 0;
-  readback_buffer_info.size =
-      VkDeviceSize(XenosOcclusionReport::kQueryResultStrideBytes) *
-      requested_capacity;
-  readback_buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-  readback_buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-  readback_buffer_info.queueFamilyIndexCount = 0;
-  readback_buffer_info.pQueueFamilyIndices = nullptr;
-  if (dfn.vkCreateBuffer(device, &readback_buffer_info, nullptr,
-                         &occlusion_query_readback_buffer_) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to create occlusion query readback "
-        "buffer, falling back to fake sample counts.");
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-    occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  VkMemoryRequirements readback_mem_reqs;
-  dfn.vkGetBufferMemoryRequirements(device, occlusion_query_readback_buffer_,
-                                    &readback_mem_reqs);
-
-  VkMemoryAllocateInfo readback_alloc_info;
-  readback_alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-  readback_alloc_info.pNext = nullptr;
-  readback_alloc_info.allocationSize = readback_mem_reqs.size;
-  readback_alloc_info.memoryTypeIndex = ui::vulkan::util::ChooseMemoryType(
-      vulkan_device->memory_types(), readback_mem_reqs.memoryTypeBits,
-      ui::vulkan::util::MemoryPurpose::kReadback);
-
-  if (readback_alloc_info.memoryTypeIndex == UINT32_MAX ||
-      dfn.vkAllocateMemory(device, &readback_alloc_info, nullptr,
-                           &occlusion_query_readback_memory_) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to allocate occlusion query readback "
-        "memory, falling back to fake sample counts.");
-    dfn.vkDestroyBuffer(device, occlusion_query_readback_buffer_, nullptr);
-    occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-    occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  occlusion_query_readback_is_coherent_ =
-      (vulkan_device->memory_types().host_coherent &
-       (1u << readback_alloc_info.memoryTypeIndex)) != 0;
-
-  if (dfn.vkBindBufferMemory(device, occlusion_query_readback_buffer_,
-                             occlusion_query_readback_memory_,
-                             0) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to bind occlusion query readback "
-        "buffer memory, falling back to fake sample counts.");
-    dfn.vkFreeMemory(device, occlusion_query_readback_memory_, nullptr);
-    occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_readback_buffer_, nullptr);
-    occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-    occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  void* mapping = nullptr;
-  if (dfn.vkMapMemory(device, occlusion_query_readback_memory_, 0,
-                      VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
-    XELOGW(
-        "VulkanCommandProcessor: Failed to map occlusion query readback "
-        "memory, falling back to fake sample counts.");
-    dfn.vkFreeMemory(device, occlusion_query_readback_memory_, nullptr);
-    occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_readback_buffer_, nullptr);
-    occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-    occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-    occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-    occlusion_query_pool_ = VK_NULL_HANDLE;
-    return;
-  }
-
-  occlusion_query_readback_mapping_ = reinterpret_cast<uint64_t*>(mapping);
-  occlusion_query_capacity_ = requested_capacity;
-
-  occlusion_query_free_indices_.clear();
-  occlusion_query_index_generations_.assign(requested_capacity, 0);
-
-  size_t requested_capacity_rounded = xe::align(requested_capacity, 64u);
-
-  occlusion_query_resolve_batch_index_map_.Resize(requested_capacity_rounded);
-  occlusion_query_reset_pending_index_map_.Resize(requested_capacity_rounded);
-
-  // Everything starts dirty here. The pool has to be reset on the GPU before
-  // first use, and Vulkan does not let us do that inside a render pass.
-  QueueAllOcclusionQueryResetPendingIndices(requested_capacity);
+      GetClampedHostZPDPoolCapacity(cvars::occlusion_query_pool_size);
+  bool can_recreate = !active_host_zpd_query_segment_.logical_active &&
+                      !active_host_zpd_query_segment_.segment_active &&
+                      !zpd_host_query_pool_->has_pending_resolve_batch() &&
+                      host_zpd_query_resolves_in_flight_.empty();
+  zpd_host_query_pool_->EnsureInitialized(GetVulkanDevice(), requested_capacity,
+                                          can_recreate);
 }
 
-// Drop all host OQ resources. This is only safe once the GPU is really idle.
-void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
-  std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-  ShutdownOcclusionQueryResourcesLocked();
+void VulkanCommandProcessor::ShutdownZPDHostQueryResources() {
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+  active_host_zpd_query_segment_ = {};
+  logical_zpd_reports_.clear();
+  fast_zpd_report_cached_values_.clear();
+  host_zpd_query_resolves_in_flight_.clear();
+  if (zpd_host_query_pool_) {
+    zpd_host_query_pool_->Shutdown();
+  }
 }
 
-// Caller already holds the mutex.
-void VulkanCommandProcessor::ShutdownOcclusionQueryResourcesLocked() {
-  // End any active segment.
-  active_occlusion_query_segment_ = {};
-  occlusion_queries_.clear();
-  occlusion_query_fast_cached_values_.clear();
-  occlusion_query_resolves_in_flight_.clear();
-  occlusion_query_free_indices_.clear();
-  occlusion_query_reset_pending_index_map_.Resize(0);
-  occlusion_query_reset_pending_index_count_ = 0;
-  occlusion_query_resolve_batch_index_map_.Resize(0);
-  occlusion_query_resolve_batch_index_count_ = 0;
-  occlusion_query_index_generations_.clear();
-  occlusion_query_capacity_ = 0;
-  occlusion_query_readback_is_coherent_ = true;
-
-  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-  if (!vulkan_device) {
-    return;
-  }
-
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-
-  if (occlusion_query_readback_mapping_ && occlusion_query_readback_memory_) {
-    dfn.vkUnmapMemory(device, occlusion_query_readback_memory_);
-  }
-  occlusion_query_readback_mapping_ = nullptr;
-
-  if (occlusion_query_readback_buffer_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyBuffer(device, occlusion_query_readback_buffer_, nullptr);
-  }
-  occlusion_query_readback_buffer_ = VK_NULL_HANDLE;
-
-  if (occlusion_query_readback_memory_ != VK_NULL_HANDLE) {
-    dfn.vkFreeMemory(device, occlusion_query_readback_memory_, nullptr);
-  }
-  occlusion_query_readback_memory_ = VK_NULL_HANDLE;
-
-  if (occlusion_query_resolve_buffer_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyBuffer(device, occlusion_query_resolve_buffer_, nullptr);
-  }
-  occlusion_query_resolve_buffer_ = VK_NULL_HANDLE;
-
-  if (occlusion_query_resolve_memory_ != VK_NULL_HANDLE) {
-    dfn.vkFreeMemory(device, occlusion_query_resolve_memory_, nullptr);
-  }
-  occlusion_query_resolve_memory_ = VK_NULL_HANDLE;
-
-  if (occlusion_query_pool_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyQueryPool(device, occlusion_query_pool_, nullptr);
-  }
-  occlusion_query_pool_ = VK_NULL_HANDLE;
+bool VulkanCommandProcessor::IsHostZPDQueryPoolReady() const {
+  return zpd_host_query_pool_ && zpd_host_query_pool_->is_initialized();
 }
 
-// Start a logical guest query lifetime and begin its first host segment.
-bool VulkanCommandProcessor::BeginGuestOcclusionQuery(
-    uint32_t sample_count_address_raw) {
-  if (!cvars::occlusion_query_enable) {
-    return false;
-  }
-
-  EnsureOcclusionQueryResources();
-
-  if (occlusion_query_pool_ == VK_NULL_HANDLE ||
-      !occlusion_query_readback_mapping_) {
-    return false;
-  }
-
-  if (!occlusion_report_controller_) {
-    return false;
-  }
-
-  // Some games will happily BEGIN again without closing the old one. Force an
-  // END so the FIFO side keeps moving instead of wedging on stale state.
-  if (active_occlusion_query_segment_.logical_active) {
-    if (cvars::occlusion_query_log) {
-      XELOGW(
-          "OQ: Forced END before BEGIN (prev_end=0x{:08X}, new_begin=0x{:08X})",
-          active_occlusion_query_segment_.end_address_raw,
-          sample_count_address_raw);
-    }
-    EndGuestOcclusionQuery(active_occlusion_query_segment_.end_address_raw,
-                           true);
-  }
-
-  uint32_t begin_record =
-      XenosOcclusionReport::RecordBase(sample_count_address_raw);
-  XenosReportController::QueryHandle query =
-      occlusion_report_controller_->BeginQuery(begin_record);
-  if (query == XenosReportController::kInvalidQuery) {
-    return false;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    // Build the logical query state right in the map.
-    LogicalOcclusionQuery logical;
-    logical.begin_address_raw = sample_count_address_raw;
-    logical.begin_record = begin_record;
-    logical.end_record = begin_record;
-    logical.accumulated_samples = 0;
-    logical.pending_segments = 0;
-    logical.ended = false;
-    occlusion_queries_[query] = logical;
-  }
-
-  occlusion_query_stats_.logical_begun++;
-
-  // Mirror the currently active segment state here.
-  active_occlusion_query_segment_.query = query;
-  active_occlusion_query_segment_.begin_address_raw = sample_count_address_raw;
-  active_occlusion_query_segment_.begin_record = begin_record;
-  active_occlusion_query_segment_.end_address_raw = sample_count_address_raw;
-  active_occlusion_query_segment_.host_index = UINT32_MAX;
-  active_occlusion_query_segment_.host_generation = 0;
-  active_occlusion_query_segment_.segment_active = false;
-  active_occlusion_query_segment_.segment_pending_begin = true;
-  active_occlusion_query_segment_.logical_active = true;
-
-  // Start counting right away if we're already in a render pass. Otherwise
-  // defer the host BEGIN until we get back into one.
-  ResumeActiveOcclusionQuerySegment(true);
-
-  return true;
+bool VulkanCommandProcessor::CanOpenHostZPDQueryNow() const {
+  return in_render_pass_;
 }
 
-// End the current guest occlusion query and queue the report write. If
-// forced_end is set, the guest did something weird and we had to close it.
-bool VulkanCommandProcessor::EndGuestOcclusionQuery(
-    uint32_t sample_count_address_raw, bool forced_end) {
-  if (!cvars::occlusion_query_enable) {
-    return false;
-  }
-
-  if (!occlusion_report_controller_) {
-    return false;
-  }
-
-  if (!active_occlusion_query_segment_.logical_active) {
-    return false;
-  }
-
-  active_occlusion_query_segment_.end_address_raw = sample_count_address_raw;
-
-  // Close the current host segment for this logical query. If we're already
-  // outside the render pass and can't end it cleanly, just drop the segment
-  // state rather than letting later draws bleed into it.
-  if (active_occlusion_query_segment_.segment_active) {
-    if (in_render_pass_) {
-      SplitActiveOcclusionQuerySegment();
-    } else {
-      XELOGW("OQ: segment_active outside render pass, dropping segment");
-      active_occlusion_query_segment_.segment_active = false;
-      active_occlusion_query_segment_.host_index = UINT32_MAX;
-      active_occlusion_query_segment_.host_generation = 0;
-    }
-  }
-
-  // Do not arm another host segment after this. The logical query is on the
-  // way out.
-  active_occlusion_query_segment_.segment_pending_begin = false;
-
-  uint32_t record_base =
-      XenosOcclusionReport::RecordBase(sample_count_address_raw);
-  bool immediate_complete = false;
-  uint64_t immediate_samples = 0;
-  uint32_t begin_record = 0;
-  uint32_t final_value = 0;
-  uint32_t cached_delta =
-      static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
-  XenosReportController::QueryHandle query =
-      active_occlusion_query_segment_.query;
-
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    std::unordered_map<XenosReportController::QueryHandle,
-                       LogicalOcclusionQuery>::iterator it =
-        occlusion_queries_.find(query);
-    if (it == occlusion_queries_.end()) {
-      active_occlusion_query_segment_ = {};
-      return false;
-    }
-
-    LogicalOcclusionQuery& logical = it->second;
-    logical.ended = true;
-    logical.end_record = record_base;
-
-    begin_record = logical.begin_record;
-
-    // If nothing is still in flight, we can finish this query right now.
-    if (logical.pending_segments == 0) {
-      immediate_complete = true;
-      immediate_samples = logical.accumulated_samples;
-      final_value = NormalizeOcclusionSamples(immediate_samples);
-      if (record_base) {
-        occlusion_query_fast_cached_values_[record_base] = final_value;
-      }
-      cached_delta = final_value;
-    } else {
-      std::unordered_map<uint32_t, uint32_t>::iterator it_cache =
-          occlusion_query_fast_cached_values_.find(record_base);
-      if (it_cache != occlusion_query_fast_cached_values_.end()) {
-        cached_delta = it_cache->second;
-      }
-    }
-  }
-
-  occlusion_query_stats_.logical_ended++;
-
-  if (!forced_end) {
-    occlusion_report_controller_->ObserveBeginEndPair(
-        active_occlusion_query_segment_.begin_address_raw,
-        sample_count_address_raw);
-  }
-
-  // Queue the guest memory write before retiring the query so immediate
-  // completions can flush it in the same update.
-  occlusion_report_controller_->EnqueueWrite(
-      record_base, active_occlusion_query_segment_.query);
-
-  if (immediate_complete) {
-    occlusion_report_controller_->MarkQueryCompleted(query, final_value);
-    occlusion_report_controller_->Update();
-  }
-
-  // With fast readback, write a cached delta to unblock guest polling
-  // while the real resolve is still in flight.
-  if (GetReadbackResolveMode() == ReadbackResolveMode::kFast) {
-    bool is_common_half_split_pair =
-        begin_record && record_base &&
-        XenosOcclusionReport::IsCommonHalfSplitPair(begin_record, record_base);
-
-    // A stale cached 0 from an older occluded lifetime can make visible stuff
-    // disappear until the real resolve lands. For the common 0x40 split pair,
-    // err on the visible side instead.
-    if (is_common_half_split_pair && cached_delta == 0) {
-      cached_delta =
-          static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
-    }
-
-    // Also stamp the paired BEGIN record for the common split case. Some
-    // titles poll both halves and get upset if one side still looks pending.
-    WriteOcclusionReportData(begin_record, record_base, cached_delta,
-                             is_common_half_split_pair);
-  }
-
-  active_occlusion_query_segment_.logical_active = false;
-
-  return true;
-}
-
-void VulkanCommandProcessor::ResumeActiveOcclusionQuerySegment(
-    bool allow_submission_close) {
-  if (!cvars::occlusion_query_enable) {
-    return;
-  }
-
-  if (!active_occlusion_query_segment_.logical_active ||
-      active_occlusion_query_segment_.segment_active ||
-      !active_occlusion_query_segment_.segment_pending_begin) {
-    return;
-  }
-
-  if (!in_render_pass_) {
-    return;
-  }
-
-  EnsureOcclusionQueryResources();
-
-  if (occlusion_query_pool_ == VK_NULL_HANDLE ||
-      !occlusion_query_readback_mapping_ || occlusion_query_capacity_ == 0) {
-    return;
+CommandProcessor::HostZPDQueryOpenResult
+VulkanCommandProcessor::OpenHostZPDQuery(uint32_t& out_host_index,
+                                         uint32_t& out_host_generation,
+                                         bool can_close_submission) {
+  EnsureZPDHostQueryResources();
+  if (!zpd_host_query_pool_ || !zpd_host_query_pool_->is_initialized()) {
+    return HostZPDQueryOpenResult::kFailed;
   }
 
   if (!BeginSubmission(true)) {
-    return;
+    return HostZPDQueryOpenResult::kFailed;
   }
 
   bool is_pool_exhausted;
   {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    is_pool_exhausted = occlusion_query_free_indices_.empty();
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
   }
 
   if (is_pool_exhausted) {
-    ProcessCompletedOcclusionQueryResolves(GetCompletedSubmission());
+    ProcessCompletedHostZPDQueryResolves(GetCompletedSubmission());
     {
-      std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-      is_pool_exhausted = occlusion_query_free_indices_.empty();
+      std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+      is_pool_exhausted = !zpd_host_query_pool_->has_free_indices();
     }
   }
 
-  // Fast readback does not need the exact count here. Keep the query
-  // conservatively visible and move on.
-  if (is_pool_exhausted &&
-      GetReadbackResolveMode() == ReadbackResolveMode::kFast) {
-    occlusion_query_stats_.pool_exhausted++;
-    {
-      std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-      std::unordered_map<XenosReportController::QueryHandle,
-                         LogicalOcclusionQuery>::iterator it_query =
-          occlusion_queries_.find(active_occlusion_query_segment_.query);
-      if (it_query != occlusion_queries_.end()) {
-        it_query->second.accumulated_samples = std::max<uint64_t>(
-            it_query->second.accumulated_samples,
-            static_cast<uint64_t>(cvars::occlusion_query_fast_cached_delta));
-      }
-    }
-    active_occlusion_query_segment_.segment_pending_begin = false;
-    return;
+  if (is_pool_exhausted && cvars::occlusion_query_fast) {
+    return HostZPDQueryOpenResult::kPoolExhausted;
   }
 
   uint64_t wait_for = 0;
   if (is_pool_exhausted) {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    if (!occlusion_query_resolves_in_flight_.empty()) {
-      wait_for = occlusion_query_resolves_in_flight_.front().submission;
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    if (!host_zpd_query_resolves_in_flight_.empty()) {
+      wait_for = host_zpd_query_resolves_in_flight_.front().submission;
     }
   }
 
   if (wait_for != 0) {
-    // Flush the active submission if it holds the earliest required resolve.
-    if (submission_open_ && wait_for == GetCurrentSubmission() &&
-        allow_submission_close && CanEndSubmissionImmediately()) {
-      EndRenderPass();
-      EndSubmission(false);
-    }
-
-    if (wait_for > GetCompletedSubmission()) {
-      completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for);
-      ProcessCompletedOcclusionQueryResolves(GetCompletedSubmission());
-    }
-  }
-
-  uint32_t host_index;
-  uint32_t host_generation = 1;
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    if (occlusion_query_free_indices_.empty()) {
-      occlusion_query_stats_.pool_exhausted++;
-      return;
-    }
-
-    host_index = occlusion_query_free_indices_.back();
-    occlusion_query_free_indices_.pop_back();
-
-    if (host_index < occlusion_query_index_generations_.size()) {
-      host_generation = ++occlusion_query_index_generations_[host_index];
-    }
-  }
-
-  active_occlusion_query_segment_.host_index = host_index;
-  active_occlusion_query_segment_.host_generation = host_generation;
-
-  // Begin the host query segment now that we're inside a render pass.
-  deferred_command_buffer_.CmdVkBeginQuery(occlusion_query_pool_, host_index,
-                                           VK_QUERY_CONTROL_PRECISE_BIT);
-  active_occlusion_query_segment_.segment_active = true;
-  active_occlusion_query_segment_.segment_pending_begin = false;
-
-  occlusion_query_stats_.segments_begun++;
-}
-
-// End the active host segment, queue it for readback, and increment the
-// logical query's pending segment count.
-void VulkanCommandProcessor::SplitActiveOcclusionQuerySegment() {
-  if (!cvars::occlusion_query_enable) {
-    return;
-  }
-
-  if (!active_occlusion_query_segment_.segment_active) {
-    return;
-  }
-
-  if (!in_render_pass_) {
-    XELOGW("OQ: Split segment requested outside render pass");
-    active_occlusion_query_segment_.segment_active = false;
-    active_occlusion_query_segment_.host_index = UINT32_MAX;
-    active_occlusion_query_segment_.host_generation = 0;
-    return;
-  }
-
-  if (occlusion_query_pool_ == VK_NULL_HANDLE) {
-    return;
-  }
-
-  uint32_t host_index = active_occlusion_query_segment_.host_index;
-  uint32_t host_generation = active_occlusion_query_segment_.host_generation;
-
-  deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
-
-  {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    // For batched vkCmdCopyQueryPoolResults.
-    QueueOcclusionQueryResolveBatchIndexLocked(host_index);
-
-    // Track resolve completion by submission.
-    OcclusionQueryResolve resolve;
-    resolve.host_index = host_index;
-    resolve.host_generation = host_generation;
-    resolve.submission = GetCurrentSubmission();
-    resolve.query = active_occlusion_query_segment_.query;
-    occlusion_query_resolves_in_flight_.push_back(resolve);
-
-    std::unordered_map<XenosReportController::QueryHandle,
-                       LogicalOcclusionQuery>::iterator it =
-        occlusion_queries_.find(resolve.query);
-    if (it != occlusion_queries_.end()) {
-      it->second.pending_segments++;
-    }
-  }
-
-  occlusion_query_stats_.segments_ended++;
-
-  active_occlusion_query_segment_.segment_active = false;
-  active_occlusion_query_segment_.host_index = UINT32_MAX;
-  active_occlusion_query_segment_.host_generation = 0;
-}
-
-// Mark a host query index for batched resolve in the current submission.
-void VulkanCommandProcessor::QueueOcclusionQueryResolveBatchIndexLocked(
-    uint32_t host_index) {
-  std::vector<uint64_t>& batch_map =
-      occlusion_query_resolve_batch_index_map_.data();
-  size_t word_index = host_index >> 6;
-  uint32_t bit_index = host_index & 63u;
-  uint64_t bit = 1ull << (63u - bit_index);
-
-  if (batch_map[word_index] & bit) {
-    batch_map[word_index] &= ~bit;
-    ++occlusion_query_resolve_batch_index_count_;
-  }
-}
-
-// Mark a freed host query index to be reset by vkCmdResetQueryPool in the
-// next command buffer before it can be safely reused.
-void VulkanCommandProcessor::QueueOcclusionQueryResetPendingIndex(
-    uint32_t host_index) {
-  std::vector<uint64_t>& reset_map =
-      occlusion_query_reset_pending_index_map_.data();
-  size_t word_index = host_index >> 6;
-  uint32_t bit_index = host_index & 63u;
-  uint64_t bit = 1ull << (63u - bit_index);
-
-  if (reset_map[word_index] & bit) {
-    reset_map[word_index] &= ~bit;
-    ++occlusion_query_reset_pending_index_count_;
-  }
-}
-
-// Mark every allocated host slot for the initial bulk reset pass.
-void VulkanCommandProcessor::QueueAllOcclusionQueryResetPendingIndices(
-    uint32_t count) {
-  occlusion_query_reset_pending_index_map_.Reset();
-  std::vector<uint64_t>& reset_map =
-      occlusion_query_reset_pending_index_map_.data();
-  for (uint32_t i = 0; i < count; ++i) {
-    size_t word_index = i >> 6;
-    uint32_t bit_index = i & 63u;
-    uint64_t bit = 1ull << (63u - bit_index);
-    reset_map[word_index] &= ~bit;
-  }
-  occlusion_query_reset_pending_index_count_ = count;
-}
-
-// Batch vkCmdResetQueryPool commands for all pending indices before
-// returning them to the free pool.
-void VulkanCommandProcessor::ResetPendingOcclusionQueryPoolIndices() {
-  if (!cvars::occlusion_query_enable) {
-    return;
-  }
-
-  if (!submission_open_) {
-    return;
-  }
-
-  if (occlusion_query_pool_ == VK_NULL_HANDLE ||
-      occlusion_query_capacity_ == 0) {
-    occlusion_query_reset_pending_index_map_.Reset();
-    occlusion_query_reset_pending_index_count_ = 0;
-    occlusion_query_resolve_batch_index_map_.Reset();
-    occlusion_query_resolve_batch_index_count_ = 0;
-    return;
-  }
-
-  if (occlusion_query_reset_pending_index_count_ == 0) {
-    return;
-  }
-
-  if (in_render_pass_) {
-    EndRenderPass();
-  }
-
-  std::vector<uint64_t>& reset_map =
-      occlusion_query_reset_pending_index_map_.data();
-
-  struct ResetRange {
-    uint32_t start;
-    uint32_t count;
-  };
-
-  std::vector<ResetRange> ranges;
-  uint32_t range_start = 0;
-  uint32_t range_count = 0;
-
-  for (uint32_t index = 0; index < occlusion_query_capacity_; ++index) {
-    size_t word_index = index >> 6;
-    uint32_t bit_index = index & 63u;
-    uint64_t bit = 1ull << (63u - bit_index);
-    bool is_marked = (reset_map[word_index] & bit) == 0;
-    if (!is_marked) {
-      continue;
-    }
-
-    occlusion_query_free_indices_.push_back(index);
-
-    if (range_count == 0) {
-      range_start = index;
-      range_count = 1;
-      continue;
-    }
-
-    if (index == range_start + range_count) {
-      ++range_count;
-      continue;
-    }
-
-    ranges.push_back({range_start, range_count});
-    range_start = index;
-    range_count = 1;
-  }
-
-  if (range_count != 0) {
-    ranges.push_back({range_start, range_count});
-  }
-
-  occlusion_query_reset_pending_index_map_.Reset();
-  occlusion_query_reset_pending_index_count_ = 0;
-
-  if (ranges.empty()) {
-    return;
-  }
-
-  for (const ResetRange& range : ranges) {
-    deferred_command_buffer_.CmdVkResetQueryPool(occlusion_query_pool_,
-                                                 range.start, range.count);
-  }
-}
-
-// Consume mapped readback data for completed submissions, accumulating
-// samples into logical queries and recycling host slots.
-void VulkanCommandProcessor::ProcessCompletedOcclusionQueryResolves(
-    uint64_t completed_submission) {
-  if (!cvars::occlusion_query_enable) {
-    return;
-  }
-
-  if (!occlusion_report_controller_) {
-    return;
-  }
-
-  uint64_t settle_margin =
-      GetReadbackResolveMode() == ReadbackResolveMode::kFast ? 1 : 0;
-  std::vector<std::pair<XenosReportController::QueryHandle, uint32_t>>
-      completed_report_queries;
-
-  {
-    std::unique_lock<std::mutex> lock(occlusion_query_mutex_);
-
-    // If the readback memory is not coherent, invalidate it once before
-    // consuming any results from this completed submission range.
-    if (!occlusion_query_readback_is_coherent_ &&
-        occlusion_query_readback_memory_ != VK_NULL_HANDLE &&
-        occlusion_query_readback_mapping_ &&
-        !occlusion_query_resolves_in_flight_.empty() &&
-        occlusion_query_resolves_in_flight_.front().submission +
-                settle_margin <=
-            completed_submission) {
-      const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
-      if (vulkan_device) {
-        const ui::vulkan::VulkanDevice::Functions& dfn =
-            vulkan_device->functions();
-        const VkDevice device = vulkan_device->device();
-        VkMappedMemoryRange range;
-        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        range.pNext = nullptr;
-        range.memory = occlusion_query_readback_memory_;
-        range.offset = 0;
-        range.size = VK_WHOLE_SIZE;
-        dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
-      }
-    }
-
-    while (!occlusion_query_resolves_in_flight_.empty()) {
-      OcclusionQueryResolve resolve =
-          occlusion_query_resolves_in_flight_.front();
-      if (resolve.submission + settle_margin > completed_submission) {
-        break;
-      }
-
-      occlusion_query_resolves_in_flight_.pop_front();
-
-      uint64_t raw_samples = 0;
-      if (occlusion_query_readback_mapping_ &&
-          resolve.host_index < occlusion_query_capacity_) {
-        raw_samples = occlusion_query_readback_mapping_[resolve.host_index];
-      }
-
-      bool generation_match = false;
-      if (resolve.host_index < occlusion_query_capacity_ &&
-          resolve.host_index < occlusion_query_index_generations_.size()) {
-        generation_match =
-            (resolve.host_generation ==
-             occlusion_query_index_generations_[resolve.host_index]);
-      }
-      if (!generation_match) {
-        occlusion_query_stats_.resolves_discarded_stale++;
-        continue;
-      }
-
-      // Queue the consumed host index for vkCmdResetQueryPool.
-      QueueOcclusionQueryResetPendingIndex(resolve.host_index);
-
-      std::unordered_map<XenosReportController::QueryHandle,
-                         LogicalOcclusionQuery>::iterator it =
-          occlusion_queries_.find(resolve.query);
-      if (it == occlusion_queries_.end()) {
-        // That lifetime is already gone, so there is nothing left to add to.
-        occlusion_query_stats_.resolves_discarded_stale++;
-        continue;
-      }
-
-      LogicalOcclusionQuery& logical = it->second;
-      if (logical.pending_segments) {
-        logical.pending_segments--;
-      }
-      logical.accumulated_samples += raw_samples;
-
-      if (logical.ended && logical.pending_segments == 0) {
-        uint32_t final_value =
-            NormalizeOcclusionSamples(logical.accumulated_samples);
-        if (logical.end_record) {
-          occlusion_query_fast_cached_values_[logical.end_record] = final_value;
+    if (submission_open_ && wait_for == GetCurrentSubmission()) {
+      if (can_close_submission && CanEndSubmissionImmediately()) {
+        VkRenderPass saved_render_pass = current_render_pass_;
+        const VulkanRenderTargetCache::Framebuffer* saved_framebuffer =
+            current_framebuffer_;
+        EndRenderPass();
+        if (!EndSubmission(false)) {
+          return HostZPDQueryOpenResult::kFailed;
         }
-        completed_report_queries.emplace_back(resolve.query, final_value);
-        occlusion_query_stats_.resolves_completed++;
+        if (!BeginSubmission(true)) {
+          return HostZPDQueryOpenResult::kFailed;
+        }
+        SubmitBarriersAndEnterRenderTargetCacheRenderPass(saved_render_pass,
+                                                          saved_framebuffer);
+        return HostZPDQueryOpenResult::kDeferred;
       }
+    } else if (wait_for > GetCompletedSubmission()) {
+      completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for);
+      ProcessCompletedHostZPDQueryResolves(GetCompletedSubmission());
     }
   }
 
-  if (!completed_report_queries.empty()) {
-    for (const auto& completed_report_query : completed_report_queries) {
-      occlusion_report_controller_->MarkQueryCompleted(
-          completed_report_query.first, completed_report_query.second);
-    }
+  if (!zpd_host_query_pool_->AcquireQueryIndex(out_host_index,
+                                               out_host_generation)) {
+    return HostZPDQueryOpenResult::kFailed;
   }
 
-  occlusion_report_controller_->Update();
+  zpd_host_query_pool_->BeginQuery(deferred_command_buffer_, out_host_index);
+  return HostZPDQueryOpenResult::kOpened;
 }
 
-// Write a report value back to guest memory.
-// begin_record is the BEGIN-side record for this lifetime, if we have one.
-// sink_record is the record we are actually writing to.
-// value is the delta we add onto the BEGIN snapshot to build the END value.
-// write_begin_record lets us also refresh the BEGIN record fields when that
-// keeps split-pair polling from getting confused.
-void VulkanCommandProcessor::WriteOcclusionReportData(uint32_t begin_record,
-                                                      uint32_t sink_record,
-                                                      uint32_t value,
-                                                      bool write_begin_record) {
-  if (!sink_record) {
-    return;
+bool VulkanCommandProcessor::CloseHostZPDQuery(uint32_t host_index,
+                                               uint32_t host_generation,
+                                               uint64_t& out_submission) {
+  if (!in_render_pass_) {
+    XELOGW("ZPD: Split segment requested outside render pass");
+    return false;
+  }
+  if (!zpd_host_query_pool_ || !zpd_host_query_pool_->is_initialized()) {
+    return false;
   }
 
-  xenos::xe_gpu_depth_sample_counts* begin =
-      begin_record
-          ? memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
-                begin_record)
-          : nullptr;
-  xenos::xe_gpu_depth_sample_counts* sink =
-      memory_->TranslatePhysical<xenos::xe_gpu_depth_sample_counts*>(
-          sink_record);
-
-  XenosOcclusionReport::WriteGuestBeginEnd(begin, sink, value,
-                                           write_begin_record);
-}
-
-// Write the finished BEGIN/END sample count to guest memory and retire the
-// logical query on the backend side.
-void VulkanCommandProcessor::WriteOcclusionReport(
-    XenosReportController::QueryHandle query, uint32_t sink_base,
-    uint32_t value) {
-  uint32_t begin_record = 0;
-
+  zpd_host_query_pool_->EndQuery(deferred_command_buffer_, host_index);
   {
-    std::lock_guard<std::mutex> lock(occlusion_query_mutex_);
-    std::unordered_map<XenosReportController::QueryHandle,
-                       LogicalOcclusionQuery>::iterator it =
-        occlusion_queries_.find(query);
-    if (it != occlusion_queries_.end()) {
-      begin_record = it->second.begin_record;
-      occlusion_queries_.erase(it);
-    }
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    zpd_host_query_pool_->QueueQueryResolve(host_index);
   }
-
-  uint32_t sink_record = XenosOcclusionReport::RecordBase(sink_base);
-  if (!sink_record) {
-    // Nothing left to write here. Destination is stale or the lifetime was
-    // already discarded.
-    return;
-  }
-
-  WriteOcclusionReportData(begin_record, sink_record, value, true);
+  out_submission = GetCurrentSubmission();
+  return true;
 }
 
-// Controller callback.
-void VulkanCommandProcessor::WriteOcclusionReportThunk(
-    XenosReportController::QueryHandle query, uint32_t sink_base,
-    uint32_t value, void* context) {
-  reinterpret_cast<VulkanCommandProcessor*>(context)->WriteOcclusionReport(
-      query, sink_base, value);
+uint64_t VulkanCommandProcessor::GetHostZPDQueryResult(uint32_t host_index) {
+  return zpd_host_query_pool_
+             ? zpd_host_query_pool_->GetQueryReadbackValue(host_index)
+             : 0;
 }
 
-// Convert the raw hardware sample count into the 32-bit guest value, and scale
-// it back down if upscaling.
-uint32_t VulkanCommandProcessor::NormalizeOcclusionSamples(
-    uint64_t samples) const {
-  if (samples == 0) {
-    return 0;
+void VulkanCommandProcessor::ReleaseHostZPDQuery(uint32_t host_index,
+                                                 uint32_t host_generation) {
+  if (zpd_host_query_pool_) {
+    zpd_host_query_pool_->ReleaseQueryIndex(host_index);
   }
+}
 
-  if (!texture_cache_) {
-    return static_cast<uint32_t>(std::min<uint64_t>(samples, UINT32_MAX));
+bool VulkanCommandProcessor::IsHostZPDQueryResultValid(
+    uint32_t host_index, uint32_t host_generation) const {
+  return zpd_host_query_pool_ &&
+         zpd_host_query_pool_->GenerationMatches(host_index, host_generation);
+}
+
+void VulkanCommandProcessor::PrepareHostZPDReadback(
+    uint64_t completed_submission, uint64_t settle_margin) {
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+  if (zpd_host_query_pool_ && !host_zpd_query_resolves_in_flight_.empty() &&
+      host_zpd_query_resolves_in_flight_.front().submission + settle_margin <=
+          completed_submission) {
+    zpd_host_query_pool_->InvalidateReadback();
   }
+}
 
-  uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
-  uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
-  uint64_t scale = scale_x * scale_y;
+bool VulkanCommandProcessor::ShouldDropHostZPDReportIfUnavailable() const {
+  return true;
+}
 
-  uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
+uint64_t VulkanCommandProcessor::GetHostZPDCurrentSubmission() const {
+  return GetCurrentSubmission();
+}
 
-  return static_cast<uint32_t>(std::min<uint64_t>(normalized, UINT32_MAX));
+uint64_t VulkanCommandProcessor::GetHostZPDCompletedSubmission() const {
+  return GetCompletedSubmission();
+}
+
+void VulkanCommandProcessor::AwaitHostZPDSubmissionAndUpdateCompleted(
+    uint64_t submission) {
+  completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission);
+}
+
+bool VulkanCommandProcessor::CanEndHostZPDSubmissionImmediately() const {
+  VulkanCommandProcessor* mutable_this =
+      const_cast<VulkanCommandProcessor*>(this);
+
+  return mutable_this->CanEndSubmissionImmediately();
+}
+
+bool VulkanCommandProcessor::EndHostZPDSubmission(bool is_swap) {
+  return EndSubmission(is_swap);
+}
+
+void VulkanCommandProcessor::PrepareToWaitForHostZPDSubmission() {
+  EndRenderPass();
+}
+
+uint32_t VulkanCommandProcessor::GetZPDReportDrawResolutionScaleX() const {
+  return texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+}
+
+uint32_t VulkanCommandProcessor::GetZPDReportDrawResolutionScaleY() const {
+  return texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
 }
 
 void VulkanCommandProcessor::InitializeTrace() {
@@ -5822,7 +4943,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
     resolve_downscale_descriptor_pool_chain_->Reclaim(completed_submission);
   }
 
-  ProcessCompletedOcclusionQueryResolves(completed_submission);
+  ProcessCompletedHostZPDQueryResolves(completed_submission);
 
   // Destroy objects scheduled for destruction.
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5944,48 +5065,46 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginSubmission();
 
     texture_cache_->BeginSubmission(GetCurrentSubmission());
-
-    // Make query indices available before the first render pass of the
-    // submission. vkCmdResetQueryPool is not allowed inside render passes.
-    ResetPendingOcclusionQueryPoolIndices();
   }
 
   if (is_opening_frame) {
     frame_open_ = true;
 
-    // Log occlusion query stats every 100 frames.
+    // Log report stats every 100 frames.
     if (cvars::occlusion_query_enable && cvars::occlusion_query_log &&
-        occlusion_query_capacity_ && occlusion_report_controller_ &&
-        frame_current_ - occlusion_query_stats_.last_log_frame >= 100) {
+        zpd_host_query_pool_ && zpd_host_query_pool_->capacity() &&
+        zpd_report_controller_ &&
+        frame_current_ - guest_zpd_report_stats_.last_log_frame >= 100) {
       XenosReportController::Stats report_stats =
-          occlusion_report_controller_->stats();
+          zpd_report_controller_->stats();
       XELOGI(
           "Occlusion Query Stats (last 100 frames): "
           "LogicalBegun={}, LogicalEnded={}, SegBegun={}, SegEnded={}, "
           "Resolved={}, ResolveDiscardedStale={}, WritesRetired={}, "
           "WritesDiscardedStale={}, WritesSavedByGrace={}, "
           "PoolExhausted={}, Failed={}",
-          occlusion_query_stats_.logical_begun,
-          occlusion_query_stats_.logical_ended,
-          occlusion_query_stats_.segments_begun,
-          occlusion_query_stats_.segments_ended,
-          occlusion_query_stats_.resolves_completed,
-          occlusion_query_stats_.resolves_discarded_stale,
+          guest_zpd_report_stats_.logical_begun,
+          guest_zpd_report_stats_.logical_ended,
+          guest_zpd_report_stats_.segments_begun,
+          guest_zpd_report_stats_.segments_ended,
+          guest_zpd_report_stats_.resolves_completed,
+          guest_zpd_report_stats_.resolves_discarded_stale,
           report_stats.writes_retired, report_stats.writes_discarded_stale,
           report_stats.writes_saved_by_grace,
-          occlusion_query_stats_.pool_exhausted, occlusion_query_stats_.failed);
+          guest_zpd_report_stats_.pool_exhausted,
+          guest_zpd_report_stats_.failed);
 
-      occlusion_report_controller_->ResetStats();
+      zpd_report_controller_->ResetStats();
 
-      occlusion_query_stats_.logical_begun = 0;
-      occlusion_query_stats_.logical_ended = 0;
-      occlusion_query_stats_.segments_begun = 0;
-      occlusion_query_stats_.segments_ended = 0;
-      occlusion_query_stats_.resolves_completed = 0;
-      occlusion_query_stats_.resolves_discarded_stale = 0;
-      occlusion_query_stats_.pool_exhausted = 0;
-      occlusion_query_stats_.failed = 0;
-      occlusion_query_stats_.last_log_frame = frame_current_;
+      guest_zpd_report_stats_.logical_begun = 0;
+      guest_zpd_report_stats_.logical_ended = 0;
+      guest_zpd_report_stats_.segments_begun = 0;
+      guest_zpd_report_stats_.segments_ended = 0;
+      guest_zpd_report_stats_.resolves_completed = 0;
+      guest_zpd_report_stats_.resolves_discarded_stale = 0;
+      guest_zpd_report_stats_.pool_exhausted = 0;
+      guest_zpd_report_stats_.failed = 0;
+      guest_zpd_report_stats_.last_log_frame = frame_current_;
     }
 
     // Reset bindings that depend on transient data.
@@ -6055,10 +5174,6 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     texture_cache_->BeginFrame();
   }
 
-  // Reset indices returned from completed resolves (vkCmdResetQueryPool must
-  // be recorded outside render passes).
-  ResetPendingOcclusionQueryPoolIndices();
-
   return true;
 }
 
@@ -6074,8 +5189,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
   // Make sure everything needed for submitting exist.
   if (submission_open_) {
-    // Ensure any active render pass (and associated occlusion segment) is
-    // closed before ending the command buffer.
+    // Close the render pass before ending the command buffer.
     EndRenderPass();
     if (!sparse_memory_binds_.empty() && semaphores_free_.empty()) {
       VkSemaphoreCreateInfo semaphore_create_info;
@@ -6192,9 +5306,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       sparse_buffer_binds_.clear();
       sparse_memory_binds_.clear();
     }
-    // If a logical query is active, split the current host segment before
-    // closing the command buffer.
-    SplitActiveOcclusionQuerySegment();
+    // Split the active segment before closing the command buffer.
+    SplitActiveHostZPDQuerySegment();
 
     SubmitBarriers(true);
 
@@ -6218,119 +5331,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     deferred_command_buffer_.Execute(command_buffer.buffer);
 
-    // Batched occlusion query resolve and readback copy.
-    if (occlusion_query_resolve_batch_index_count_ != 0) {
-      if (occlusion_query_pool_ == VK_NULL_HANDLE ||
-          occlusion_query_resolve_buffer_ == VK_NULL_HANDLE ||
-          occlusion_query_readback_buffer_ == VK_NULL_HANDLE ||
-          occlusion_query_capacity_ == 0) {
-        occlusion_query_resolve_batch_index_map_.Reset();
-        occlusion_query_resolve_batch_index_count_ = 0;
-      } else {
-        const std::vector<uint64_t>& batch_map =
-            occlusion_query_resolve_batch_index_map_.data();
-
-        const VkDeviceSize query_result_stride = static_cast<VkDeviceSize>(
-            XenosOcclusionReport::kQueryResultStrideBytes);
-
-        struct ResolveRange {
-          uint32_t start;
-          uint32_t count;
-        };
-
-        std::vector<ResolveRange> ranges;
-        uint32_t range_start = 0;
-        uint32_t range_count = 0;
-
-        for (uint32_t index = 0; index < occlusion_query_capacity_; ++index) {
-          const size_t word_index = index >> 6;
-          const uint32_t bit_index = index & 63u;
-          const uint64_t bit = 1ull << (63u - bit_index);
-          const bool is_marked = (batch_map[word_index] & bit) == 0;
-          if (!is_marked) {
-            continue;
-          }
-
-          if (range_count == 0) {
-            range_start = index;
-            range_count = 1;
-            continue;
-          }
-
-          if (index == range_start + range_count) {
-            ++range_count;
-            continue;
-          }
-
-          ranges.push_back({range_start, range_count});
-          range_start = index;
-          range_count = 1;
-        }
-
-        if (range_count != 0) {
-          ranges.push_back({range_start, range_count});
-        }
-
-        occlusion_query_resolve_batch_index_map_.Reset();
-        occlusion_query_resolve_batch_index_count_ = 0;
-
-        for (const ResolveRange& range : ranges) {
-          if (range.start >= occlusion_query_capacity_) {
-            continue;
-          }
-
-          uint32_t count =
-              std::min(range.count, occlusion_query_capacity_ - range.start);
-
-          VkDeviceSize offset =
-              static_cast<VkDeviceSize>(range.start) * query_result_stride;
-          VkDeviceSize size =
-              static_cast<VkDeviceSize>(count) * query_result_stride;
-
-          dfn.vkCmdCopyQueryPoolResults(
-              command_buffer.buffer, occlusion_query_pool_, range.start, count,
-              occlusion_query_resolve_buffer_, offset, query_result_stride,
-              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-
-          VkBufferMemoryBarrier resolve_barrier;
-          resolve_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-          resolve_barrier.pNext = nullptr;
-          resolve_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          resolve_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-          resolve_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          resolve_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          resolve_barrier.buffer = occlusion_query_resolve_buffer_;
-          resolve_barrier.offset = offset;
-          resolve_barrier.size = size;
-          dfn.vkCmdPipelineBarrier(command_buffer.buffer,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                                   nullptr, 1, &resolve_barrier, 0, nullptr);
-
-          VkBufferCopy copy_region;
-          copy_region.srcOffset = offset;
-          copy_region.dstOffset = offset;
-          copy_region.size = size;
-          dfn.vkCmdCopyBuffer(
-              command_buffer.buffer, occlusion_query_resolve_buffer_,
-              occlusion_query_readback_buffer_, 1, &copy_region);
-
-          VkBufferMemoryBarrier readback_barrier;
-          readback_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-          readback_barrier.pNext = nullptr;
-          readback_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-          readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-          readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          readback_barrier.buffer = occlusion_query_readback_buffer_;
-          readback_barrier.offset = offset;
-          readback_barrier.size = size;
-          dfn.vkCmdPipelineBarrier(command_buffer.buffer,
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                   VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
-                                   &readback_barrier, 0, nullptr);
-        }
-      }
+    if (zpd_host_query_pool_) {
+      zpd_host_query_pool_->RecordResolveBatch(command_buffer.buffer);
     }
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       XELOGE("Failed to end a Vulkan command buffer");
@@ -7822,9 +6824,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
 }
 
 #define COMMAND_PROCESSOR VulkanCommandProcessor
-#define XE_GPU_OVERRIDES_EVENT_WRITE_ZPD
 #include "../pm4_command_processor_implement.h"
-#undef XE_GPU_OVERRIDES_EVENT_WRITE_ZPD
 #undef COMMAND_PROCESSOR
 }  // namespace vulkan
 }  // namespace gpu
