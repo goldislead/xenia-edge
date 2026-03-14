@@ -23,6 +23,12 @@ namespace vulkan {
 
 class VulkanZPDQueryPool {
  public:
+  // Small Vulkan query pool for the ZPD path.
+  //
+  // Keeps query allocation, batched resolves, and readback in one place. The
+  // command processor just opens and closes queries, then checks results later.
+  // Vulkan can reuse indices across submissions, so this also tracks a
+  // generation per slot and handles readback invalidation when needed.
   VulkanZPDQueryPool() = default;
   VulkanZPDQueryPool(const VulkanZPDQueryPool&) = delete;
   VulkanZPDQueryPool& operator=(const VulkanZPDQueryPool&) = delete;
@@ -39,6 +45,7 @@ class VulkanZPDQueryPool {
            capacity_ != 0;
   }
 
+  // Status.
   uint32_t capacity() const { return capacity_; }
   bool has_pending_resolve_batch() const {
     return resolve_batch_index_count_ != 0;
@@ -50,7 +57,7 @@ class VulkanZPDQueryPool {
   void ReleaseQueryIndex(uint32_t query_index);
   bool GenerationMatches(uint32_t query_index, uint32_t query_generation) const;
 
-  // Query recording.
+  // Recording and resolve batching.
   void BeginQuery(DeferredCommandBuffer& deferred_command_buffer,
                   uint32_t query_index) const;
   void EndQuery(DeferredCommandBuffer& deferred_command_buffer,
@@ -68,8 +75,7 @@ class VulkanZPDQueryPool {
 
   VkQueryPool query_pool_ = VK_NULL_HANDLE;
 
-  // Vulkan can copy straight into host-visible transfer dst memory, so there
-  // is no separate resolve buffer.
+  // Vulkan copies query results into host-visible transfer memory.
   VkBuffer readback_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory readback_memory_ = VK_NULL_HANDLE;
   uint64_t* readback_mapping_ = nullptr;
@@ -78,11 +84,11 @@ class VulkanZPDQueryPool {
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
 
-  // Vulkan can recycle indices across submissions, so each slot keeps a
-  // generation.
+  // Vulkan can reuse query indices before older work has fully drained, so
+  // each slot keeps a generation.
   std::vector<uint32_t> index_generations_;
 
-  // xe::BitMap uses 1 = free and 0 = marked. Queued resolves clear the bit.
+  // Queued resolves are tracked with a bitmap and recorded in batches.
   xe::BitMap resolve_batch_index_map_;
   uint32_t resolve_batch_index_count_ = 0;
 };

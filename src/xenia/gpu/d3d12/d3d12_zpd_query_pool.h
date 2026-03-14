@@ -23,6 +23,12 @@ namespace d3d12 {
 
 class D3D12ZPDQueryPool {
  public:
+  // Small D3D12 query pool for the ZPD path.
+  //
+  // Keeps query allocation, batched resolves, and readback in one place. The
+  // command processor just opens and closes queries, then reads results back
+  // later. D3D12 can resolve straight into readback memory, so this stays
+  // fairly small.
   D3D12ZPDQueryPool() = default;
   D3D12ZPDQueryPool(const D3D12ZPDQueryPool&) = delete;
   D3D12ZPDQueryPool& operator=(const D3D12ZPDQueryPool&) = delete;
@@ -38,6 +44,7 @@ class D3D12ZPDQueryPool {
            capacity_ != 0;
   }
 
+  // Status.
   uint32_t capacity() const { return capacity_; }
   bool has_pending_resolve_batch() const {
     return resolve_batch_index_count_ != 0;
@@ -48,7 +55,7 @@ class D3D12ZPDQueryPool {
   bool AcquireQueryIndex(uint32_t& query_index);
   void ReleaseQueryIndex(uint32_t query_index);
 
-  // Query recording.
+  // Recording and resolve batching.
   void BeginQuery(DeferredCommandList& deferred_command_list,
                   uint32_t query_index) const;
   void EndQuery(DeferredCommandList& deferred_command_list,
@@ -65,14 +72,14 @@ class D3D12ZPDQueryPool {
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap_;
 
   // D3D12 can resolve straight into readback memory, so one mapping is
-  // enough.
+  // enough here.
   Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer_;
   uint64_t* readback_mapping_ = nullptr;
 
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
 
-  // xe::BitMap uses 1 = free and 0 = marked. Queued resolves clear the bit.
+  // Queued resolves are tracked with a bitmap and flushed in batches.
   xe::BitMap resolve_batch_index_map_;
   uint32_t resolve_batch_index_count_ = 0;
 };
