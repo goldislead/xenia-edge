@@ -295,12 +295,10 @@ class CommandProcessor {
   virtual void OnPrimaryBufferEnd() {}
 
   // ZPD report handling lives here.
-  //
-  // In this code, "report" means the 360 memory record, and "query" means the
-  // API object that produces the sample count.
-  //
-  // Backends own the pool and submission side. This class owns the logical
-  // lifetime and the writeback flow.
+  // From here on out, "report" refers to the guest memory record, and "query"
+  // refers to the host object that produces the sample count.
+  // Backends own the pool and submission side.
+  // This class owns the logical lifetime and the writeback flow.
   enum class HostZPDQueryOpenResult {
     kOpened,         // Opened successfully.
     kDeferred,       // Delayed for now.
@@ -459,10 +457,9 @@ class CommandProcessor {
   std::deque<PendingHostZPDQueryResolve> host_zpd_query_resolves_in_flight_;
 
   // Cached END delta for the fast path until the real resolve is ready.
-  // Keyed by record base.
   std::unordered_map<uint32_t, uint32_t> fast_zpd_report_cached_values_;
 
-  // Rolling count for the no-hardware path.
+  // Rolling count for the fake ZPD path.
   uint32_t fake_zpd_sample_count_ = 0;
   GuestZPDReportStats guest_zpd_report_stats_;
 
