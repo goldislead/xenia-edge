@@ -81,6 +81,9 @@ class XenosReportController {
   // Soft pairs come first. Hard pairs take over if the pattern holds.
   uint32_t GetPairedRecord(uint32_t report_address) const;
 
+  // Returns the trusted pair for the record containing report_address.
+  uint32_t GetHardPairedRecord(uint32_t report_address) const;
+
   // Queues a record write for later retirement.
   void QueueGuestReportWrite(uint32_t report_address,
                              ReportHandle report_handle,
@@ -89,8 +92,14 @@ class XenosReportController {
   // Called when the delta is ready.
   void SetReportResolved(ReportHandle report_handle, uint32_t delta_value);
 
-  // Pumps queued writes.
+  // Retires queued writes that are already ready.
   void RetirePendingReports();
+
+  // Applies one targeted wait for writes touching report_address.
+  //
+  // This is used by the strict path when the same pending report gets touched
+  // again and we need one more push to keep it moving.
+  void NudgeReportRetirement(uint32_t report_address);
 
   struct Stats {
     uint64_t writes_enqueued = 0;
@@ -151,6 +160,8 @@ class XenosReportController {
                              bool hard);
   void TryPromotePairLocked(uint32_t report_record_base);
   uint64_t GetRecordSequenceLocked(uint32_t report_record_base) const;
+  bool TouchesRecordLocked(const QueuedReportWrite& queued_write,
+                           uint32_t report_record_base) const;
 
   WaitAndResolveCallback wait_and_resolve_callback_ = nullptr;
   CommitGuestReportCallback commit_guest_report_callback_ = nullptr;

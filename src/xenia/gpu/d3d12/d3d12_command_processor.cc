@@ -3867,7 +3867,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
 
-    // Log report stats every 100 frames.
+    // Log guest ZPD report stats every 100 frames.
     if (cvars::occlusion_query_enable && cvars::occlusion_query_log &&
         zpd_host_query_pool_ && zpd_host_query_pool_->capacity() &&
         zpd_report_controller_ &&
@@ -4034,6 +4034,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     completion_timeline_->SignalAndAdvance(direct_queue);
 
     submission_open_ = false;
+
+    MaybeNudgeStrictZPDReportRetirement();
 
     // Queue operations done directly (like UpdateTileMappings) will be awaited
     // alongside the last submission if needed.
@@ -5724,20 +5726,22 @@ void D3D12CommandProcessor::EnsureZPDHostQueryResources() {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
   uint32_t requested_capacity =
       GetClampedHostZPDPoolCapacity(cvars::occlusion_query_pool_size);
   bool can_recreate = !active_host_zpd_query_segment_.logical_active &&
                       !active_host_zpd_query_segment_.segment_active &&
-                      !zpd_host_query_pool_->has_pending_resolve_batch() &&
-                      host_zpd_query_resolves_in_flight_.empty();
+                      !zpd_host_query_pool_->has_pending_resolve_batch();
+  {
+    std::lock_guard<std::mutex> lock(zpd_report_mutex_);
+    can_recreate = can_recreate && host_zpd_query_resolves_in_flight_.empty();
+  }
   zpd_host_query_pool_->EnsureInitialized(GetD3D12Provider(),
                                           requested_capacity, can_recreate);
 }
 
 void D3D12CommandProcessor::ShutdownZPDHostQueryResources() {
-  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
   active_host_zpd_query_segment_ = {};
+  std::lock_guard<std::mutex> lock(zpd_report_mutex_);
   logical_zpd_reports_.clear();
   fast_zpd_report_cached_values_.clear();
   host_zpd_query_resolves_in_flight_.clear();
@@ -5839,9 +5843,10 @@ bool D3D12CommandProcessor::CloseHostZPDQuery(uint32_t host_index,
 }
 
 uint64_t D3D12CommandProcessor::GetHostZPDQueryResult(uint32_t host_index) {
-  return zpd_host_query_pool_
-             ? zpd_host_query_pool_->GetQueryReadbackValue(host_index)
-             : 0;
+  uint64_t value = zpd_host_query_pool_
+                       ? zpd_host_query_pool_->GetQueryReadbackValue(host_index)
+                       : 0;
+  return value;
 }
 
 void D3D12CommandProcessor::ReleaseHostZPDQuery(uint32_t host_index,
@@ -5885,6 +5890,8 @@ void D3D12CommandProcessor::RecordHostZPDQueryResolveBatch() {
   if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
     return;
   }
+  bool had_pending_resolve_batch =
+      zpd_host_query_pool_->has_pending_resolve_batch();
   zpd_host_query_pool_->FlushResolveBatch(deferred_command_list_,
                                           submission_open_);
 }

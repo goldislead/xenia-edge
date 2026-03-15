@@ -10,16 +10,23 @@
 #ifndef XENIA_GPU_VULKAN_VULKAN_ZPD_QUERY_POOL_H_
 #define XENIA_GPU_VULKAN_VULKAN_ZPD_QUERY_POOL_H_
 
+#include <cstdint>
 #include <vector>
 
 #include "xenia/base/bit_map.h"
-#include "xenia/gpu/vulkan/deferred_command_buffer.h"
-#include "xenia/ui/vulkan/vulkan_device.h"
-#include "xenia/ui/vulkan/vulkan_util.h"
+#include "xenia/ui/vulkan/vulkan_api.h"
 
 namespace xe {
+namespace ui {
+namespace vulkan {
+class VulkanDevice;
+}  // namespace vulkan
+}  // namespace ui
+
 namespace gpu {
 namespace vulkan {
+
+class DeferredCommandBuffer;
 
 class VulkanZPDQueryPool {
  public:
@@ -45,7 +52,6 @@ class VulkanZPDQueryPool {
            capacity_ != 0;
   }
 
-  // Status.
   uint32_t capacity() const { return capacity_; }
   bool has_pending_resolve_batch() const {
     return resolve_batch_index_count_ != 0;

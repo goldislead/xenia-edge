@@ -12,7 +12,11 @@
 #include <algorithm>
 
 #include "xenia/base/logging.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/vulkan/deferred_command_buffer.h"
+#include "xenia/ui/vulkan/vulkan_device.h"
+#include "xenia/ui/vulkan/vulkan_util.h"
 
 namespace xe {
 namespace gpu {
@@ -252,15 +256,7 @@ void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index) {
     return;
   }
 
-  // xe::BitMap starts at all ones after Reset. Clear once when queued so
-  // duplicate attempts don't grow the batch count.
-  std::vector<uint64_t>& batch_map = resolve_batch_index_map_.data();
-  size_t word_index = query_index >> 6;
-  uint32_t bit_index = query_index & 63u;
-  uint64_t bit = 1ull << (63u - bit_index);
-
-  if (batch_map[word_index] & bit) {
-    batch_map[word_index] &= ~bit;
+  if (resolve_batch_index_map_.AcquireExact(query_index)) {
     ++resolve_batch_index_count_;
   }
 }
@@ -281,7 +277,6 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
     uint32_t count;
   };
 
-  const std::vector<uint64_t>& batch_map = resolve_batch_index_map_.data();
   const VkDeviceSize query_result_stride =
       static_cast<VkDeviceSize>(kHostZPDResolveStrideBytes);
 
@@ -289,11 +284,7 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
   uint32_t range_start = 0;
   uint32_t range_count = 0;
   for (uint32_t index = 0; index < capacity_; ++index) {
-    size_t word_index = index >> 6;
-    uint32_t bit_index = index & 63u;
-    uint64_t bit = 1ull << (63u - bit_index);
-    bool is_marked = (batch_map[word_index] & bit) == 0;
-    if (!is_marked) {
+    if (!resolve_batch_index_map_.IsAcquired(index)) {
       continue;
     }
     if (range_count == 0) {
@@ -313,8 +304,8 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
     ranges.push_back({range_start, range_count});
   }
 
-  // Detach this batch now. Later ends in the same submission belong to the
-  // next pass.
+  // Detach the recorded batch now. Later ENDs in the same submission belong
+  // to the next pass through this code, not this one.
   resolve_batch_index_map_.Reset();
   resolve_batch_index_count_ = 0;
 
@@ -324,7 +315,8 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
 
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
 
-  // One barrier for the touched span is enough.
+  // One barrier for the touched span is enough. No need to fence every range
+  // individually and make the command stream uglier than it already is.
   VkDeviceSize barrier_offset = VK_WHOLE_SIZE;
   VkDeviceSize barrier_end = 0;
   for (const ResolveRange& range : ranges) {
@@ -388,7 +380,8 @@ uint64_t VulkanZPDQueryPool::GetQueryReadbackValue(uint32_t query_index) const {
     return 0;
   }
 
-  return readback_mapping_[query_index];
+  uint64_t value = readback_mapping_[query_index];
+  return value;
 }
 
 }  // namespace vulkan

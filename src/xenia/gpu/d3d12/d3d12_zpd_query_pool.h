@@ -10,16 +10,23 @@
 #ifndef XENIA_GPU_D3D12_D3D12_ZPD_QUERY_POOL_H_
 #define XENIA_GPU_D3D12_D3D12_ZPD_QUERY_POOL_H_
 
+#include <cstdint>
 #include <vector>
 
 #include "xenia/base/bit_map.h"
-#include "xenia/gpu/d3d12/deferred_command_list.h"
-#include "xenia/ui/d3d12/d3d12_provider.h"
-#include "xenia/ui/d3d12/d3d12_util.h"
+#include "xenia/ui/d3d12/d3d12_api.h"
 
 namespace xe {
+namespace ui {
+namespace d3d12 {
+class D3D12Provider;
+}  // namespace d3d12
+}  // namespace ui
+
 namespace gpu {
 namespace d3d12 {
+
+class DeferredCommandList;
 
 class D3D12ZPDQueryPool {
  public:
@@ -44,7 +51,6 @@ class D3D12ZPDQueryPool {
            capacity_ != 0;
   }
 
-  // Status.
   uint32_t capacity() const { return capacity_; }
   bool has_pending_resolve_batch() const {
     return resolve_batch_index_count_ != 0;

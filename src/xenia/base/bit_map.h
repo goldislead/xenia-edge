@@ -33,6 +33,11 @@ class BitMap {
   // are no more free entries.
   size_t Acquire();
   size_t AcquireFromBack();
+  // Returns whether an entry is currently acquired.
+  bool IsAcquired(size_t index) const;
+  // (threadsafe) Acquires an entry by index. Returns false if it is already
+  // acquired.
+  bool AcquireExact(size_t index);
   // (threadsafe) Releases an entry by an index.
   void Release(size_t index);
 

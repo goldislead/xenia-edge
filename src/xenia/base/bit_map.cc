@@ -78,6 +78,36 @@ size_t BitMap::AcquireFromBack() {
   return -1LL;
 }
 
+bool BitMap::IsAcquired(size_t index) const {
+  auto slot = index / kDataSizeBits;
+  assert_true(slot < data_.size());
+  index -= slot * kDataSizeBits;
+
+  uint64_t bit = 1ull << (kDataSizeBits - index - 1);
+  return (data_[slot] & bit) == 0;
+}
+
+bool BitMap::AcquireExact(size_t index) {
+  auto slot = index / kDataSizeBits;
+  assert_true(slot < data_.size());
+  index -= slot * kDataSizeBits;
+
+  uint64_t bit = 1ull << (kDataSizeBits - index - 1);
+
+  uint64_t entry = 0;
+  uint64_t new_entry = 0;
+  do {
+    entry = data_[slot];
+    if ((entry & bit) == 0) {
+      return false;
+    }
+
+    new_entry = entry & ~bit;
+  } while (!atomic_cas(entry, new_entry, &data_[slot]));
+
+  return true;
+}
+
 void BitMap::Release(size_t index) {
   auto slot = index / kDataSizeBits;
   index -= slot * kDataSizeBits;

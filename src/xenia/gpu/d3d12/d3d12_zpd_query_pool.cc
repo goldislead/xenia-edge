@@ -10,7 +10,11 @@
 #include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 
 #include "xenia/base/logging.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/d3d12/deferred_command_list.h"
+#include "xenia/ui/d3d12/d3d12_provider.h"
+#include "xenia/ui/d3d12/d3d12_util.h"
 
 namespace xe {
 namespace gpu {
@@ -81,8 +85,8 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
 
   size_t requested_capacity_rounded = xe::align(requested_capacity, 64u);
   resolve_batch_index_map_.Resize(requested_capacity_rounded);
-  // Clear the bitmap before recording commands. New ends in the same frame
-  // belong to the next batch.
+  // Clear the bitmap before recording commands. New ENDs recorded later in
+  // the same frame should land in the next batch, not in this one.
   resolve_batch_index_map_.Reset();
   resolve_batch_index_count_ = 0;
 
@@ -151,15 +155,7 @@ void D3D12ZPDQueryPool::QueueQueryResolve(uint32_t query_index) {
     return;
   }
 
-  // xe::BitMap starts with all bits set after Reset. Clear once when
-  // queued so duplicate attempts stay cheap.
-  std::vector<uint64_t>& batch_map = resolve_batch_index_map_.data();
-  size_t word_index = query_index >> 6;
-  uint32_t bit_index = query_index & 63u;
-  uint64_t bit = 1ull << (63u - bit_index);
-
-  if (batch_map[word_index] & bit) {
-    batch_map[word_index] &= ~bit;
+  if (resolve_batch_index_map_.AcquireExact(query_index)) {
     ++resolve_batch_index_count_;
   }
 }
@@ -171,21 +167,22 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
     uint32_t count;
   };
 
-  if (!resolve_batch_index_count_) {
+  if (!resolve_batch_index_count_ || !submission_open) {
+    return;
+  }
+
+  if (!is_initialized()) {
+    resolve_batch_index_map_.Reset();
+    resolve_batch_index_count_ = 0;
     return;
   }
 
   std::vector<ResolveRange> ranges;
-  std::vector<uint64_t>& batch_map = resolve_batch_index_map_.data();
 
   uint32_t range_start = 0;
   uint32_t range_count = 0;
   for (uint32_t index = 0; index < capacity_; ++index) {
-    size_t word_index = index >> 6;
-    uint32_t bit_index = index & 63u;
-    uint64_t bit = 1ull << (63u - bit_index);
-    bool is_marked = (batch_map[word_index] & bit) == 0;
-    if (!is_marked) {
+    if (!resolve_batch_index_map_.IsAcquired(index)) {
       continue;
     }
     if (range_count == 0) {
@@ -207,10 +204,9 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
 
   // Clear the bitmap before recording commands. New ends in the same frame
   // belong to the next batch.
-  resolve_batch_index_map_.Reset();
-  resolve_batch_index_count_ = 0;
-
-  if (ranges.empty() || !is_initialized() || !submission_open) {
+  if (ranges.empty()) {
+    resolve_batch_index_map_.Reset();
+    resolve_batch_index_count_ = 0;
     return;
   }
 
@@ -222,6 +218,8 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
         query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, range.start, range.count,
         readback_buffer_.Get(), range.start * query_result_stride);
   }
+  resolve_batch_index_map_.Reset();
+  resolve_batch_index_count_ = 0;
 }
 
 uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index) const {
@@ -229,7 +227,8 @@ uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index) const {
     return 0;
   }
 
-  return readback_mapping_[query_index];
+  uint64_t value = readback_mapping_[query_index];
+  return value;
 }
 
 }  // namespace d3d12

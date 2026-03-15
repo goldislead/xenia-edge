@@ -1174,14 +1174,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   bool guest_marks_end =
       end_report && xe::gpu::XenosZPDReport::IsReportPending(end_report);
 
+  bool logical_active = active_host_zpd_query_segment_.logical_active;
+
   if (cvars::occlusion_query_enable && zpd_report_controller_) {
     COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
     if (COMMAND_PROCESSOR::IsHostZPDQueryPoolReady()) {
       if (!report_record_base) {
         return true;
       }
-
-      bool logical_active = active_host_zpd_query_segment_.logical_active;
 
       if (logical_active) {
         // A new write ends the current logical report first. It ends the
@@ -1216,6 +1216,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 
         COMMAND_PROCESSOR::CommitGuestZPDReportData(0, report_record_base,
                                                     cached_delta, false);
+      } else {
+        zpd_report_controller_->NudgeReportRetirement(report_address);
       }
       return true;
     }
