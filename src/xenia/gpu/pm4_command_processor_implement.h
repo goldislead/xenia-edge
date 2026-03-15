@@ -1216,7 +1216,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 
         COMMAND_PROCESSOR::CommitGuestZPDReportData(0, report_record_base,
                                                     cached_delta, false);
-      } else {
+      } else if (pending_strict_zpd_retire_nudge_record_ ==
+                 report_record_base) {
         zpd_report_controller_->NudgeReportRetirement(report_address);
       }
       return true;

@@ -363,6 +363,7 @@ void XenosReportController::FlushPendingGuestCommits(
           pending_guest_commit.report_handle,
           pending_guest_commit.report_record_base,
           pending_guest_commit.delta_value,
+          pending_guest_commit.write_begin_report);
     }
     commit_guest_report_callback_(pending_guest_commit.report_handle,
                                   pending_guest_commit.report_record_base,
