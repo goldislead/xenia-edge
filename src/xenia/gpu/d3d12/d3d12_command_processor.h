@@ -529,8 +529,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void AwaitHostZPDSubmissionAndUpdateCompleted(uint64_t submission) override;
   bool CanEndHostZPDSubmissionImmediately() const override;
   bool EndHostZPDSubmission(bool is_swap) override;
-  uint32_t GetZPDReportDrawResolutionScaleX() const override;
-  uint32_t GetZPDReportDrawResolutionScaleY() const override;
 
   // Records the pending resolve batch on the current command list.
   void RecordHostZPDQueryResolveBatch();
