@@ -39,6 +39,7 @@ struct XenosZPDReport {
     return address & kSlotAlignMask;
   }
 
+  // Within a slot, the END record is at the base, and BEGIN is +0x20.
   static constexpr uint32_t GetBeginRecordBase(uint32_t address) {
     uint32_t slot_base = GetSlotBase(address);
     return slot_base ? (slot_base + kRecordSizeBytes) : 0;
@@ -83,7 +84,9 @@ struct XenosZPDReport {
     return false;
   }
 
-  // Reads the initial sample count. Returns 0 if the report is pending.
+  // Reads guest fields in priority order. On real hardware these can be
+  // independently written, so we fall through to ZPass_A and ZFail_A if
+  // Total_A is 0 but not sentinel.
   static uint32_t ReadSampleCount(
       const xenos::xe_gpu_depth_sample_counts* report) {
     if (!report || IsReportPending(report)) {
@@ -110,9 +113,8 @@ struct XenosZPDReport {
     return IsPendingSentinel(sample_count) ? 0u : sample_count;
   }
 
-  // Writes one logical 32-bit count. ZFail_A and StencilFail_A stay 0
-  // because host occlusion query APIs only expose passing samples. Total_A
-  // mirrors ZPass_A for the same reason.
+  // Host APIs only expose a passing sample count, so Total_A mirrors ZPass_A
+  // nd the fail/stencil fields are 0.
   static void WriteSampleCount(xenos::xe_gpu_depth_sample_counts* report,
                                uint32_t sample_count) {
     if (!report) {
