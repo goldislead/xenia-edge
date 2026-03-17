@@ -1453,14 +1453,16 @@ bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
 
   uint64_t current_submission = GetHostZPDCurrentSubmission();
   if (current_submission != 0 &&
-      wait_for_submission == current_submission &&
+      wait_for_submission >= current_submission &&
       CanEndHostZPDSubmissionImmediately()) {
     PrepareToWaitForHostZPDSubmission();
     EndHostZPDSubmission(false);
   }
 
   uint64_t completed_before = GetHostZPDCompletedSubmission();
-  if (wait_for_submission > completed_before) {
+  // Only await if the submission has actually been signaled.
+  current_submission = GetHostZPDCurrentSubmission();
+  if (wait_for_submission > completed_before &&
     AwaitHostZPDSubmissionAndUpdateCompleted(wait_for_submission);
     uint64_t completed_after = GetHostZPDCompletedSubmission();
     if (completed_after > completed_before) {
@@ -1479,12 +1481,6 @@ void CommandProcessor::MaybeAwaitStrictZPDReportRetirement() {
   if (IsFastZPDPathEnabled() || !zpd_report_controller_ ||
       pending_strict_zpd_retire_handle_ ==
           XenosReportController::kInvalidReportHandle) {
-    return;
-  }
-
-  if (active_host_zpd_query_segment_.logical_active ||
-      active_host_zpd_query_segment_.segment_active ||
-      active_host_zpd_query_segment_.segment_pending_begin) {
     return;
   }
 
