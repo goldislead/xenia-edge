@@ -30,13 +30,11 @@ DECLARE_bool(non_seamless_cube_map);
 
 DECLARE_bool(half_pixel_offset);
 
-DECLARE_bool(occlusion_query_enable);
+DECLARE_string(occlusion_query);
 
 DECLARE_int32(occlusion_query_fake_lower_threshold);
 
 DECLARE_int32(occlusion_query_fake_upper_threshold);
-
-DECLARE_bool(occlusion_query_fast);
 
 DECLARE_int32(occlusion_query_fast_cached_delta);
 
@@ -45,10 +43,6 @@ DECLARE_bool(occlusion_query_strict_immediate_sentinel_clear);
 DECLARE_int32(occlusion_query_strict_retire_max_stalls);
 
 DECLARE_bool(occlusion_query_log);
-
-DECLARE_int32(occlusion_query_pool_size);
-
-void SetOcclusionQueryEnable(bool value);
 
 // Returns the guest vblank rate in Hz (50 for PAL, 60 for NTSC).
 // Based on use_50Hz_mode cvar.
