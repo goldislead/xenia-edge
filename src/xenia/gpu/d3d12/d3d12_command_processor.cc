@@ -1195,6 +1195,9 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
+  zpd_draw_resolution_scale_x_ = draw_resolution_scale_x;
+  zpd_draw_resolution_scale_y_ = draw_resolution_scale_y;
+
   pipeline_cache_ = std::make_unique<PipelineCache>(*this, *register_file_,
                                                     *render_target_cache_.get(),
                                                     bindless_resources_used_);
@@ -5897,14 +5900,6 @@ bool D3D12CommandProcessor::CanEndHostZPDSubmissionImmediately() const {
 
 bool D3D12CommandProcessor::EndHostZPDSubmission(bool is_swap) {
   return EndSubmission(is_swap);
-}
-
-uint32_t D3D12CommandProcessor::GetZPDReportDrawResolutionScaleX() const {
-  return texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-}
-
-uint32_t D3D12CommandProcessor::GetZPDReportDrawResolutionScaleY() const {
-  return texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
 }
 
 // Resolve the queued indices into the mapped readback buffer.
