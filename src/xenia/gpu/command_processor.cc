@@ -1463,6 +1463,7 @@ bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
   // Only await if the submission has actually been signaled.
   current_submission = GetHostZPDCurrentSubmission();
   if (wait_for_submission > completed_before &&
+      wait_for_submission < current_submission) {
     AwaitHostZPDSubmissionAndUpdateCompleted(wait_for_submission);
     uint64_t completed_after = GetHostZPDCompletedSubmission();
     if (completed_after > completed_before) {
