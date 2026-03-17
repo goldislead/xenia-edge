@@ -127,6 +127,22 @@ static void SetReadbackResolveCvar(const std::string& mode) {
   OVERRIDE_string(readback_resolve, mode);
 }
 
+static ZPDMode ParseZPDMode() {
+  const std::string& mode = cvars::occlusion_query;
+  if (mode == "strict") {
+    return ZPDMode::kStrict;
+  } else if (mode == "fast") {
+    return ZPDMode::kFast;
+  } else {
+    // Default to "fast" for any unrecognized value.
+    return ZPDMode::kFake;
+  }
+}
+
+static void SetZPDModeCvar(const std::string& mode) {
+  OVERRIDE_string(occlusion_query, mode);
+}
+
 using namespace xe::gpu::xenos;
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
@@ -143,6 +159,8 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
   assert_not_null(write_ptr_index_event_);
   // Parse and cache readback resolve mode once
   cached_readback_resolve_mode_ = ParseReadbackResolveMode();
+  // Parse and cache ZPD mode once.
+  cached_zpd_mode_ = ParseZPDMode();
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -326,6 +344,42 @@ void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode) {
     auto* gpu_table = config_table["GPU"].as_table();
     if (gpu_table) {
       gpu_table->insert_or_assign("readback_resolve", mode_str);
+    }
+
+    config::SaveGameConfig(title_id, config_table);
+  }
+}
+
+void CommandProcessor::SetZPDMode(ZPDMode mode) {
+  if (cached_zpd_mode_ == mode) {
+    return;
+  }
+  cached_zpd_mode_ = mode;
+  const char* mode_str = "fake";
+  switch (mode) {
+    case ZPDMode::kFast:
+      mode_str = "fast";
+      break;
+    case ZPDMode::kExact:
+      mode_str = "exact";
+      break;
+    default:
+      break;
+  }
+  SetZPDModeCvar(mode_str);
+
+  // Save to per-game config if a title is loaded
+  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
+  if (title_id != 0) {
+    toml::table config_table = config::LoadGameConfig(title_id);
+
+    if (!config_table.contains("GPU")) {
+      config_table.insert("GPU", toml::table{});
+    }
+
+    auto* gpu_table = config_table["GPU"].as_table();
+    if (gpu_table) {
+      gpu_table->insert_or_assign("occlusion_query", mode_str);
     }
 
     config::SaveGameConfig(title_id, config_table);
@@ -955,7 +1009,7 @@ void CommandProcessor::InitializeTrace() {
 }
 
 bool CommandProcessor::BeginGuestZPDReport(uint32_t report_address) {
-  if (!cvars::occlusion_query_enable || !zpd_report_controller_) {
+  if (GetZPDMode() != ZPDMode::kFake || !zpd_report_controller_) {
     return false;
   }
 
@@ -1064,7 +1118,7 @@ bool CommandProcessor::BeginGuestZPDReport(uint32_t report_address) {
 
 bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
                                          bool guest_forced_end) {
-  if (!cvars::occlusion_query_enable || !zpd_report_controller_ ||
+  if (GetZPDMode() != ZPDMode::kFake || !zpd_report_controller_ ||
       !active_host_zpd_query_segment_.logical_active) {
     return false;
   }
@@ -1162,7 +1216,7 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
   bool has_cross_slot_end =
       stored_end_record && stored_end_record != report_record_base;
 
-  if (IsFastZPDPathEnabled()) {
+  if (GetZPDMode() == ZPDMode::kFast) {
     bool write_begin_record = begin_record && report_record_base &&
                               begin_record != report_record_base;
     CommitGuestZPDReportDataWithResolvedBeginValue(
@@ -1225,7 +1279,7 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
 
 void CommandProcessor::ResumeActiveHostZPDQuerySegment(
     bool can_close_submission) {
-  if (!cvars::occlusion_query_enable ||
+  if (GetZPDMode() != ZPDMode::kFake ||
       !active_host_zpd_query_segment_.logical_active ||
       active_host_zpd_query_segment_.segment_active ||
       !active_host_zpd_query_segment_.segment_pending_begin ||
@@ -1254,7 +1308,7 @@ void CommandProcessor::ResumeActiveHostZPDQuerySegment(
       guest_zpd_report_stats_.pool_exhausted++;
       // Pool is full and we're in fast mode. Inject a nonzero sample count so
       // the report resolves without stalling for a free slot.
-      if (IsFastZPDPathEnabled()) {
+      if (GetZPDMode() == ZPDMode::kFast) {
         XenosReportController::ReportHandle report_handle =
             active_host_zpd_query_segment_.report_handle;
         auto it = logical_zpd_reports_.find(report_handle);
@@ -1286,7 +1340,7 @@ void CommandProcessor::ResumeActiveHostZPDQuerySegment(
 // report can span multiple segments if split by submissions or render passes.
 // Results are accumulated before the final write.
 void CommandProcessor::SplitActiveHostZPDQuerySegment() {
-  if (!cvars::occlusion_query_enable ||
+  if (GetZPDMode() != ZPDMode::kFake ||
       !active_host_zpd_query_segment_.segment_active) {
     return;
   }
@@ -1327,7 +1381,7 @@ void CommandProcessor::SplitActiveHostZPDQuerySegment() {
 
 void CommandProcessor::ProcessCompletedHostZPDQueryResolves(
     uint64_t completed_submission) {
-  if (!cvars::occlusion_query_enable || !zpd_report_controller_) {
+  if (GetZPDMode() != ZPDMode::kFake || !zpd_report_controller_) {
     return;
   }
 
@@ -1413,17 +1467,13 @@ void CommandProcessor::ProcessCompletedHostZPDQueryResolves(
   }
 }
 
-bool CommandProcessor::IsFastZPDPathEnabled() const {
-  return cvars::occlusion_query_fast;
-}
-
 bool CommandProcessor::IsStrictImmediateSentinelClearEnabled() const {
-  return !IsFastZPDPathEnabled() &&
+  return GetZPDMode() == ZPDMode::kStrict &&
          cvars::occlusion_query_strict_immediate_sentinel_clear;
 }
 
 void CommandProcessor::TryPumpZPDQueryResolves() {
-  if (!cvars::occlusion_query_enable || !zpd_report_controller_) {
+  if (GetZPDMode() != ZPDMode::kFake || !zpd_report_controller_) {
     return;
   }
 
@@ -1437,7 +1487,7 @@ void CommandProcessor::TryPumpZPDQueryResolves() {
 
 bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
     XenosReportController::ReportHandle report_handle) {
-  if (!cvars::occlusion_query_enable || !zpd_report_controller_) {
+  if (GetZPDMode() != ZPDMode::kFake || !zpd_report_controller_) {
     return false;
   }
 
@@ -1491,7 +1541,7 @@ bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
 }
 
 void CommandProcessor::MaybeAwaitStrictZPDReportRetirement() {
-  if (IsFastZPDPathEnabled() || !zpd_report_controller_ ||
+  if (GetZPDMode() != ZPDMode::kStrict || !zpd_report_controller_ ||
       pending_strict_zpd_retire_handle_ ==
           XenosReportController::kInvalidReportHandle) {
     return;
