@@ -52,20 +52,20 @@ enum class ReadbackResolveMode {
   kFull       // Immediate sync with GPU stall (full)
 };
 
+enum class ZPDMode {
+  kFake,    // Synthetic sample counts, no real GPU queries (fake)
+  kFast,    // Real queries with speculative cached writes (fast)
+  kStrict,  // Real queries, waits for GPU result before writing back (strict)
+};
+
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 
 // ZPD query resolves are always 64-bit sample counts.
 constexpr uint32_t kHostZPDResolveStrideBytes = 8;
 
-// Clamps the pool size and rounds it up for bitmask wrapping.
-inline uint32_t GetClampedHostZPDPoolCapacity(int32_t capacity) {
-  static constexpr int32_t kHostZPDPoolCapacityMin = 16;
-  static constexpr int32_t kHostZPDPoolCapacityMax = 524288;
-  uint32_t requested_capacity = static_cast<uint32_t>(
-      std::clamp(capacity, kHostZPDPoolCapacityMin, kHostZPDPoolCapacityMax));
-  return xe::next_pow2(requested_capacity);
-}
+// Host ZPD query pool capacity.
+constexpr uint32_t kZPDQueryPoolCapacity = 8192;
 
 class GraphicsSystem;
 class Shader;
@@ -135,6 +135,9 @@ class CommandProcessor {
 
   // Set readback resolve mode (updates both cvar and cached value)
   void SetReadbackResolveMode(ReadbackResolveMode mode);
+
+  ZPDMode GetZPDMode() const { return cached_zpd_mode_; }
+  void SetZPDMode(ZPDMode mode);
 
   // "Desired" is for the external thread managing the post-processing effect.
   SwapPostEffect GetDesiredSwapPostEffect() const {
@@ -446,7 +449,6 @@ class CommandProcessor {
   void CommitGuestZPDReportDataWithResolvedBeginValue(
       uint32_t begin_record, uint32_t report_record_base, uint32_t begin_value,
       uint32_t delta_value, bool write_begin_record);
-  bool IsFastZPDPathEnabled() const;
   // Returns true if strict mode should immediately overwrite the sentinel with
   // a speculative result rather than leaving it until the GPU result arrives.
   bool IsStrictImmediateSentinelClearEnabled() const;
@@ -568,6 +570,9 @@ class CommandProcessor {
   // Cached readback resolve mode (parsed once from string cvar)
   ReadbackResolveMode cached_readback_resolve_mode_ =
       ReadbackResolveMode::kFast;
+
+  // Cached ZPD occlusion query mode (defaults to fake)
+  ZPDMode cached_zpd_mode_ = ZPDMode::kFake;
 
   // For host frame rate limiting at IssueSwap
   uint64_t last_swap_time_ = 0;
