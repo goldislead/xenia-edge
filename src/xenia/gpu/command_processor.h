@@ -310,6 +310,8 @@ class CommandProcessor {
 
   // One logical ZPD report.
   struct LogicalGuestZPDReport {
+    // Raw host sample count, summed across all segement. Not scaled yet, that
+    // happens during retirement.
     uint64_t accumulated_samples = 0;
     uint64_t last_segment_end_submission = 0;
     uint64_t slot_sequence_id = 0;
@@ -325,6 +327,10 @@ class CommandProcessor {
   };
 
   // One active query segment for a logical ZPD report.
+  // logical_active: a ZPD report is open.
+  // segment_active: a query is currently recording.
+  // segment_pending_begin: the logical report wants a new segment but can't
+  // open one yet (no submission, render pass not ready, etc.).
   struct ActiveHostZPDQuerySegment {
     XenosReportController::ReportHandle report_handle =
         XenosReportController::kInvalidReportHandle;
@@ -512,7 +518,7 @@ class CommandProcessor {
       XenosReportController::kInvalidReportHandle;
   uint32_t pending_strict_zpd_retire_stall_count_ = 0;
 
-  // Rolling count for the no-hardware path.
+  // The legacy fallback rolling sample count.
   uint32_t fake_zpd_sample_count_ = 0;
   GuestZPDReportStats guest_zpd_report_stats_;
 
