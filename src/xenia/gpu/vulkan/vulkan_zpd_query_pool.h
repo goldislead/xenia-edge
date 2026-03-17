@@ -60,8 +60,7 @@ class VulkanZPDQueryPool {
 
   // Allocation.
   bool AcquireQueryIndex(uint32_t& query_index, uint32_t& query_generation);
-  void ReleaseQueryIndex(uint32_t query_index,
-                         uint32_t query_generation);
+  void ReleaseQueryIndex(uint32_t query_index, uint32_t query_generation);
   bool GenerationMatches(uint32_t query_index, uint32_t query_generation) const;
 
   // Recording and resolve batching.
