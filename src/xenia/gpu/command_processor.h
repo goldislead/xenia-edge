@@ -67,9 +67,9 @@ constexpr uint32_t kHostZPDResolveStrideBytes = 8;
 // Host ZPD query pool capacity.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
 
- protected:
-  uint32_t zpd_draw_resolution_scale_x_ = 1;
-  uint32_t zpd_draw_resolution_scale_y_ = 1;
+protected:
+uint32_t zpd_draw_resolution_scale_x_ = 1;
+uint32_t zpd_draw_resolution_scale_y_ = 1;
 
 class GraphicsSystem;
 class Shader;
