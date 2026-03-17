@@ -1673,8 +1673,8 @@ uint32_t CommandProcessor::NormalizeZPDReportSampleCount(
     return 0;
   }
 
-  uint64_t scale_x = GetZPDReportDrawResolutionScaleX();
-  uint64_t scale_y = GetZPDReportDrawResolutionScaleY();
+  uint64_t scale_x = zpd_draw_resolution_scale_x_;
+  uint64_t scale_y = zpd_draw_resolution_scale_y_;
   uint64_t scale = scale_x * scale_y;
   // A result upscaling inflated to 3 samples at 2x should resolve to 1, not 0.
   uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
