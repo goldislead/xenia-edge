@@ -3837,7 +3837,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     deferred_command_list_.Reset();
 
     // Resume the active query segment.
-    if (cvars::occlusion_query_enable &&
+    if (GetZPDMode() != ZPDMode::kFake &&
         active_host_zpd_query_segment_.logical_active) {
       ResumeActiveHostZPDQuerySegment(false);
     }
@@ -3871,7 +3871,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     frame_open_ = true;
 
     // Log guest ZPD report stats every 100 frames.
-    if (cvars::occlusion_query_enable && cvars::occlusion_query_log &&
+    if (GetZPDMode() != ZPDMode::kFake && cvars::occlusion_query_log &&
         zpd_host_query_pool_ && zpd_host_query_pool_->capacity() &&
         zpd_report_controller_ &&
         frame_current_ - guest_zpd_report_stats_.last_log_frame >= 100) {
@@ -3990,7 +3990,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     // D3D12 query spans can't cross command list boundaries.
     // Split the active segment here and resume it in the next submission.
-    if (cvars::occlusion_query_enable) {
+    if (GetZPDMode() != ZPDMode::kFake) {
       SplitActiveHostZPDQuerySegment();
       RecordHostZPDQueryResolveBatch();
     }
@@ -5724,12 +5724,11 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
 }
 
 void D3D12CommandProcessor::EnsureZPDHostQueryResources() {
-  if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
+  if (GetZPDMode() = ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
 
-  uint32_t requested_capacity =
-      GetClampedHostZPDPoolCapacity(cvars::occlusion_query_pool_size);
+  uint32_t requested_capacity = kZPDQueryPoolCapacity
   bool can_recreate = !active_host_zpd_query_segment_.logical_active &&
                       !active_host_zpd_query_segment_.segment_active &&
                       !zpd_host_query_pool_->has_pending_resolve_batch() &&
@@ -5779,7 +5778,7 @@ D3D12CommandProcessor::OpenHostZPDQuery(uint32_t& out_host_index,
 
   bool waited_for_submission = false;
   if (is_pool_exhausted) {
-    if (cvars::occlusion_query_fast) {
+    if (GetZPDMode() == ZPDMode::kFast) {
       return HostZPDQueryOpenResult::kPoolExhausted;
     }
 
@@ -5910,7 +5909,7 @@ uint32_t D3D12CommandProcessor::GetZPDReportDrawResolutionScaleY() const {
 
 // Resolve the queued indices into the mapped readback buffer.
 void D3D12CommandProcessor::RecordHostZPDQueryResolveBatch() {
-  if (!cvars::occlusion_query_enable || !zpd_host_query_pool_) {
+  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
   zpd_host_query_pool_->FlushResolveBatch(deferred_command_list_,
