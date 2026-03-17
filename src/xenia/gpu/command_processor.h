@@ -67,6 +67,10 @@ constexpr uint32_t kHostZPDResolveStrideBytes = 8;
 // Host ZPD query pool capacity.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
 
+ protected:
+  uint32_t zpd_draw_resolution_scale_x_ = 1;
+  uint32_t zpd_draw_resolution_scale_y_ = 1;
+
 class GraphicsSystem;
 class Shader;
 
@@ -297,10 +301,9 @@ class CommandProcessor {
 
   virtual void OnPrimaryBufferEnd() {}
 
-  // ZPD report handling lives here.
-  //
-  // In this code, "report" means the 360 memory record, and "query" means the
-  // API object that produces the sample count.
+  // ZPD report handling.
+  // For the record: "report" means the guest memory record, whereas "query"
+  // refer to the actual API object that produces the sample count.
   //
   // Backends own the pool and submission side. This class owns the logical
   // lifetime and the writeback flow.
@@ -421,8 +424,6 @@ class CommandProcessor {
   // Backends with render pass state should override this to end the pass
   // before the wait.
   virtual void PrepareToWaitForHostZPDSubmission() {}
-  virtual uint32_t GetZPDReportDrawResolutionScaleX() const { return 1; }
-  virtual uint32_t GetZPDReportDrawResolutionScaleY() const { return 1; }
 
   // Logical report state.
   bool BeginGuestZPDReport(uint32_t report_address);
@@ -480,10 +481,10 @@ class CommandProcessor {
   virtual bool IssueCopy() { return false; }
 
   // Debug marker stubs for base class (overridden by D3D12/Vulkan backends).
-  virtual bool debug_markers_enabled() const { return false; }
-  virtual void PushDebugMarker(const char* format, ...) {}
-  virtual void PopDebugMarker() {}
-  virtual void InsertDebugMarker(const char* format, ...) {}
+  bool debug_markers_enabled() const { return false; }
+  void PushDebugMarker(const char* format, ...) {}
+  void PopDebugMarker() {}
+  void InsertDebugMarker(const char* format, ...) {}
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
@@ -519,6 +520,15 @@ class CommandProcessor {
   XenosReportController::ReportHandle pending_strict_zpd_retire_handle_ =
       XenosReportController::kInvalidReportHandle;
   uint32_t pending_strict_zpd_retire_stall_count_ = 0;
+
+  // Set by the backend when the texture cache is created or its resolution
+  // scale changes. Defaults to 1x1 until then.
+  uint32_t zpd_draw_resolution_scale_x() const {
+    return zpd_draw_resolution_scale_x_;
+  }
+  uint32_t zpd_draw_resolution_scale_y() const {
+    return zpd_draw_resolution_scale_y_;
+  }
 
   // The legacy fallback rolling sample count.
   uint32_t fake_zpd_sample_count_ = 0;
