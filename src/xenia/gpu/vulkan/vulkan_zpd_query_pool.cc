@@ -205,16 +205,20 @@ bool VulkanZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
   query_index = free_indices_.back();
   free_indices_.pop_back();
 
-  if (query_index < index_generations_.size()) {
-    query_generation = ++index_generations_[query_index];
-  } else {
-    query_generation = 1;
-  }
+  assert_true(query_index < index_generations_.size());
+  query_generation = ++index_generations_[query_index];
   return true;
 }
 
-void VulkanZPDQueryPool::ReleaseQueryIndex(uint32_t query_index) {
+void VulkanZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
+                                          uint32_t query_generation) {
   if (!vulkan_device_ || query_index >= capacity_) {
+    return;
+  }
+
+  if (!GenerationMatches(query_index, query_generation)) {
+    XELOGW("VulkanZPDQueryPool: stale release index={} gen={}", query_index,
+           query_generation);
     return;
   }
 
@@ -262,16 +266,6 @@ void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index) {
 }
 
 void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
-  if (!resolve_batch_index_count_) {
-    return;
-  }
-
-  if (!is_initialized()) {
-    resolve_batch_index_map_.Reset();
-    resolve_batch_index_count_ = 0;
-    return;
-  }
-
   struct ResolveRange {
     uint32_t start;
     uint32_t count;
@@ -281,33 +275,45 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
       static_cast<VkDeviceSize>(kHostZPDResolveStrideBytes);
 
   std::vector<ResolveRange> ranges;
-  uint32_t range_start = 0;
-  uint32_t range_count = 0;
-  for (uint32_t index = 0; index < capacity_; ++index) {
-    if (!resolve_batch_index_map_.IsAcquired(index)) {
-      continue;
+  {
+    if (!resolve_batch_index_count_) {
+      return;
     }
-    if (range_count == 0) {
+
+    if (!is_initialized()) {
+      resolve_batch_index_map_.Reset();
+      resolve_batch_index_count_ = 0;
+      return;
+    }
+
+    uint32_t range_start = 0;
+    uint32_t range_count = 0;
+    for (uint32_t index = 0; index < capacity_; ++index) {
+      if (!resolve_batch_index_map_.IsAcquired(index)) {
+        continue;
+      }
+      if (range_count == 0) {
+        range_start = index;
+        range_count = 1;
+        continue;
+      }
+      if (index == range_start + range_count) {
+        ++range_count;
+        continue;
+      }
+      ranges.push_back({range_start, range_count});
       range_start = index;
       range_count = 1;
-      continue;
     }
-    if (index == range_start + range_count) {
-      ++range_count;
-      continue;
+    if (range_count != 0) {
+      ranges.push_back({range_start, range_count});
     }
-    ranges.push_back({range_start, range_count});
-    range_start = index;
-    range_count = 1;
-  }
-  if (range_count != 0) {
-    ranges.push_back({range_start, range_count});
-  }
 
-  // Detach the recorded batch now. Later ENDs in the same submission belong
-  // to the next pass through this code, not this one.
-  resolve_batch_index_map_.Reset();
-  resolve_batch_index_count_ = 0;
+    // Detach the recorded batch now. Later ENDs in the same submission belong
+    // to the next pass through this code, not this one.
+    resolve_batch_index_map_.Reset();
+    resolve_batch_index_count_ = 0;
+  }
 
   if (ranges.empty()) {
     return;

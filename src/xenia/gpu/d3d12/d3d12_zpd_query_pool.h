@@ -58,8 +58,11 @@ class D3D12ZPDQueryPool {
   bool has_free_indices() const { return !free_indices_.empty(); }
 
   // Allocation.
-  bool AcquireQueryIndex(uint32_t& query_index);
-  void ReleaseQueryIndex(uint32_t query_index);
+  bool AcquireQueryIndex(uint32_t& query_index,
+                         uint32_t& query_generation);
+  void ReleaseQueryIndex(uint32_t query_index, uint32_t query_generation);
+  bool GenerationMatches(uint32_t query_index,
+                         uint32_t query_generation) const;
 
   // Recording and resolve batching.
   void BeginQuery(DeferredCommandList& deferred_command_list,
@@ -84,6 +87,11 @@ class D3D12ZPDQueryPool {
 
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
+
+  // D3D12 keeps indices alive until they are explicitly released, but a
+  // generation still helps catch stale or double-retired handles before an old
+  // readback value can be reused accidentally.
+  std::vector<uint32_t> index_generations_;
 
   // Queued resolves are tracked with a bitmap and flushed in batches.
   xe::BitMap resolve_batch_index_map_;

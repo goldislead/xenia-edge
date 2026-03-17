@@ -40,7 +40,9 @@ DECLARE_bool(occlusion_query_fast);
 
 DECLARE_int32(occlusion_query_fast_cached_delta);
 
-DECLARE_int32(occlusion_query_fast_sequence_grace);
+DECLARE_bool(occlusion_query_strict_immediate_sentinel_clear);
+
+DECLARE_int32(occlusion_query_strict_retire_max_stalls);
 
 DECLARE_bool(occlusion_query_log);
 

@@ -1163,18 +1163,46 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 
   uint32_t report_address =
       register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
-  // Base of the BEGIN/END report pair in guest memory.
   uint32_t report_record_base =
       xe::gpu::XenosZPDReport::GetRecordBase(report_address);
+  uint32_t report_slot_base =
+      xe::gpu::XenosZPDReport::GetSlotBase(report_address);
+  bool is_begin_record = xe::gpu::XenosZPDReport::IsBeginRecord(report_address);
+  bool is_end_record = xe::gpu::XenosZPDReport::IsEndRecord(report_address);
   xe_gpu_depth_sample_counts* end_report =
-      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-          report_record_base);
+      report_record_base
+          ? memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
+                report_record_base)
+          : nullptr;
 
-  // Guest marks END by leaving the 0xFFFFFEED pending sentinel in the report.
   bool guest_marks_end =
       end_report && xe::gpu::XenosZPDReport::IsReportPending(end_report);
-
   bool logical_active = active_host_zpd_query_segment_.logical_active;
+  XenosReportController::ReportHandle report_handle =
+      active_host_zpd_query_segment_.report_handle;
+
+  if (cvars::occlusion_query_log) {
+    XELOGI(
+        "ZPD: EVENT_WRITE_ZPD event={} initiator=0x{:08X} "
+        "report_address=0x{:08X} record=0x{:08X} slot=0x{:08X} "
+        "is_begin={} is_end={} guest_marks_end={} logical_active={} "
+        "handle={}",
+        GetEventName(event_type), initiator, report_address, report_record_base,
+        report_slot_base, is_begin_record, is_end_record, guest_marks_end,
+        logical_active, report_handle);
+    if (end_report) {
+      XELOGI(
+          "ZPD: EVENT_WRITE_ZPD fields event={} report_address=0x{:08X} "
+          "record=0x{:08X} Total=({:08X},{:08X}) ZFail=({:08X},{:08X}) "
+          "ZPass=({:08X},{:08X}) Stencil=({:08X},{:08X}) pending={}",
+          GetEventName(event_type), report_address, report_record_base,
+          uint32_t(end_report->Total_A), uint32_t(end_report->Total_B),
+          uint32_t(end_report->ZFail_A), uint32_t(end_report->ZFail_B),
+          uint32_t(end_report->ZPass_A), uint32_t(end_report->ZPass_B),
+          uint32_t(end_report->StencilFail_A),
+          uint32_t(end_report->StencilFail_B), guest_marks_end);
+    }
+  }
 
   if (cvars::occlusion_query_enable && zpd_report_controller_) {
     COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
@@ -1183,42 +1211,79 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
         return true;
       }
 
-      if (logical_active) {
-        // A new write ends the current logical report first. It ends the
-        // active lifetime or starts a new one if nothing is active.
-        COMMAND_PROCESSOR::EndGuestZPDReport(report_address, false);
-        return true;
-      }
+      if (event_type == xenos::Event::ZPASS_DONE) {
+        if (logical_active) {
+          if (is_end_record) {
+            if (cvars::occlusion_query_log) {
+              XELOGI(
+                  "ZPD: EVENT_WRITE_ZPD ending active logical handle={}",
+                  report_handle);
+            }
+            COMMAND_PROCESSOR::EndGuestZPDReport(report_address, false);
+            return true;
+          }
 
-      // No active report and no pending END sentinel. Treat this as BEGIN.
-      if (!guest_marks_end) {
-        COMMAND_PROCESSOR::BeginGuestZPDReport(report_address);
-        return true;
-      }
+          if (is_begin_record) {
+            if (cvars::occlusion_query_log) {
+              XELOGI(
+                  "ZPD: EVENT_WRITE_ZPD BEGIN while logical is active, "
+                  "forcing END handle={}",
+                  report_handle);
+            }
+            COMMAND_PROCESSOR::EndGuestZPDReport(
+                active_host_zpd_query_segment_.end_record, true);
+            COMMAND_PROCESSOR::BeginGuestZPDReport(report_address);
+            return true;
+          }
+        } else {
+          if (is_begin_record) {
+            if (cvars::occlusion_query_log) {
+              XELOGI("ZPD: EVENT_WRITE_ZPD treating write as BEGIN");
+            }
+            COMMAND_PROCESSOR::BeginGuestZPDReport(report_address);
+            return true;
+          }
 
-      if (COMMAND_PROCESSOR::IsFastZPDPathEnabled()) {
-        // Guest marked END, but there is no active logical report. Clear the
-        // pending state with a cached delta so polling code does not sit on
-        // the sentinel forever.
-        uint32_t cached_delta =
-            static_cast<uint32_t>(cvars::occlusion_query_fast_cached_delta);
-        {
-          std::lock_guard<std::mutex> lock(zpd_report_mutex_);
-          auto existing_cached_delta =
-              fast_zpd_report_cached_values_.find(report_record_base);
-          if (existing_cached_delta != fast_zpd_report_cached_values_.end()) {
-            cached_delta = existing_cached_delta->second;
-          } else {
-            fast_zpd_report_cached_values_.emplace(report_record_base,
-                                                   cached_delta);
+          if (is_end_record) {
+            if (COMMAND_PROCESSOR::IsFastZPDPathEnabled()) {
+              uint64_t current_slot_sequence =
+                  zpd_report_controller_->GetSlotSequence(report_record_base);
+              uint32_t cached_delta = 0;
+              uint64_t cached_slot_sequence = 0;
+              bool can_commit_cached_delta = false;
+              auto existing_cached_delta =
+                  fast_zpd_report_cached_values_.find(report_record_base);
+              if (existing_cached_delta !=
+                      fast_zpd_report_cached_values_.end() &&
+                  existing_cached_delta->second.slot_sequence_id != 0 &&
+                  existing_cached_delta->second.slot_sequence_id ==
+                      current_slot_sequence) {
+                cached_delta = existing_cached_delta->second.delta_value;
+                cached_slot_sequence =
+                    existing_cached_delta->second.slot_sequence_id;
+                can_commit_cached_delta = true;
+              }
+
+              if (cvars::occlusion_query_log) {
+                XELOGI(
+                    "ZPD: EVENT_WRITE_ZPD orphan END record=0x{:08X} "
+                    "cache_hit={} cache_seq={} current_seq={} cached_delta={}",
+                    report_record_base, can_commit_cached_delta,
+                    cached_slot_sequence, current_slot_sequence, cached_delta);
+              }
+              if (can_commit_cached_delta) {
+                guest_zpd_report_stats_.orphan_end_cache_hit++;
+                COMMAND_PROCESSOR::CommitGuestZPDReportDataWithGuestBeginValue(
+                    0, report_record_base, cached_delta, false);
+              } else {
+                guest_zpd_report_stats_.orphan_end_cache_miss++;
+              }
+            } else {
+              zpd_report_controller_->RetireResolvedReports();
+            }
+            return true;
           }
         }
-
-        COMMAND_PROCESSOR::CommitGuestZPDReportData(0, report_record_base,
-                                                    cached_delta, false);
-      } else if (pending_strict_zpd_retire_nudge_record_ ==
-                 report_record_base) {
-        zpd_report_controller_->NudgeReportRetirement(report_address);
       }
       return true;
     }

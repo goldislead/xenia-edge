@@ -21,50 +21,46 @@ namespace gpu {
 // Helpers for guest ZPD report records.
 //
 // This keeps record math, sentinel checks, and shared writes in one place.
-// Lifetime and pairing stay in the report controller.
+// Lifetime and retirement stay in the report controller.
 struct XenosZPDReport {
   // Reports are 0x20 records.
   static constexpr uint32_t kRecordSizeBytes = 0x20;
   static constexpr uint32_t kRecordAlignMask = ~(kRecordSizeBytes - 1);
 
-  // The common case is two 0x20 records packed into one 0x40 slot.
+  // ZPD queries use two 0x20 records in one 0x40 slot.
   static constexpr uint32_t kSlotSizeBytes = 0x40;
   static constexpr uint32_t kSlotAlignMask = ~(kSlotSizeBytes - 1);
-
-  // Page bucket used for grouping.
-  static constexpr uint32_t kPageSizeBytes = 0x1000;
-  static constexpr uint32_t kPageAlignMask = ~(kPageSizeBytes - 1);
 
   static constexpr uint32_t GetRecordBase(uint32_t address) {
     return address & kRecordAlignMask;
   }
 
-  // Records in the same slot are close enough for common split checks.
   static constexpr uint32_t GetSlotBase(uint32_t address) {
     return address & kSlotAlignMask;
   }
 
-  static constexpr uint32_t GetPageBase(uint32_t address) {
-    return address & kPageAlignMask;
+  static constexpr uint32_t GetBeginRecordBase(uint32_t address) {
+    uint32_t slot_base = GetSlotBase(address);
+    return slot_base ? (slot_base + kRecordSizeBytes) : 0;
   }
 
-  static constexpr bool IsSameSlot(uint32_t a, uint32_t b) {
-    return GetSlotBase(a) == GetSlotBase(b);
+  static constexpr uint32_t GetEndRecordBase(uint32_t address) {
+    return GetSlotBase(address);
   }
 
-  static constexpr uint32_t AbsDelta(uint32_t a, uint32_t b) {
-    return a > b ? (a - b) : (b - a);
+  static constexpr bool IsBeginRecord(uint32_t address) {
+    uint32_t record_base = GetRecordBase(address);
+    return record_base && record_base == GetBeginRecordBase(record_base);
   }
 
-  // Two records in the same 0x40 slot, one half apart.
-  static constexpr bool IsCommonHalfSplitPair(uint32_t a, uint32_t b) {
-    return IsSameSlot(a, b) &&
-           AbsDelta(GetRecordBase(a), GetRecordBase(b)) == 0x20;
+  static constexpr bool IsEndRecord(uint32_t address) {
+    uint32_t record_base = GetRecordBase(address);
+    return record_base && record_base == GetEndRecordBase(record_base);
   }
 
   // Written when the report should stay pending until writeback.
-  // Sentinel can show up in either endianness. Perplexingly, some games byte-
-  // swap the sentinel in their own code, so both forms are valid.
+  // Sentinel can show up in either endianness. Some games byte-swap it in
+  // their own code, so both forms are valid.
   static constexpr uint32_t kPendingSentinelBE = 0xFFFFFEEDu;
   static constexpr uint32_t kPendingSentinelLE = 0xEDFEFFFFu;
   static constexpr bool IsPendingSentinel(uint32_t value) {
@@ -90,7 +86,7 @@ struct XenosZPDReport {
   // Reads the initial sample count. Returns 0 if the report is pending.
   static uint32_t ReadSampleCount(
       const xenos::xe_gpu_depth_sample_counts* report) {
-    if (!report) {
+    if (!report || IsReportPending(report)) {
       return 0;
     }
 
@@ -114,7 +110,9 @@ struct XenosZPDReport {
     return IsPendingSentinel(sample_count) ? 0u : sample_count;
   }
 
-  // Writes one logical 32-bit count. Keeps B at 0.
+  // Writes one logical 32-bit count. ZFail_A and StencilFail_A stay 0
+  // because host occlusion query APIs only expose passing samples. Total_A
+  // mirrors ZPass_A for the same reason.
   static void WriteSampleCount(xenos::xe_gpu_depth_sample_counts* report,
                                uint32_t sample_count) {
     if (!report) {
@@ -122,12 +120,30 @@ struct XenosZPDReport {
     }
     report->Total_A = sample_count;
     report->Total_B = 0;
+    report->ZFail_A = 0;
+    report->ZFail_B = 0;
     report->ZPass_A = sample_count;
     report->ZPass_B = 0;
-    report->ZFail_A = sample_count;
-    report->ZFail_B = 0;
-    report->StencilFail_A = sample_count;
+    report->StencilFail_A = 0;
     report->StencilFail_B = 0;
+  }
+
+  static void WriteGuestReportDeltaWithBeginValue(
+      xenos::xe_gpu_depth_sample_counts* begin_report,
+      xenos::xe_gpu_depth_sample_counts* end_report, uint32_t begin_value,
+      uint32_t delta_value, bool write_begin_report) {
+    if (!end_report) {
+      return;
+    }
+
+    uint64_t end_sample_count = uint64_t(begin_value) + uint64_t(delta_value);
+    uint32_t clamped_end_sample_count = end_sample_count > UINT32_MAX
+                                            ? UINT32_MAX
+                                            : uint32_t(end_sample_count);
+    if (write_begin_report && begin_report && end_report != begin_report) {
+      WriteSampleCount(begin_report, begin_value);
+    }
+    WriteSampleCount(end_report, clamped_end_sample_count);
   }
 
   // Optionally refreshes BEGIN before writing the END delta.
@@ -135,15 +151,10 @@ struct XenosZPDReport {
       xenos::xe_gpu_depth_sample_counts* begin_report,
       xenos::xe_gpu_depth_sample_counts* end_report, uint32_t delta_value,
       bool write_begin_report) {
-    if (!end_report) {
-      return;
-    }
     uint32_t begin_sample_count = ReadSampleCount(begin_report);
-    uint32_t end_sample_count = begin_sample_count + delta_value;
-    if (write_begin_report && begin_report && end_report != begin_report) {
-      WriteSampleCount(begin_report, begin_sample_count);
-    }
-    WriteSampleCount(end_report, end_sample_count);
+    WriteGuestReportDeltaWithBeginValue(begin_report, end_report,
+                                        begin_sample_count, delta_value,
+                                        write_begin_report);
   }
 };
 

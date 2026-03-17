@@ -31,6 +31,9 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
     return true;
   }
 
+  // Recreating the pool is only valid once the previous resolve batch has
+  // fully drained.
+  assert_true(!is_initialized() || !has_pending_resolve_batch());
   Shutdown();
 
   ID3D12Device* device = provider.GetDevice();
@@ -85,8 +88,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
 
   size_t requested_capacity_rounded = xe::align(requested_capacity, 64u);
   resolve_batch_index_map_.Resize(requested_capacity_rounded);
-  // Clear the bitmap before recording commands. New ENDs recorded later in
-  // the same frame should land in the next batch, not in this one.
+  // A freshly created pool starts with no queued resolve work.
   resolve_batch_index_map_.Reset();
   resolve_batch_index_count_ = 0;
 
@@ -95,6 +97,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
   for (uint32_t i = requested_capacity; i > 0; --i) {
     free_indices_.push_back(i - 1);
   }
+  index_generations_.assign(requested_capacity, 0);
 
   return true;
 }
@@ -103,6 +106,7 @@ void D3D12ZPDQueryPool::Shutdown() {
   resolve_batch_index_map_.Resize(0);
   resolve_batch_index_count_ = 0;
   free_indices_.clear();
+  index_generations_.clear();
   capacity_ = 0;
   if (readback_mapping_ && readback_buffer_) {
     readback_buffer_->Unmap(0, nullptr);
@@ -113,21 +117,41 @@ void D3D12ZPDQueryPool::Shutdown() {
   query_heap_.Reset();
 }
 
-bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index) {
+bool D3D12ZPDQueryPool::AcquireQueryIndex(
+    uint32_t& query_index, uint32_t& query_generation) {
   if (free_indices_.empty()) {
     query_index = UINT32_MAX;
+    query_generation = 0;
     return false;
   }
 
   query_index = free_indices_.back();
   free_indices_.pop_back();
+
+  assert_true(query_index < index_generations_.size());
+  query_generation = ++index_generations_[query_index];
   return true;
 }
 
-void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index) {
-  if (query_index < capacity_) {
-    free_indices_.push_back(query_index);
+void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
+                                          uint32_t query_generation) {
+  if (query_index >= capacity_) {
+    return;
   }
+
+  if (!GenerationMatches(query_index, query_generation)) {
+    XELOGW("D3D12ZPDQueryPool: stale release index={} gen={}", query_index,
+           query_generation);
+    return;
+  }
+
+  free_indices_.push_back(query_index);
+}
+
+bool D3D12ZPDQueryPool::GenerationMatches(
+    uint32_t query_index, uint32_t query_generation) const {
+  return query_index < index_generations_.size() &&
+         index_generations_[query_index] == query_generation;
 }
 
 void D3D12ZPDQueryPool::BeginQuery(DeferredCommandList& deferred_command_list,
@@ -167,46 +191,52 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
     uint32_t count;
   };
 
-  if (!resolve_batch_index_count_ || !submission_open) {
-    return;
-  }
-
-  if (!is_initialized()) {
-    resolve_batch_index_map_.Reset();
-    resolve_batch_index_count_ = 0;
+  if (!submission_open) {
     return;
   }
 
   std::vector<ResolveRange> ranges;
-
-  uint32_t range_start = 0;
-  uint32_t range_count = 0;
-  for (uint32_t index = 0; index < capacity_; ++index) {
-    if (!resolve_batch_index_map_.IsAcquired(index)) {
-      continue;
+  {
+    if (!resolve_batch_index_count_) {
+      return;
     }
-    if (range_count == 0) {
+
+    if (!is_initialized()) {
+      resolve_batch_index_map_.Reset();
+      resolve_batch_index_count_ = 0;
+      return;
+    }
+
+    uint32_t range_start = 0;
+    uint32_t range_count = 0;
+    for (uint32_t index = 0; index < capacity_; ++index) {
+      if (!resolve_batch_index_map_.IsAcquired(index)) {
+        continue;
+      }
+      if (range_count == 0) {
+        range_start = index;
+        range_count = 1;
+        continue;
+      }
+      if (index == range_start + range_count) {
+        ++range_count;
+        continue;
+      }
+      ranges.push_back({range_start, range_count});
       range_start = index;
       range_count = 1;
-      continue;
     }
-    if (index == range_start + range_count) {
-      ++range_count;
-      continue;
+    if (range_count != 0) {
+      ranges.push_back({range_start, range_count});
     }
-    ranges.push_back({range_start, range_count});
-    range_start = index;
-    range_count = 1;
-  }
-  if (range_count != 0) {
-    ranges.push_back({range_start, range_count});
-  }
 
-  // Clear the bitmap before recording commands. New ends in the same frame
-  // belong to the next batch.
-  if (ranges.empty()) {
+    // Detach the recorded batch now. Later ENDs in the same submission belong
+    // to the next pass through this code, not this one.
     resolve_batch_index_map_.Reset();
     resolve_batch_index_count_ = 0;
+  }
+
+  if (ranges.empty()) {
     return;
   }
 
@@ -218,8 +248,6 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
         query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, range.start, range.count,
         readback_buffer_.Get(), range.start * query_result_stride);
   }
-  resolve_batch_index_map_.Reset();
-  resolve_batch_index_count_ = 0;
 }
 
 uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index) const {

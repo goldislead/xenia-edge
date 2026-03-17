@@ -110,12 +110,21 @@ DEFINE_int32(
     "delta for speculative writes until a real result is cached.\n"
     "Leave this at 1 unless a game clearly needs a different visible fallback.",
     "GPU");
+DEFINE_bool(
+    occlusion_query_strict_immediate_sentinel_clear, false,
+    "In strict occlusion query mode, write a speculative result to the END\n"
+    "record immediately rather than leaving the 0xFFFFFEED pending sentinel\n"
+    "until the GPU result arrives. Intended for titles that read report memory\n"
+    "directly without going through GetData and stall on the sentinel value.\n"
+    "Disables S_FALSE signaling for those queries. The real GPU result still\n"
+    "overwrites the speculative value when it arrives.",
+    "GPU");
 DEFINE_int32(
-    occlusion_query_fast_sequence_grace, 0,
-    "When hardware occlusion is enabled and fast readback is active, allow "
-    "slightly late results to match if the record sequence is still within "
-    "this grace distance. This can help with aggressive slot reuse, but it can "
-    "also accept stale results and cause artifacts.",
+    occlusion_query_strict_retire_max_stalls, 16,
+    "Maximum number of consecutive failed retirement attempts before a stuck\n"
+    "strict-mode query handle is abandoned. Prevents indefinite stalling when\n"
+    "a GPU query submission never completes. Values less than or equal to 0\n"
+    "use the default of 16.",
     "GPU");
 DEFINE_bool(occlusion_query_log, false,
             "Log hardware occlusion query lifetime and summary stats.\n"

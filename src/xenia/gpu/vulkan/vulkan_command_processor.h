@@ -447,7 +447,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce - such as when there are unfinished graphics
   // pipeline creation requests.
-  bool CanEndSubmissionImmediately();
+  bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
     CheckSubmissionCompletionAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ &&
@@ -473,13 +473,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
                                           bool can_close_submission) override;
   bool CloseHostZPDQuery(uint32_t host_index, uint32_t host_generation,
                          uint64_t& out_submission) override;
+  bool DiscardHostZPDQuery(uint32_t host_index,
+                           uint32_t host_generation) override;
   uint64_t GetHostZPDQueryResult(uint32_t host_index) override;
   void ReleaseHostZPDQuery(uint32_t host_index,
                            uint32_t host_generation) override;
   bool IsHostZPDQueryResultValid(uint32_t host_index,
                                  uint32_t host_generation) const override;
-  void PrepareHostZPDReadback(uint64_t completed_submission,
-                              uint64_t settle_margin) override;
+  void PrepareHostZPDReadback(uint64_t completed_submission) override;
   bool ShouldDropHostZPDReportIfUnavailable() const override;
   uint64_t GetHostZPDCurrentSubmission() const override;
   uint64_t GetHostZPDCompletedSubmission() const override;
