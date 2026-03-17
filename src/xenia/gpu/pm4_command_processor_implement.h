@@ -1205,7 +1205,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   }
 
   if (COMMAND_PROCESSOR::GetZPDMode() != ZPDMode::kFake &&
-                                         zpd_report_controller_) {
+      zpd_report_controller_) {
     COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
     if (COMMAND_PROCESSOR::IsHostZPDQueryPoolReady()) {
       if (!report_record_base) {
