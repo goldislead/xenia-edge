@@ -1215,9 +1215,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
         if (logical_active) {
           if (is_end_record) {
             if (cvars::occlusion_query_log) {
-              XELOGI(
-                  "ZPD: EVENT_WRITE_ZPD ending active logical handle={}",
-                  report_handle);
+              XELOGI("ZPD: EVENT_WRITE_ZPD ending active logical handle={}",
+                     report_handle);
             }
             COMMAND_PROCESSOR::EndGuestZPDReport(report_address, false);
             return true;
