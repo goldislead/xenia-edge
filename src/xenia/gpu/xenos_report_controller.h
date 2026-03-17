@@ -135,7 +135,8 @@ class XenosReportController {
   // Per-slot sequence IDs keyed by the 0x40 slot base.
   std::unordered_map<uint32_t, uint64_t> slot_sequences_;
 
-  // Last committed cumulative value for each slot.
+  // Running cumulative sample count per slot. Each retired write adds to
+  // this so successive queries at the same address see an increasing total.
   std::unordered_map<uint32_t, uint32_t> slot_values_;
 
   Stats stats_;
