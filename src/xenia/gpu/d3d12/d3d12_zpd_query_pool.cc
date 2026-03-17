@@ -10,9 +10,9 @@
 #include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 
 #include "xenia/base/logging.h"
-#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -117,8 +117,8 @@ void D3D12ZPDQueryPool::Shutdown() {
   query_heap_.Reset();
 }
 
-bool D3D12ZPDQueryPool::AcquireQueryIndex(
-    uint32_t& query_index, uint32_t& query_generation) {
+bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
+                                          uint32_t& query_generation) {
   if (free_indices_.empty()) {
     query_index = UINT32_MAX;
     query_generation = 0;
@@ -148,8 +148,8 @@ void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
   free_indices_.push_back(query_index);
 }
 
-bool D3D12ZPDQueryPool::GenerationMatches(
-    uint32_t query_index, uint32_t query_generation) const {
+bool D3D12ZPDQueryPool::GenerationMatches(uint32_t query_index,
+                                          uint32_t query_generation) const {
   return query_index < index_generations_.size() &&
          index_generations_[query_index] == query_generation;
 }
