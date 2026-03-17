@@ -433,13 +433,13 @@ class CommandProcessor {
   // Reads the BEGIN value from guest memory. Only use this when the
   // controller-captured BEGIN snapshot is unavailable, such as orphan END
   // fallback writes.
-  void CommitGuestZPDReportDataWithGuestBeginValue(
-      uint32_t begin_record, uint32_t report_record_base,
-      uint32_t delta_value, bool write_begin_record);
+  void CommitGuestZPDReportDataWithGuestBeginValue(uint32_t begin_record,
+                                                   uint32_t report_record_base,
+                                                   uint32_t delta_value,
+                                                   bool write_begin_record);
   void CommitGuestZPDReportDataWithResolvedBeginValue(
-      uint32_t begin_record, uint32_t report_record_base,
-      uint32_t begin_value, uint32_t delta_value,
-      bool write_begin_record);
+      uint32_t begin_record, uint32_t report_record_base, uint32_t begin_value,
+      uint32_t delta_value, bool write_begin_record);
   bool IsFastZPDPathEnabled() const;
   // Returns true if strict mode should immediately overwrite the sentinel with
   // a speculative result rather than leaving it until the GPU result arrives.
@@ -453,9 +453,8 @@ class CommandProcessor {
   // Controller callback for writes that can retire now.
   static void CommitGuestZPDReportCallback(
       XenosReportController::ReportHandle report_handle,
-      uint32_t report_record_base, uint32_t begin_value,
-      uint32_t delta_value, bool write_begin_report,
-      void* callback_context);
+      uint32_t report_record_base, uint32_t begin_value, uint32_t delta_value,
+      bool write_begin_report, void* callback_context);
 #include "pm4_command_processor_declare.h"
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type,
