@@ -488,8 +488,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool CanEndHostZPDSubmissionImmediately() const override;
   bool EndHostZPDSubmission(bool is_swap) override;
   void PrepareToWaitForHostZPDSubmission() override;
-  uint32_t GetZPDReportDrawResolutionScaleX() const override;
-  uint32_t GetZPDReportDrawResolutionScaleY() const override;
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
