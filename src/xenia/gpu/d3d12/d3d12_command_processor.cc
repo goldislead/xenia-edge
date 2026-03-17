@@ -5731,7 +5731,7 @@ void D3D12CommandProcessor::EnsureZPDHostQueryResources() {
     return;
   }
 
-  uint32_t requested_capacity = kZPDQueryPoolCapacity
+  uint32_t requested_capacity = kZPDQueryPoolCapacity;
   bool can_recreate = !active_host_zpd_query_segment_.logical_active &&
                       !active_host_zpd_query_segment_.segment_active &&
                       !zpd_host_query_pool_->has_pending_resolve_batch() &&
