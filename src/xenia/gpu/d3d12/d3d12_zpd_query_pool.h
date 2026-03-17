@@ -58,11 +58,9 @@ class D3D12ZPDQueryPool {
   bool has_free_indices() const { return !free_indices_.empty(); }
 
   // Allocation.
-  bool AcquireQueryIndex(uint32_t& query_index,
-                         uint32_t& query_generation);
+  bool AcquireQueryIndex(uint32_t& query_index, uint32_t& query_generation);
   void ReleaseQueryIndex(uint32_t query_index, uint32_t query_generation);
-  bool GenerationMatches(uint32_t query_index,
-                         uint32_t query_generation) const;
+  bool GenerationMatches(uint32_t query_index, uint32_t query_generation) const;
 
   // Recording and resolve batching.
   void BeginQuery(DeferredCommandList& deferred_command_list,
