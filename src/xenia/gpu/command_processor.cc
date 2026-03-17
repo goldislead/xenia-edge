@@ -981,6 +981,10 @@ bool CommandProcessor::BeginGuestZPDReport(uint32_t report_address) {
       guest_zpd_report_stats_.forced_close_no_end_record++;
       auto dying_logical_report = logical_zpd_reports_.find(
           active_host_zpd_query_segment_.report_handle);
+      // If a previous logical report is being forced closed without an END,
+      // carry its last cached delta forward so the new lifetime doesn't start
+      // from 0. Guests that poll the same slot in a tight loop would otherwise
+      // see a bad zero result.
       if (dying_logical_report != logical_zpd_reports_.end()) {
         carried_cached_delta = dying_logical_report->second.cached_delta;
       }
@@ -1113,9 +1117,9 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
     if (logical.pending_segments == 0) {
       resolved_immediately = true;
       final_value = NormalizeZPDReportSampleCount(logical.accumulated_samples);
-      // If no host query work was ever associated with this logical report,
-      // keep using the delta carried from the previous slot lifetime instead
-      // of immediately committing a cold zero.
+      // No host query work ran during this report, so accumulated_samples is 0.
+      // Reuse the previous cached delta instead of writing 0. Guests often
+      // drive culling decisions off the last visible result.
       if (final_value == 0 && logical.cached_delta != 0) {
         cached_delta = logical.cached_delta;
       } else {
@@ -1192,6 +1196,8 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
                                                      begin_value, false);
     }
 
+    // Write a speculative result now so the sentinel is gone before the next
+    // frame. The real result will overwrite this once it resolves.
     if (IsStrictImmediateSentinelClearEnabled()) {
       bool write_begin_record = begin_record && report_record_base &&
                                 begin_record != report_record_base;
@@ -1246,6 +1252,8 @@ void CommandProcessor::ResumeActiveHostZPDQuerySegment(
       return;
     case HostZPDQueryOpenResult::kPoolExhausted: {
       guest_zpd_report_stats_.pool_exhausted++;
+      // Pool is full and we're in fast mode. Inject a nonzero sample count so
+      // the report resolves without stalling for a free slot.
       if (IsFastZPDPathEnabled()) {
         XenosReportController::ReportHandle report_handle =
             active_host_zpd_query_segment_.report_handle;
@@ -1274,6 +1282,9 @@ void CommandProcessor::ResumeActiveHostZPDQuerySegment(
   guest_zpd_report_stats_.segments_begun++;
 }
 
+// Closes the current host query segment and queues it for resolve. A logical
+// report can span multiple segments if split by submissions or render passes.
+// Results are accumulated before the final write.
 void CommandProcessor::SplitActiveHostZPDQuerySegment() {
   if (!cvars::occlusion_query_enable ||
       !active_host_zpd_query_segment_.segment_active) {
@@ -1348,6 +1359,9 @@ void CommandProcessor::ProcessCompletedHostZPDQueryResolves(
     ready_resolves.push_back(resolve);
   }
 
+  // Read and release all ready query slots first, then resolve reports. The
+  // split lets released slots feed back into the pool before we check whether
+  // the logical report can retire.
   completed_resolves.reserve(ready_resolves.size());
   for (const PendingHostZPDQueryResolve& resolve : ready_resolves) {
     uint64_t raw_samples = GetHostZPDQueryResult(resolve.query_index);
@@ -1449,6 +1463,8 @@ bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
   }
 
   uint64_t current_submission = GetHostZPDCurrentSubmission();
+  // If the submission we need hasn't been sent to the GPU yet, close it first.
+  // Waiting on an unfired fence would block forever.
   if (current_submission != 0 &&
       wait_for_submission >= current_submission &&
       CanEndHostZPDSubmissionImmediately()) {
@@ -1546,6 +1562,9 @@ void CommandProcessor::CommitGuestZPDReportDataWithGuestBeginValue(
                                         write_begin_record);
 }
 
+// Used only for orphan END writes where no controller BEGIN value is
+// available. Reads begin from guest memory, which may reflect a guest write
+// rather than our snapshot.
 void CommandProcessor::CommitGuestZPDReportDataWithResolvedBeginValue(
     uint32_t begin_record, uint32_t report_record_base, uint32_t begin_value,
     uint32_t delta_value, bool write_begin_record) {
@@ -1608,6 +1627,7 @@ uint32_t CommandProcessor::NormalizeZPDReportSampleCount(
   uint64_t scale_x = GetZPDReportDrawResolutionScaleX();
   uint64_t scale_y = GetZPDReportDrawResolutionScaleY();
   uint64_t scale = scale_x * scale_y;
+  // A result upscaling inflated to 3 samples at 2x should resolve to 1, not 0.
   uint64_t normalized = scale <= 1 ? samples : (samples + (scale >> 1)) / scale;
   return static_cast<uint32_t>(std::min<uint64_t>(normalized, UINT32_MAX));
 }
