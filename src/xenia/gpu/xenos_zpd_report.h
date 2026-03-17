@@ -137,9 +137,8 @@ struct XenosZPDReport {
     }
 
     uint64_t end_sample_count = uint64_t(begin_value) + uint64_t(delta_value);
-    uint32_t clamped_end_sample_count = end_sample_count > UINT32_MAX
-                                            ? UINT32_MAX
-                                            : uint32_t(end_sample_count);
+    uint32_t clamped_end_sample_count =
+        end_sample_count > UINT32_MAX ? UINT32_MAX : uint32_t(end_sample_count);
     if (write_begin_report && begin_report && end_report != begin_report) {
       WriteSampleCount(begin_report, begin_value);
     }
