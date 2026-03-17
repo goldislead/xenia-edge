@@ -1465,8 +1465,7 @@ bool CommandProcessor::AwaitAndPumpZPDQueryResolves(
   uint64_t current_submission = GetHostZPDCurrentSubmission();
   // If the submission we need hasn't been sent to the GPU yet, close it first.
   // Waiting on an unfired fence would block forever.
-  if (current_submission != 0 &&
-      wait_for_submission >= current_submission &&
+  if (current_submission != 0 && wait_for_submission >= current_submission &&
       CanEndHostZPDSubmissionImmediately()) {
     PrepareToWaitForHostZPDSubmission();
     EndHostZPDSubmission(false);
