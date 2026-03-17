@@ -80,17 +80,21 @@ DEFINE_bool(
     "when MSAA is used with fullscreen passes.",
     "GPU");
 
-DEFINE_bool(occlusion_query_enable, false,
-            "Use real host occlusion queries instead of faking results.\n"
-            "Still experimental. Some games improve a lot. Others may "
-            "experience missing objects, slow lens flare updates, or hangs.",
-            "GPU");
-DEFINE_bool(
-    occlusion_query_fast, true,
-    "Enable the fast path for hardware occlusion queries.\n"
-    "Uses cached delta writes and a one submission delay so guest polling "
-    "doesn't stall while the real resolve catches up. Some games need this "
-    "disabled to handle occlusion correctly.",
+DEFINE_string(
+    occlusion_query, "fake",
+    "Controls hardware occlusion query behavior for EVENT_WRITE_ZPD.\n"
+    "Used for effects like lens flares, object culling, and auto-exposure.\n"
+    "\n"
+    " fake: Write a synthetic result without asking the GPU.\n"
+    "       Safe for most games. Some effects may look slightly wrong\n"
+    "       but nothing will hang. (default)\n"
+    " fast: Ask the GPU but don't wait for the answer. Writes a cached\n"
+    "       result immediately and updates it when the GPU catches up.\n"
+    "       Try this if a game has missing objects or broken lens flares.\n"
+    " strict: Ask the GPU and wait for the real result before continuing.\n"
+    "         Most accurate, but some games will hang waiting for a result\n"
+    "         that never arrives. Only try this if fast queries aren't \n"
+    "         accurate enough.",
     "GPU");
 DEFINE_int32(occlusion_query_fake_lower_threshold, 80,
              "Lower end of the fake sample count value written on "
@@ -106,39 +110,28 @@ DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
              "GPU");
 DEFINE_int32(
     occlusion_query_fast_cached_delta, 1,
-    "When hardware occlusion is enabled and fast readback is active, use this "
-    "delta for speculative writes until a real result is cached.\n"
-    "Leave this at 1 unless a game clearly needs a different visible fallback.",
+    "In fast mode, use this delta value for speculative writes until a real "
+    "result is cached.\n"
+    "Leave this at 1 unless a game clearly needs a higher visible fallback.",
     "GPU");
 DEFINE_bool(
     occlusion_query_strict_immediate_sentinel_clear, false,
-    "In strict occlusion query mode, write a speculative result to the END\n"
-    "record immediately rather than leaving the 0xFFFFFEED pending sentinel\n"
-    "until the GPU result arrives. Intended for titles that read report "
-    "memory directly.\n"
-    "Disables S_FALSE signaling for those queries. The real GPU result still\n"
-    "overwrites the speculative value when it arrives.",
+    "In strict mode, write a placeholder result to memory as soon as the "
+    "query ends rather than leaving it marked as pending. Useful if a game "
+    "reads query memory directly and stall waiting for the pending mark to "
+    "clear. The real result still overwrites the placeholder when it arrives.",
     "GPU");
 DEFINE_int32(
     occlusion_query_strict_retire_max_stalls, 16,
-    "Maximum number of consecutive failed retirement attempts before a stuck\n"
-    "strict mode query handle is abandoned. Prevents indefinite stalling when\n"
-    "a GPU query submission never completes. Values less than or equal to 0\n"
-    "use the default of 16.",
+    "In exact mode, how many times to retry a query that hasn't resolved, "
+    "before giving up on it. Increase this if a game works correctly in strict "
+    "mode, but occasionally drops results under heavy load. Values less than "
+    "or equal to 0 use the the default of 16.",
     "GPU");
 DEFINE_bool(occlusion_query_log, false,
             "Log hardware occlusion query lifetime and summary stats.\n"
             "Only useful for debugging and testing.",
             "GPU");
-DEFINE_int32(occlusion_query_pool_size, 8192,
-             "Number of host occlusion query slots to allocate.\n"
-             "The default should be enough for most games. Raise it only if a "
-             "game burns through the pool and starts stalling or hanging.",
-             "GPU");
-
-void SetOcclusionQueryEnable(bool value) {
-  OVERRIDE_bool(occlusion_query_enable, value);
-}
 
 uint32_t GetGuestVblankRateHz() { return cvars::use_50Hz_mode ? 50 : 60; }
 
