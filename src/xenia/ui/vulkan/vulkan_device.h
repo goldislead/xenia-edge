@@ -236,7 +236,7 @@ class VulkanDevice {
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)
 #include "xenia/ui/vulkan/functions/device_1_1_khr_bind_memory2.inc"
     // VK_EXT_host_query_reset (promoted to 1.2)
-    PFN_vkResetQueryPool vkResetQueryPool = nullptr;
+#include "xenia/ui/vulkan/functions/device_1_2_ext_host_query_reset.inc"
     // VK_KHR_maintenance4 (#414, promoted to 1.3)
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
