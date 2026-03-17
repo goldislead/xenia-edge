@@ -4901,14 +4901,6 @@ void VulkanCommandProcessor::PrepareToWaitForHostZPDSubmission() {
   EndRenderPass();
 }
 
-uint32_t VulkanCommandProcessor::GetZPDReportDrawResolutionScaleX() const {
-  return texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
-}
-
-uint32_t VulkanCommandProcessor::GetZPDReportDrawResolutionScaleY() const {
-  return texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
-}
-
 void VulkanCommandProcessor::InitializeTrace() {
   CommandProcessor::InitializeTrace();
 
