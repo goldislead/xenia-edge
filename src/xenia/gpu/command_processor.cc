@@ -985,9 +985,9 @@ bool CommandProcessor::BeginGuestZPDReport(uint32_t report_address) {
         carried_cached_delta = dying_logical_report->second.cached_delta;
       }
       if (active_host_zpd_query_segment_.segment_active) {
-        if (DiscardHostZPDQuery(active_host_zpd_query_segment_.query_index,
-                                active_host_zpd_query_segment_
-                                    .query_generation)) {
+        if (DiscardHostZPDQuery(
+                active_host_zpd_query_segment_.query_index,
+                active_host_zpd_query_segment_.query_generation)) {
           guest_zpd_report_stats_.segments_ended++;
         } else {
           guest_zpd_report_stats_.failed++;
@@ -1112,8 +1112,7 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
 
     if (logical.pending_segments == 0) {
       resolved_immediately = true;
-      final_value =
-          NormalizeZPDReportSampleCount(logical.accumulated_samples);
+      final_value = NormalizeZPDReportSampleCount(logical.accumulated_samples);
       // If no host query work was ever associated with this logical report,
       // keep using the delta carried from the previous slot lifetime instead
       // of immediately committing a cold zero.
@@ -1160,8 +1159,8 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
       stored_end_record && stored_end_record != report_record_base;
 
   if (IsFastZPDPathEnabled()) {
-    bool write_begin_record =
-        begin_record && report_record_base && begin_record != report_record_base;
+    bool write_begin_record = begin_record && report_record_base &&
+                              begin_record != report_record_base;
     CommitGuestZPDReportDataWithResolvedBeginValue(
         begin_record, report_record_base, begin_value, cached_delta,
         write_begin_record);
@@ -1172,8 +1171,8 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
             "record=0x{:08X} begin_value={}",
             stored_end_record, begin_value);
       }
-      CommitGuestZPDReportDataWithResolvedBeginValue(
-          0, stored_end_record, 0, begin_value, false);
+      CommitGuestZPDReportDataWithResolvedBeginValue(0, stored_end_record, 0,
+                                                     begin_value, false);
     }
   } else if (!resolved_immediately) {
     TryPumpZPDQueryResolves();
@@ -1189,14 +1188,13 @@ bool CommandProcessor::EndGuestZPDReport(uint32_t report_address,
             "record=0x{:08X} begin_value={}",
             stored_end_record, begin_value);
       }
-      CommitGuestZPDReportDataWithResolvedBeginValue(
-          0, stored_end_record, 0, begin_value, false);
+      CommitGuestZPDReportDataWithResolvedBeginValue(0, stored_end_record, 0,
+                                                     begin_value, false);
     }
 
     if (IsStrictImmediateSentinelClearEnabled()) {
-      bool write_begin_record =
-          begin_record && report_record_base &&
-          begin_record != report_record_base;
+      bool write_begin_record = begin_record && report_record_base &&
+                                begin_record != report_record_base;
       uint32_t speculative = cached_delta;
       if (write_begin_record && speculative == 0) {
         speculative =
@@ -1255,8 +1253,7 @@ void CommandProcessor::ResumeActiveHostZPDQuerySegment(
         if (it != logical_zpd_reports_.end()) {
           it->second.accumulated_samples = std::max<uint64_t>(
               it->second.accumulated_samples,
-              static_cast<uint64_t>(
-                  cvars::occlusion_query_fast_cached_delta));
+              static_cast<uint64_t>(cvars::occlusion_query_fast_cached_delta));
         }
         active_host_zpd_query_segment_.segment_pending_begin = false;
         return;
@@ -1354,8 +1351,8 @@ void CommandProcessor::ProcessCompletedHostZPDQueryResolves(
   completed_resolves.reserve(ready_resolves.size());
   for (const PendingHostZPDQueryResolve& resolve : ready_resolves) {
     uint64_t raw_samples = GetHostZPDQueryResult(resolve.query_index);
-    bool is_valid =
-        IsHostZPDQueryResultValid(resolve.query_index, resolve.query_generation);
+    bool is_valid = IsHostZPDQueryResultValid(resolve.query_index,
+                                              resolve.query_generation);
     if (!is_valid) {
       ++discarded_stale;
       continue;
