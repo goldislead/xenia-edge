@@ -1204,7 +1204,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     }
   }
 
-  if (cvars::occlusion_query_enable && zpd_report_controller_) {
+  if (COMMAND_PROCESSOR::GetZPDMode() != ZPDMode::kFake &&
+                                         zpd_report_controller_) {
     COMMAND_PROCESSOR::EnsureZPDHostQueryResources();
     if (COMMAND_PROCESSOR::IsHostZPDQueryPoolReady()) {
       if (!report_record_base) {
@@ -1244,7 +1245,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
           }
 
           if (is_end_record) {
-            if (COMMAND_PROCESSOR::IsFastZPDPathEnabled()) {
+            if (COMMAND_PROCESSOR::GetZPDMode() == ZPDMode::kFast) {
               uint64_t current_slot_sequence =
                   zpd_report_controller_->GetSlotSequence(report_record_base);
               uint32_t cached_delta = 0;
