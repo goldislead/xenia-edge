@@ -12,8 +12,8 @@
 #include <algorithm>
 
 #include "xenia/base/logging.h"
-#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
@@ -211,7 +211,7 @@ bool VulkanZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
 }
 
 void VulkanZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
-                                          uint32_t query_generation) {
+                                           uint32_t query_generation) {
   if (!vulkan_device_ || query_index >= capacity_) {
     return;
   }
