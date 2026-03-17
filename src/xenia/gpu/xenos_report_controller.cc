@@ -78,8 +78,8 @@ uint64_t XenosReportController::GetSlotSequence(uint32_t report_address) const {
   return GetSlotSequenceLocked(XenosZPDReport::GetSlotBase(report_address));
 }
 
-void XenosReportController::QueueGuestReportWrite(
-    uint32_t report_address, ReportHandle report_handle) {
+void XenosReportController::QueueGuestReportWrite(uint32_t report_address,
+                                                  ReportHandle report_handle) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   uint32_t slot_base = XenosZPDReport::GetSlotBase(report_address);
@@ -216,11 +216,12 @@ void XenosReportController::ProcessReportWritesLocked(
     auto existing_report = logical_reports_.find(queued_write.report_handle);
     if (existing_report == logical_reports_.end()) {
       if (cvars::occlusion_query_log) {
-        XELOGI("ZPD: Controller ProcessReportWritesLocked drop missing handle={}",
-               queued_write.report_handle);
+        XELOGI(
+            "ZPD: Controller ProcessReportWritesLocked drop missing handle={}",
+            queued_write.report_handle);
       }
-      RemoveQueuedReportHandleForSlotLocked(
-          queued_write.slot_base, queued_write.report_handle);
+      RemoveQueuedReportHandleForSlotLocked(queued_write.slot_base,
+                                            queued_write.report_handle);
       write_iterator = queued_report_writes_.erase(write_iterator);
       ++stats_.writes_discarded;
       continue;
@@ -240,9 +241,8 @@ void XenosReportController::ProcessReportWritesLocked(
       continue;
     }
 
-    bool blocked =
-        blocked_slot_bases.find(queued_write.slot_base) !=
-        blocked_slot_bases.end();
+    bool blocked = blocked_slot_bases.find(queued_write.slot_base) !=
+                   blocked_slot_bases.end();
     if (blocked) {
       if (cvars::occlusion_query_log) {
         XELOGI(
@@ -264,8 +264,8 @@ void XenosReportController::ProcessReportWritesLocked(
             queued_write.report_handle, queued_write.slot_base,
             report_state.slot_sequence_id, current_slot_sequence);
       }
-      RemoveQueuedReportHandleForSlotLocked(
-          queued_write.slot_base, queued_write.report_handle);
+      RemoveQueuedReportHandleForSlotLocked(queued_write.slot_base,
+                                            queued_write.report_handle);
       write_iterator = queued_report_writes_.erase(write_iterator);
       logical_reports_.erase(existing_report);
       ++stats_.writes_discarded_stale;
@@ -291,8 +291,8 @@ void XenosReportController::ProcessReportWritesLocked(
           report_state.delta_value);
     }
 
-    RemoveQueuedReportHandleForSlotLocked(
-        queued_write.slot_base, queued_write.report_handle);
+    RemoveQueuedReportHandleForSlotLocked(queued_write.slot_base,
+                                          queued_write.report_handle);
     write_iterator = queued_report_writes_.erase(write_iterator);
     logical_reports_.erase(existing_report);
     ++stats_.writes_retired;
@@ -305,16 +305,14 @@ bool XenosReportController::HasQueuedWriteForSlotLocked(
     return false;
   }
 
-  auto queued_handles_for_slot =
-      queued_report_handles_by_slot_.find(slot_base);
+  auto queued_handles_for_slot = queued_report_handles_by_slot_.find(slot_base);
   return queued_handles_for_slot != queued_report_handles_by_slot_.end() &&
          !queued_handles_for_slot->second.empty();
 }
 
 void XenosReportController::RemoveQueuedReportHandleForSlotLocked(
     uint32_t slot_base, ReportHandle report_handle) {
-  auto queued_handles_for_slot =
-      queued_report_handles_by_slot_.find(slot_base);
+  auto queued_handles_for_slot = queued_report_handles_by_slot_.find(slot_base);
   if (queued_handles_for_slot == queued_report_handles_by_slot_.end()) {
     return;
   }
@@ -323,8 +321,8 @@ void XenosReportController::RemoveQueuedReportHandleForSlotLocked(
   if (!queued_handles.empty() && queued_handles.front() == report_handle) {
     queued_handles.pop_front();
   } else {
-    auto queued_handle = std::find(queued_handles.begin(), queued_handles.end(),
-                                   report_handle);
+    auto queued_handle =
+        std::find(queued_handles.begin(), queued_handles.end(), report_handle);
     if (queued_handle != queued_handles.end()) {
       queued_handles.erase(queued_handle);
     }
@@ -335,7 +333,8 @@ void XenosReportController::RemoveQueuedReportHandleForSlotLocked(
   }
 }
 
-uint64_t XenosReportController::GetSlotSequenceLocked(uint32_t slot_base) const {
+uint64_t XenosReportController::GetSlotSequenceLocked(
+    uint32_t slot_base) const {
   auto existing_slot_sequence = slot_sequences_.find(slot_base);
   if (existing_slot_sequence != slot_sequences_.end()) {
     return existing_slot_sequence->second;
