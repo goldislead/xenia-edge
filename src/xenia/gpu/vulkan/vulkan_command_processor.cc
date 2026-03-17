@@ -4700,6 +4700,8 @@ bool VulkanCommandProcessor::IsHostZPDQueryPoolReady() const {
   return zpd_host_query_pool_ && zpd_host_query_pool_->is_initialized();
 }
 
+// Vulkan requires queries to be inside a render pass. D3D12 doesn't have
+// this restriction, which is why the two backends differ here.
 bool VulkanCommandProcessor::CanOpenHostZPDQueryNow() const {
   return in_render_pass_;
 }
@@ -4746,6 +4748,9 @@ VulkanCommandProcessor::OpenHostZPDQuery(uint32_t& out_host_index,
       break;
     }
 
+    // Only flip the submission once. If the pool is still exhausted after
+    // draining, defer and let the caller try again next draw rather than
+    // spinning.
     if (submission_open_ && wait_for == GetCurrentSubmission()) {
       if (retried_after_submission_flip || !can_close_submission ||
           !CanEndSubmissionImmediately()) {
@@ -4820,6 +4825,8 @@ bool VulkanCommandProcessor::DiscardHostZPDQuery(uint32_t host_index,
     return false;
   }
 
+  // We can't call EndQuery outside a render pass, but vkResetQueryPool in
+  // ReleaseQueryIndex clears the slot cleanly. No pairing needed unlike D3D12.
   if (!in_render_pass_) {
     XELOGW("ZPD: Discard segment requested outside render pass");
     zpd_host_query_pool_->ReleaseQueryIndex(host_index, host_generation);
@@ -4863,6 +4870,8 @@ void VulkanCommandProcessor::PrepareHostZPDReadback(
 }
 
 bool VulkanCommandProcessor::ShouldDropHostZPDReportIfUnavailable() const {
+  // Vulkan drops rather than stalls. Blocking inside a render pass would
+  // require tearing it down, which is worse than losing one query result.
   return true;
 }
 
