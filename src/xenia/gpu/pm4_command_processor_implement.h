@@ -1147,11 +1147,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
 }
 
 static uint32_t samples = cvars::query_occlusion_sample_upper_threshold;
+static uint32_t counts = 0;
 
 #if !defined(XE_GPU_OVERRIDES_EVENT_WRITE_ZPD)
 XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
+  // Set by D3D as BE but struct ABI is LE
+  const uint32_t kQueryFinished = xe::byte_swap(0xFFFFFEED);
   assert_true(count == 1);
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t event_type = initiator & 0x3F;
@@ -1170,20 +1173,47 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
   // Occlusion queries:
   // This command is send on query begin and end.
   // As a workaround report some fixed amount of passed samples.
-  static uint32_t batch_counts = 0;
-  auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-      register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+  uint32_t addr = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
+  auto* pSampleCounts =
+      memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(addr);
+  uint32_t total_a = pSampleCounts->Total_A;
+  uint32_t total_b = pSampleCounts->Total_B;
+  uint32_t zf_a = pSampleCounts->ZFail_A;
+  uint32_t zf_b = pSampleCounts->ZFail_B;
+  uint32_t zp_a = pSampleCounts->ZPass_A;
+  uint32_t zp_b = pSampleCounts->ZPass_B;
+  uint32_t sf_a = pSampleCounts->StencilFail_A;
+  uint32_t sf_b = pSampleCounts->StencilFail_B;
+
+  XELOGI(
+      "RB_SAMPLE_COUNT_ADDR=0x{:08X} REPORT{{Total_A=0x{:08X}, "
+      "Total_B=0x{:08X}, ZFail_A=0x{:08X}, ZFail_B=0x{:08X}, "
+      "ZPass_A=0x{:08X}, ZPass_B=0x{:08X}, StencilFail_A=0x{:08X}, "
+      "StencilFail_B=0x{:08X}}}",
+      addr, total_a, total_b, zf_a, zf_b, zp_a, zp_b, sf_a, sf_b);
+
+  // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
+  // and used to detect a finished query.
+  bool is_end_via_z_pass =
+      zp_a == kQueryFinished && zp_b == kQueryFinished;
+  // Older versions of D3D also checks for ZFail (4D5307D5).
+  bool is_end_via_z_fail =
+      zf_a == kQueryFinished && zf_b == kQueryFinished;
+
   std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
 
-  uint32_t step = samples ? samples : 1;
-  if (batch_counts > UINT32_MAX - step) {
-    batch_counts = UINT32_MAX;
+  if (cvars::occlusion_query_batch) {
+    uint32_t step = std::max(uint32_t(1), samples);
+    counts = counts > UINT32_MAX - step ? UINT32_MAX : counts + step;
+    pSampleCounts->ZPass_A = counts;
+    pSampleCounts->Total_A = counts;
   } else {
-    batch_counts += step;
+    counts = 0;
+    if (is_end_via_z_pass || is_end_via_z_fail) {
+      pSampleCounts->ZPass_A = samples;
+      pSampleCounts->Total_A = samples;
+    }
   }
-
-  pSampleCounts->ZPass_A = batch_counts;
-  pSampleCounts->Total_A = batch_counts;
 
   samples =
       samples <= static_cast<uint32_t>(

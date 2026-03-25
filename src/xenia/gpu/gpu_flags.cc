@@ -97,6 +97,10 @@ DEFINE_bool(occlusion_query_enable, false,
             "accurate but causes GPU stalls and performance issues.",
             "GPU");
 
+DEFINE_bool(occlusion_query_batch, true,
+            "Assume guest is using batched queries. Dictates fake policy.",
+            "GPU");
+
 void SetOcclusionQueryEnable(bool value) {
   OVERRIDE_bool(occlusion_query_enable, value);
 }
