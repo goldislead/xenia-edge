@@ -203,11 +203,13 @@ class SharedMemory {
   struct SystemPageFlagsBlock {
     // Whether each page is up to date in the GPU buffer.
     uint64_t valid;
-    // Subset of valid pages - uploaded from guest memory for the current frame.
+    // Recent CPU uploads that haven't been synced with a GPU write yet.
     uint64_t valid_cpu_uploaded;
-    // Subset of valid pages - whether each page in the GPU buffer contains data
-    // that was written on the GPU, thus should not be invalidated spuriously.
-    uint64_t valid_and_gpu_written;
+    // GPU-written pages still in flight and waiting to be published.
+    uint64_t valid_and_gpu_written_pending;
+    // GPU-written pages that have been finalized and committed to the current
+    // snapshot.
+    uint64_t valid_and_gpu_written_committed;
   };
 
   // Frame-valid pages for lock-free reads during RequestRange fast path checks.
@@ -221,10 +223,13 @@ class SharedMemory {
   // CPU-uploaded pages for the current frame. These are merged into the active
   // buffer but discarded once GPU-written state is synced.
   uint64_t* system_page_flags_valid_cpu_uploaded_ = nullptr;
-  // These pages hold data written by the GPU. Use this as the main source for
-  // publishing the frame. It's separate from active_valid_flags_ which can
-  // include CPU uploads as well.
-  uint64_t* system_page_flags_valid_and_gpu_written_ = nullptr;
+  // These pages hold data written by the GPU that are still waiting to be
+  // published to the next frame.
+  uint64_t* system_page_flags_valid_and_gpu_written_pending_ = nullptr;
+  // The master record of GPU-written data that's been finalized. This is the
+  // primary source for updates, even if the active buffer is currently juggling
+  // a mix of CPU uploads and pending GPU writes.
+  uint64_t* system_page_flags_valid_and_gpu_written_committed_ = nullptr;
   unsigned num_system_page_flags_ = 0;
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length,
