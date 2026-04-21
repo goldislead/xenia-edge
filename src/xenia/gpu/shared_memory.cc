@@ -136,10 +136,6 @@ void SharedMemory::InvalidateAllPages() {
   std::memset(staging, 0, num_system_page_flags_ * sizeof(uint64_t));
   std::memset(system_page_flags_valid_and_gpu_written_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
-
-  // Mark all blocks as dirty and set dirty flag
-  dirty_blocks_.store(0xFFFFFFFF, std::memory_order_relaxed);
-  gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
 }
 
 void SharedMemory::ClearCache() {
@@ -163,58 +159,22 @@ void SharedMemory::ClearCache() {
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
-  // Early exit if no GPU writes occurred since last copy.
-  // This optimization avoids unnecessary 16KB copies every frame.
-  if (!gpu_written_data_dirty_.load(std::memory_order_relaxed)) {
-    return;
-  }
+  auto global_lock = global_critical_region_.Acquire();
 
-  // Lock-free implementation using double buffering.
-  // Get the staging buffer (not currently being read)
-  uint64_t* staging = staging_valid_flags_.load(std::memory_order_acquire);
+  uint64_t* staging = staging_valid_flags_.load(std::memory_order_relaxed);
+  uint32_t copy_size = num_system_page_flags_ * sizeof(uint64_t);
+  memory::vastcpy(
+      reinterpret_cast<uint8_t*>(staging),
+      reinterpret_cast<uint8_t*>(system_page_flags_valid_and_gpu_written_),
+      copy_size);
 
-  // Partial copying optimization: only copy dirty blocks.
-  // Load and reset the dirty blocks bitmap atomically.
-  uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
-
-  // Count dirty blocks to decide between partial and full copy.
-  uint32_t dirty_count = xe::bit_count(dirty_mask);
-
-  // Threshold: if >50% of blocks are dirty, full copy is more efficient.
-  // vastcpy has overhead that's only worthwhile for large copies.
-  if (dirty_count == 0 || dirty_count > 16) {
-    // Full copy: either no blocks marked (race/init) or many blocks dirty.
-    uint32_t copy_size = num_system_page_flags_ * sizeof(uint64_t);
-    memory::vastcpy(
-        reinterpret_cast<uint8_t*>(staging),
-        reinterpret_cast<uint8_t*>(system_page_flags_valid_and_gpu_written_),
-        copy_size);
-  } else {
-    // Partial copy: only copy dirty blocks using memcpy (efficient for 512-byte
-    // chunks).
-    while (dirty_mask) {
-      uint32_t block_index;
-      xe::bit_scan_forward(dirty_mask, &block_index);
-      dirty_mask &= ~(1u << block_index);  // Clear this bit
-
-      // Each block is 64 entries * 8 bytes = 512 bytes
-      uint32_t entry_offset = block_index * 64;
-      std::memcpy(&staging[entry_offset],
-                  &system_page_flags_valid_and_gpu_written_[entry_offset],
-                  64 * sizeof(uint64_t));
-    }
-  }
-
-  // Atomically swap buffers - readers will instantly see the new data
-  // Use acq_rel ordering: acquire the old value, release the new one
+  // This makes the latest GPU data visible for lock-free reads. By exchanging
+  // the points, this keeps the buffers cycling. The new data goes live, and the
+  // old life buffer becomes the next staging area.
   uint64_t* old_active =
       active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
 
-  // The old active buffer becomes the new staging buffer
-  staging_valid_flags_.store(old_active, std::memory_order_release);
-
-  // Clear dirty flag after successful copy.
-  gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+  staging_valid_flags_.store(old_active, std::memory_order_relaxed);
 }
 
 SharedMemory::GlobalWatchHandle SharedMemory::RegisterGlobalWatch(
@@ -418,13 +378,6 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
       valid_flags[i] |= valid_bits;
       if (written_by_gpu) {
         system_page_flags_valid_and_gpu_written_[i] |= valid_bits;
-        // Mark as dirty to trigger copy in
-        // SetSystemPageBlocksValidWithGpuDataWritten.
-        gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
-        // Mark the specific 64-entry block as dirty for partial copying.
-        // Each bit in dirty_blocks_ represents 64 entries (i >> 6).
-        uint32_t dirty_block_bit = 1u << (i >> 6);
-        dirty_blocks_.fetch_or(dirty_block_bit, std::memory_order_relaxed);
       } else {
         system_page_flags_valid_and_gpu_written_[i] &= ~valid_bits;
       }
@@ -675,7 +628,6 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     }
   }
 
-  uint32_t dirty_blocks_mask = 0;
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t invalidate_bits = UINT64_MAX;
     if (i == block_first) {
@@ -687,13 +639,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
     valid_flags[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
-    // Track which 64-entry blocks are dirty for partial copying.
-    dirty_blocks_mask |= (1u << (i >> 6));
   }
-
-  // Mark as dirty since GPU-written flags changed due to CPU invalidation.
-  gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
-  dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
 
   FireWatches(page_first, page_last, false);
 
