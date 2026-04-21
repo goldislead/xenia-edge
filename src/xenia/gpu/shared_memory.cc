@@ -28,12 +28,12 @@ bool SharedMemory::InitializeCommon() {
       ((kBufferSize >> page_size_log2_) + 63) / 64;
   num_system_page_flags_ = static_cast<uint32_t>(num_system_page_flags_entries);
 
-  // Allocate double-buffered valid flags (2x) plus gpu_written (1x) = 3 total
-  // arrays. With 2048 entries per array and 8 bytes per entry, that's 49152
-  // bytes total.
+  // Allocate double-buffered valid flags (2x), guest memory uploaded (1x), and
+  // gpu_written (1x) = 4 total arrays. With 2048 entries per array and 8 bytes
+  // per entry, that's 65536 bytes total.
 
   uint64_t* system_page_flags_base = (uint64_t*)memory::AllocFixed(
-      nullptr, num_system_page_flags_ * 3 * sizeof(uint64_t),
+      nullptr, num_system_page_flags_ * 4 * sizeof(uint64_t),
       memory::AllocationType::kReserveCommit, memory::PageAccess::kReadWrite);
 
   if (!system_page_flags_base) {
@@ -41,15 +41,19 @@ bool SharedMemory::InitializeCommon() {
     return false;
   }
 
-  // Set up double buffer for valid flags
+  // Set up double buffer for valid flags and CPU/GPU ownership subsets
   valid_buffer_a_ = system_page_flags_base;
   valid_buffer_b_ = system_page_flags_base + num_system_page_flags_;
-  system_page_flags_valid_and_gpu_written_ =
+  system_page_flags_valid_cpu_uploaded_ =
       system_page_flags_base + (num_system_page_flags_ * 2);
+  system_page_flags_valid_and_gpu_written_ =
+      system_page_flags_base + (num_system_page_flags_ * 3);
 
   // Initialize all buffers to zero
   memset(valid_buffer_a_, 0, 8 * num_system_page_flags_entries);
   memset(valid_buffer_b_, 0, 8 * num_system_page_flags_entries);
+  memset(system_page_flags_valid_cpu_uploaded_, 0,
+         8 * num_system_page_flags_entries);
   memset(system_page_flags_valid_and_gpu_written_, 0,
          8 * num_system_page_flags_entries);
 
@@ -121,6 +125,7 @@ void SharedMemory::ShutdownCommon() {
     staging_valid_flags_.store(nullptr, std::memory_order_relaxed);
   }
 
+  system_page_flags_valid_cpu_uploaded_ = nullptr;
   system_page_flags_valid_and_gpu_written_ = nullptr;
   num_system_page_flags_ = 0;
 }
@@ -134,6 +139,8 @@ void SharedMemory::InvalidateAllPages() {
 
   std::memset(active, 0, num_system_page_flags_ * sizeof(uint64_t));
   std::memset(staging, 0, num_system_page_flags_ * sizeof(uint64_t));
+  std::memset(system_page_flags_valid_cpu_uploaded_, 0,
+              num_system_page_flags_ * sizeof(uint64_t));
   std::memset(system_page_flags_valid_and_gpu_written_, 0,
               num_system_page_flags_ * sizeof(uint64_t));
 }
@@ -167,6 +174,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
       reinterpret_cast<uint8_t*>(staging),
       reinterpret_cast<uint8_t*>(system_page_flags_valid_and_gpu_written_),
       copy_size);
+  std::memset(system_page_flags_valid_cpu_uploaded_, 0, copy_size);
 
   // This makes the latest GPU data visible for lock-free reads. By exchanging
   // the points, this keeps the buffers cycling. The new data goes live, and the
@@ -363,6 +371,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
 
   {
     auto global_lock = global_critical_region_.Acquire();
+    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -372,13 +381,12 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
-      // SystemPageFlagsBlock& block = system_page_flags_[i];
-      uint64_t* valid_flags =
-          active_valid_flags_.load(std::memory_order_relaxed);
       valid_flags[i] |= valid_bits;
       if (written_by_gpu) {
+        system_page_flags_valid_cpu_uploaded_[i] &= ~valid_bits;
         system_page_flags_valid_and_gpu_written_[i] |= valid_bits;
       } else {
+        system_page_flags_valid_cpu_uploaded_[i] |= valid_bits;
         system_page_flags_valid_and_gpu_written_[i] &= ~valid_bits;
       }
     }
@@ -508,7 +516,6 @@ void SharedMemory::TryFindUploadRange(const uint32_t& block_first,
   // Load the active valid flags buffer - using relaxed ordering since we're
   // already under the global lock when called from RequestRange
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
-
   for (uint32_t i = block_first; i <= block_last; ++i) {
     uint64_t block_valid = valid_flags[i];
     if (i == block_first) {
@@ -636,8 +643,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
-    uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
     valid_flags[i] &= ~invalidate_bits;
+    system_page_flags_valid_cpu_uploaded_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
 
@@ -665,6 +672,7 @@ void SharedMemory::PrepareForTraceDownload() {
     uint64_t previously_valid_block = valid_flags[i];
     uint64_t gpu_written_block = system_page_flags_valid_and_gpu_written_[i];
     valid_flags[i] = gpu_written_block;
+    system_page_flags_valid_cpu_uploaded_[i] = 0;
 
     // Fire watches on the invalidated pages.
     uint64_t fire_watches_block = previously_valid_block & ~gpu_written_block;
