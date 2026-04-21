@@ -200,18 +200,6 @@ class SharedMemory {
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
-  struct SystemPageFlagsBlock {
-    // Whether each page is up to date in the GPU buffer.
-    uint64_t valid;
-    // Recent CPU uploads that haven't been synced with a GPU write yet.
-    uint64_t valid_cpu_uploaded;
-    // GPU-written pages still in flight and waiting to be published.
-    uint64_t valid_and_gpu_written_pending;
-    // GPU-written pages that have been finalized and committed to the current
-    // snapshot.
-    uint64_t valid_and_gpu_written_committed;
-  };
-
   // Frame-valid pages for lock-free reads during RequestRange fast path checks.
   // Writers still use the lock for read-modify-write operations, but readers
   // can access the active buffer without blocking.
@@ -231,6 +219,21 @@ class SharedMemory {
   // a mix of CPU uploads and pending GPU writes.
   uint64_t* system_page_flags_valid_and_gpu_written_committed_ = nullptr;
   unsigned num_system_page_flags_ = 0;
+
+#if !defined(NDEBUG)
+  void AssertSystemPageFlagsInvariantsLocked() const;
+#endif
+
+  // Diagnostic counters for clear_memory_page_state publication and repair.
+  std::atomic<uint64_t> clear_memory_page_state_publication_count_{0};
+  std::atomic<uint64_t> clear_memory_page_state_request_fast_path_hit_count_{0};
+  std::atomic<uint64_t> clear_memory_page_state_request_upload_page_count_{0};
+  std::atomic<uint64_t> clear_memory_page_state_gpu_written_page_count_{0};
+  std::atomic<uint64_t>
+      clear_memory_page_state_invalidated_gpu_written_page_count_{0};
+  std::atomic<uint64_t> clear_memory_page_state_published_page_count_{0};
+  uint32_t clear_memory_page_state_pending_page_count_ = 0;
+  uint32_t clear_memory_page_state_committed_page_count_ = 0;
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length,
       bool exact_range);
