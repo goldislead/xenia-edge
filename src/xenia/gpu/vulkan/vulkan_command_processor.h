@@ -156,8 +156,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
-  void PrepareForWait() override;
-  void ReturnFromWait() override;
+  void PollCompletedSubmission() override;
 
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(
@@ -176,7 +175,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t GetCurrentSubmission() const {
     return completion_timeline_.GetUpcomingSubmission();
   }
-  uint64_t GetCompletedSubmission() const {
+  uint64_t GetCompletedSubmission() const override {
     return completion_timeline_.GetCompletedSubmissionFromLastUpdate();
   }
 
@@ -468,26 +467,33 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
   // segment_pending_begin waits for the next. Outside a render pass,
   // DiscardZPDQuery defers the slot release until the submission completes.
+  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
+  // need to open before a pass begins or split an active pass around the clear.
+
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
     zpd_deferred_releases_.clear();
+    zpd_active_query_index_ = UINT32_MAX;
+    zpd_active_query_generation_ = 0;
+    zpd_active_query_is_fsi_ = false;
+    zpd_fsi_counter_index_force_update_ = true;
     if (zpd_host_query_pool_) {
       zpd_host_query_pool_->Shutdown();
     }
   }
 
-  bool IsZPDQueryPoolReady() const override {
-    return zpd_host_query_pool_->is_initialized();
-  }
+  bool IsZPDQueryPoolReady() const override;
   bool CanOpenZPDQuery() const override;
 
   QueryOpenResult OpenZPDQuery(ReportHandle report_handle,
                                bool can_close_submission) override;
-  bool CloseZPDQuery(ReportHandle report_handle) override;
+  bool CloseZPDQuery(ReportHandle report_handle,
+                     uint64_t& out_submission) override;
   bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
-  bool AwaitQueryResolve(ReportHandle report_handle) override;
+  bool AwaitQueryResolve(ReportHandle report_handle,
+                         uint64_t wait_for_submission) override;
 
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
@@ -533,10 +539,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint64_t submission = 0;
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
+    bool uses_fsi_counter = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
+  bool zpd_active_query_is_fsi_ = false;
+  bool zpd_fsi_counter_index_force_update_ = true;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
