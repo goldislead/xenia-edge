@@ -1074,6 +1074,13 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   // Bump slot sequence — invalidates pending writes from prior lifetime.
   uint64_t slot_sequence_id = ++zpd_slot_sequences_[slot_base];
 
+  // Clear the cached delta for this address so an orphan END can't carry a
+  // value from the previous lifetime into the new one. A real END will write
+  // the cache again when it resolves.
+  if (cvars::occlusion_query_fast_trust_report) {
+    fast_zpd_report_cached_values_.erase(end_record);
+  }
+
   ReportHandle report_handle = zpd_next_report_handle_++;
   if (report_handle == kInvalidReportHandle) {
     report_handle = zpd_next_report_handle_++;
@@ -1164,7 +1171,10 @@ bool CommandProcessor::EndZPDReport(uint32_t report_address,
     resolved_immediately = true;
     final_value = NormalizeSampleCount(logical.accumulated_samples);
 
-    cached_delta = (final_value == 0 && logical.cached_delta != 0)
+    // Use the current report's result. A cached delta carried over from an
+    // earlier lifetime on this slot should not replace a real zero.
+    cached_delta = cvars::occlusion_query_fast_trust_report ? final_value
+                   : (final_value == 0 && logical.cached_delta != 0)
                        ? logical.cached_delta
                        : final_value;
     logical.cached_delta = cached_delta;
@@ -1198,8 +1208,12 @@ bool CommandProcessor::EndZPDReport(uint32_t report_address,
   if (GetZPDMode() == ZPDMode::kFast) {
     bool write_begin = begin_record && report_record_base &&
                        begin_record != report_record_base;
-    uint32_t speculative =
-        (write_begin && cached_delta == 0) ? 1 : cached_delta;
+    // Promote zero to one only while segments are still pending. Once the real
+    // result is ready, write it as is.
+    bool escape_zero =
+        write_begin && cached_delta == 0 &&
+        (!cvars::occlusion_query_fast_trust_report || !resolved_immediately);
+    uint32_t speculative = escape_zero ? 1 : cached_delta;
     WriteZPDReport(begin_record, report_record_base, begin_value, speculative,
                    write_begin);
   } else if (!resolved_immediately) {
