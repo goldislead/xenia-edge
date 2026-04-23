@@ -178,16 +178,8 @@ void VulkanCommandProcessor::InitializeShaderStorage(
 
 void VulkanCommandProcessor::RestoreEdramSnapshot(const void* snapshot) {}
 
-void VulkanCommandProcessor::PrepareForWait() {
-  // Refresh completion data so PumpPendingRetire in the base class sees the
-  // latest GPU progress.
+void VulkanCommandProcessor::PollCompletedSubmission() {
   CheckSubmissionCompletionAndDeviceLoss(GetCompletedSubmission());
-  CommandProcessor::PrepareForWait();
-}
-
-void VulkanCommandProcessor::ReturnFromWait() {
-  CheckSubmissionCompletionAndDeviceLoss(GetCompletedSubmission());
-  CommandProcessor::ReturnFromWait();
 }
 
 std::string VulkanCommandProcessor::GetWindowTitleText() const {
@@ -4786,7 +4778,8 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
   return QueryOpenResult::kOpened;
 }
 
-bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle) {
+bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
+                                           uint64_t& out_submission) {
   if (!in_render_pass_) {
     XELOGW("ZPD: Split segment requested outside render pass");
     return false;
@@ -4802,6 +4795,8 @@ bool VulkanCommandProcessor::CloseZPDQuery(ReportHandle report_handle) {
   resolve.query_generation = zpd_active_query_generation_;
   resolve.report_handle = report_handle;
   zpd_resolves_in_flight_.push_back(resolve);
+
+  out_submission = resolve.submission;
 
   zpd_active_query_index_ = UINT32_MAX;
   zpd_active_query_generation_ = 0;
@@ -4877,7 +4872,8 @@ void VulkanCommandProcessor::PumpQueryResolves() {
   }
 }
 
-bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle) {
+bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
+                                               uint64_t wait_for_submission) {
   if (GetZPDMode() == ZPDMode::kFake) {
     return false;
   }
@@ -4887,22 +4883,15 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle) {
 
   PumpQueryResolves();
 
-  // Find the latest submission that has a resolve for this handle.
-  uint64_t wait_for = 0;
-  for (const auto& resolve : zpd_resolves_in_flight_) {
-    if (resolve.report_handle == report_handle) {
-      wait_for = resolve.submission;
-    }
-  }
-
-  if (wait_for == 0) {
+  if (wait_for_submission == 0) {
+    // No segment has closed yet — check if the report is already done.
     auto it = logical_zpd_reports_.find(report_handle);
     return it == logical_zpd_reports_.end() ||
            (it->second.pending_segments == 0 && it->second.ended);
   }
 
   // Ensure the submission is flushed.
-  if (wait_for >= GetCurrentSubmission()) {
+  if (wait_for_submission >= GetCurrentSubmission()) {
     if (!submission_open_) {
       return false;
     }
@@ -4920,8 +4909,8 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle) {
     }
   }
 
-  if (wait_for > GetCompletedSubmission()) {
-    completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for);
+  if (wait_for_submission > GetCompletedSubmission()) {
+    completion_timeline_.AwaitSubmissionAndUpdateCompleted(wait_for_submission);
   }
 
   PumpQueryResolves();

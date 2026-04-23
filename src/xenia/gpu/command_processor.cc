@@ -998,6 +998,11 @@ void CommandProcessor::MakeCoherent() {
 
 void CommandProcessor::PrepareForWait() {
   trace_writer_.Flush();
+  // Only refresh completion if there is a strict ZPD retire pending so
+  // PumpPendingRetire sees the latest progress without adding extra overhead.
+  if (zpd_pending_retire_handle_ != kInvalidReportHandle) {
+    PollCompletedSubmission();
+  }
   // Give strict ZPD a chance to retire an pending report before the guest's
   // loop polls again.
   PumpPendingRetire();
@@ -1093,6 +1098,7 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   logical.end_record = end_record;
   logical.begin_value = zpd_slot_values_[slot_base];
   logical.accumulated_samples = 0;
+  logical.last_segment_end_submission = 0;
   logical.pending_segments = 0;
   logical.cached_delta = 0;
   logical.ended = false;
@@ -1289,7 +1295,8 @@ void CommandProcessor::CloseQuerySegment() {
     return;
   }
 
-  if (!CloseZPDQuery(zpd_active_segment_.report_handle)) {
+  uint64_t submission = 0;
+  if (!CloseZPDQuery(zpd_active_segment_.report_handle, submission)) {
     zpd_active_segment_.segment_active = false;
     zpd_active_segment_.segment_pending_begin =
         zpd_active_segment_.logical_active && !zpd_batch_fake_;
@@ -1300,6 +1307,7 @@ void CommandProcessor::CloseQuerySegment() {
   auto it = logical_zpd_reports_.find(zpd_active_segment_.report_handle);
   if (it != logical_zpd_reports_.end()) {
     it->second.pending_segments++;
+    it->second.last_segment_end_submission = submission;
   }
 
   zpd_active_segment_.segment_active = false;
@@ -1362,16 +1370,17 @@ void CommandProcessor::PumpPendingRetire() {
 
   CommandProcessor::ReportHandle handle_to_await = zpd_pending_retire_handle_;
 
-  if (AwaitQueryResolve(handle_to_await)) {
+  auto logical_report = logical_zpd_reports_.find(handle_to_await);
+  if (logical_report == logical_zpd_reports_.end()) {
     zpd_pending_retire_handle_ = kInvalidReportHandle;
     zpd_pending_retire_stalls_ = 0;
     return;
   }
 
-  auto logical_report = logical_zpd_reports_.find(handle_to_await);
-  if (logical_report == logical_zpd_reports_.end()) {
-    // If the report is already gone it retired through another path.
-    // Clear so we don't spin on a handle that no longer exists.
+  uint64_t wait_for_submission =
+      logical_report->second.last_segment_end_submission;
+
+  if (AwaitQueryResolve(handle_to_await, wait_for_submission)) {
     zpd_pending_retire_handle_ = kInvalidReportHandle;
     zpd_pending_retire_stalls_ = 0;
     return;

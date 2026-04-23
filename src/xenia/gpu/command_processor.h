@@ -319,6 +319,8 @@ class CommandProcessor {
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
 
+  virtual void PollCompletedSubmission() {}
+
   virtual void OnPrimaryBufferEnd() {}
 
   // TODO(boma): Add tracking for VIZ & EXT queries.
@@ -334,6 +336,8 @@ class CommandProcessor {
   struct ZPDReport {
     // Raw host count across all segments, normalized at retirement.
     uint64_t accumulated_samples = 0;
+    // Submission containing the most recently closed segment's resolve.
+    uint64_t last_segment_end_submission = 0;
     uint64_t slot_sequence_id = 0;
     uint32_t slot_base = 0;
     uint32_t begin_record = 0;
@@ -386,14 +390,20 @@ class CommandProcessor {
     return QueryOpenResult::kFailed;
   }
   // Backend records EndQuery, queues a resolve for the active slot.
-  virtual bool CloseZPDQuery(ReportHandle report_handle) { return false; }
+  virtual bool CloseZPDQuery(ReportHandle report_handle,
+                             uint64_t& out_submission) {
+    return false;
+  }
   // Backend discards the active query without resolving.
   virtual bool DiscardZPDQuery() { return false; }
 
   // Backend drains completed resolves and calls OnZPDQueryResolved for each.
   virtual void PumpQueryResolves() {}
   // Backend waits for all pending segments of report_handle to resolve.
-  virtual bool AwaitQueryResolve(ReportHandle report_handle) { return false; }
+  virtual bool AwaitQueryResolve(ReportHandle report_handle,
+                                 uint64_t wait_for_submission) {
+    return false;
+  }
 
   bool BeginZPDReport(uint32_t report_address);
   bool EndZPDReport(uint32_t report_address, bool guest_forced_end);
