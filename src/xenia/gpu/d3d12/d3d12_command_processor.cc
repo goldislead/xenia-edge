@@ -2750,6 +2750,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
   reg::RB_DEPTHCONTROL normalized_depth_control =
       draw_util::GetNormalizedDepthControl(regs);
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(
+                         regs, pixel_shader->writes_color_targets())
+                   : 0;
 
   // Shader modifications.
   uint32_t ps_param_gen_pos = UINT32_MAX;
@@ -2766,14 +2770,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   DxbcShaderTranslator::Modification pixel_shader_modification =
       pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
                          *pixel_shader, interpolator_mask, ps_param_gen_pos,
-                         normalized_depth_control)
+                         normalized_depth_control, normalized_color_mask)
                    : DxbcShaderTranslator::Modification(0);
 
   // Set up the render targets - this may perform dispatches and draws.
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(
-                         regs, pixel_shader->writes_color_targets())
-                   : 0;
   if (!render_target_cache_->Update(is_rasterization_done,
                                     normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
@@ -4704,6 +4704,35 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
   }
 
 #endif
+  if constexpr (!edram_rov_used) {
+    // For RTV, reuse the existing per-face polygon offset constants. The ROV
+    // path still fills them in its own block below.
+    if (draw_util::IsHostDepthPolygonOffsetNeeded(
+            regs, primitive_polygonal, normalized_depth_control,
+            normalized_color_mask)) {
+      draw_util::HostDepthPolygonOffset polygon_offset;
+      draw_util::GetHostDepthPolygonOffset(
+          regs, primitive_polygonal, rb_depth_info.depth_format,
+          draw_resolution_scale_x, draw_resolution_scale_y, polygon_offset);
+      update_dirty_floatmask(system_constants_.edram_poly_offset_front_scale,
+                             polygon_offset.front_scale);
+      system_constants_.edram_poly_offset_front_scale =
+          polygon_offset.front_scale;
+      update_dirty_floatmask(system_constants_.edram_poly_offset_front_offset,
+                             polygon_offset.front_offset);
+      system_constants_.edram_poly_offset_front_offset =
+          polygon_offset.front_offset;
+      update_dirty_floatmask(system_constants_.edram_poly_offset_back_scale,
+                             polygon_offset.back_scale);
+      system_constants_.edram_poly_offset_back_scale =
+          polygon_offset.back_scale;
+      update_dirty_floatmask(system_constants_.edram_poly_offset_back_offset,
+                             polygon_offset.back_offset);
+      system_constants_.edram_poly_offset_back_offset =
+          polygon_offset.back_offset;
+    }
+  }
+
   if constexpr (edram_rov_used) {
     uint32_t depth_base_dwords_scaled =
         rb_depth_info.depth_base * edram_tile_dwords_scaled;

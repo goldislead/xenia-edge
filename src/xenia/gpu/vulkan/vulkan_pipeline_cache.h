@@ -133,6 +133,7 @@ class VulkanPipelineCache {
       uint32_t interpolator_mask, bool ps_param_gen_used) const;
   SpirvShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask) const;
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,

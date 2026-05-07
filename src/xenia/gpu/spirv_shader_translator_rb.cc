@@ -1485,6 +1485,97 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     }
   }
 
+  if (FBO_IsApplyingPolygonOffset()) {
+    // When a draw looks like a biased decal pass, write the biased depth
+    // explicitly instead of relying on fixed function depth bias.
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    assert_true(input_front_facing_ != spv::NoResult);
+    assert_true(output_or_var_fragment_depth_ != spv::NoResult);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(2));
+    spv::Id depth_unbiased =
+        builder_->createLoad(builder_->createAccessChain(
+                                 spv::StorageClassInput,
+                                 input_fragment_coordinates_, id_vector_temp_),
+                             spv::NoPrecision);
+    builder_->addCapability(spv::CapabilityDerivativeControl);
+    spv::Id depth_dx =
+        builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_, depth_unbiased);
+    spv::Id depth_dy =
+        builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_, depth_unbiased);
+    depth_dx = builder_->createUnaryBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs, depth_dx);
+    depth_dy = builder_->createUnaryBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs, depth_dy);
+    spv::Id depth_max_slope =
+        builder_->createBinBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                       GLSLstd450FMax, depth_dx, depth_dy);
+    spv::Id front_facing =
+        builder_->createLoad(input_front_facing_, spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantEdramPolyOffsetFrontScale));
+    spv::Id poly_offset_front_scale = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_, id_vector_temp_),
+        spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantEdramPolyOffsetBackScale));
+    spv::Id poly_offset_back_scale = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_, id_vector_temp_),
+        spv::NoPrecision);
+    spv::Id poly_offset_scale =
+        builder_->createTriOp(spv::OpSelect, type_float_, front_facing,
+                              poly_offset_front_scale, poly_offset_back_scale);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantEdramPolyOffsetFrontOffset));
+    spv::Id poly_offset_front_offset = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_, id_vector_temp_),
+        spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kSystemConstantEdramPolyOffsetBackOffset));
+    spv::Id poly_offset_back_offset = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_, id_vector_temp_),
+        spv::NoPrecision);
+    spv::Id poly_offset_offset = builder_->createTriOp(
+        spv::OpSelect, type_float_, front_facing, poly_offset_front_offset,
+        poly_offset_back_offset);
+    spv::Id poly_offset = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_,
+        builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
+                                           depth_max_slope, poly_offset_scale),
+        poly_offset_offset);
+
+    using DepthStencilMode = Modification::DepthStencilMode;
+    DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    bool depth_float24_truncating =
+        depth_stencil_mode == DepthStencilMode::kFloat24TruncatingPolygonOffset;
+    bool depth_float24_rounding =
+        depth_stencil_mode == DepthStencilMode::kFloat24RoundingPolygonOffset;
+
+    spv::Id depth_biased = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_, depth_unbiased, poly_offset);
+    if (depth_float24_truncating || depth_float24_rounding) {
+      spv::Id const_float_0_5 = builder_->makeFloatConstant(0.5f);
+      depth_biased = builder_->createTriBuiltinCall(
+          type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, depth_biased,
+          const_float_0_, const_float_0_5);
+      spv::Id depth_float24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
+          *builder_, depth_biased, depth_float24_rounding, true,
+          ext_inst_glsl_std_450_);
+      depth_biased = SpirvShaderTranslator::Depth20e4To32(
+          *builder_, depth_float24, 0, true, false, ext_inst_glsl_std_450_);
+    }
+    builder_->createStore(depth_biased, output_or_var_fragment_depth_);
+  }
+
   if (edram_fragment_shader_interlock_) {
     if (block_fsi_if_after_depth_stencil_merge) {
       builder_->createBranch(block_fsi_if_after_depth_stencil_merge);

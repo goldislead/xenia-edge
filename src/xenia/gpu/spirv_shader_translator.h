@@ -34,15 +34,20 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 10;
+    static constexpr uint32_t kVersion = 11;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
       // Early fragment tests - enable if alpha test and alpha to coverage are
       // disabled; ignored if anything in the shader blocks early Z writing.
       kEarlyHint,
-      // TODO(Triang3l): Unorm24 (rounding) and float24 (truncating and
-      // rounding) output modes.
+      // For FBO, apply polygon offset in the fragment shader where fixed
+      // function host depth bias doesn't match Xenos behavior.
+      kPolygonOffset,
+      // For D24FS8 host depth in 0...0.5, quantize the biased depth to float24
+      // (20e4) to match float24 behavior on the guest.
+      kFloat24TruncatingPolygonOffset,
+      kFloat24RoundingPolygonOffset,
     };
 
     struct {
@@ -728,6 +733,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
     return !is_depth_only_fragment_shader_ &&
            !current_shader().writes_depth() &&
            !current_shader().memexport_eM_written();
+  }
+  bool FBO_IsApplyingPolygonOffset() const {
+    if (edram_fragment_shader_interlock_) {
+      return false;
+    }
+    using DepthStencilMode = Modification::DepthStencilMode;
+    DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    bool is_polygon_offset =
+        depth_stencil_mode == DepthStencilMode::kPolygonOffset ||
+        depth_stencil_mode ==
+            DepthStencilMode::kFloat24TruncatingPolygonOffset ||
+        depth_stencil_mode ==
+            DepthStencilMode::kFloat24RoundingPolygonOffset;
+    return is_polygon_offset;
   }
   void FSI_LoadSampleMask(spv::Id msaa_samples);
   void FSI_LoadEdramOffsets(spv::Id msaa_samples);

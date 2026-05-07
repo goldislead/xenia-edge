@@ -35,6 +35,21 @@ DEFINE_double(
     "near-coplanar decal projections with host render target paths.",
     "GPU");
 
+DEFINE_bool(
+    depth_bias_shader_offset, false,
+    "Apply polygon offset in pixel and fragment shaders for host render target "
+    "draws that test against existing depth without writing it. This helps "
+    "mitigate decals z-fighting in certain titles. Disable to compare with "
+    "fixed function host depth bias.",
+    "GPU");
+
+DEFINE_double(
+    depth_bias_shader_offset_max_abs_offset, 0.001,
+    "Maximum absolute polygon offset constant (in host depth units) for which "
+    "shader-side polygon offset may be used. This helps avoid affecting "
+    "non-decal draws that use larger bias values.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 namespace draw_util {
@@ -89,6 +104,107 @@ reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs) {
 constexpr int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
 constexpr int8_t kD3D10StandardSamplePositions4x[4][2] = {
     {-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+
+bool GetHostDepthPolygonOffset(const RegisterFile& regs,
+                               bool primitive_polygonal,
+                               xenos::DepthRenderTargetFormat depth_format,
+                               uint32_t draw_resolution_scale_x,
+                               uint32_t draw_resolution_scale_y,
+                               HostDepthPolygonOffset& polygon_offset_out) {
+  polygon_offset_out = {};
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (primitive_polygonal) {
+    if (pa_su_sc_mode_cntl.poly_offset_front_enable) {
+      polygon_offset_out.front_scale =
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
+      polygon_offset_out.front_offset =
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    }
+    if (pa_su_sc_mode_cntl.poly_offset_back_enable) {
+      polygon_offset_out.back_scale =
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE);
+      polygon_offset_out.back_offset =
+          regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET);
+    }
+  } else if (pa_su_sc_mode_cntl.poly_offset_para_enable) {
+    polygon_offset_out.front_scale =
+        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
+    polygon_offset_out.front_offset =
+        regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    polygon_offset_out.back_scale = polygon_offset_out.front_scale;
+    polygon_offset_out.back_offset = polygon_offset_out.front_offset;
+  }
+
+  if (!polygon_offset_out.front_scale && !polygon_offset_out.front_offset &&
+      !polygon_offset_out.back_scale && !polygon_offset_out.back_offset) {
+    return false;
+  }
+
+  // Host render targets feed this to SV_Depth or gl_FragDepth, so constants
+  // need to be in host depth units. D24FS stores guest 0 - 1 depth in host
+  // 0 - 0.5, while the slope already comes from host depth derivatives.
+  float scale_factor =
+      xenos::kPolygonOffsetScaleSubpixelUnit *
+      float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+  polygon_offset_out.front_scale *= scale_factor;
+  polygon_offset_out.back_scale *= scale_factor;
+  if (depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+    polygon_offset_out.front_offset *= 0.5f;
+    polygon_offset_out.back_offset *= 0.5f;
+  }
+  return true;
+}
+
+bool IsHostDepthPolygonOffsetNeeded(
+    const RegisterFile& regs, bool primitive_polygonal,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask) {
+  if (!cvars::depth_bias_shader_offset) {
+    return false;
+  }
+
+  // Avoid affecting alpha-to-mask draws (foliage, hair) where changes to depth
+  // pipeline behavior may cause visible coverage differences.
+  if (regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) {
+    return false;
+  }
+
+  xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
+  bool zfunc_equal_including =
+      zfunc == xenos::CompareFunction::kLessEqual ||
+      zfunc == xenos::CompareFunction::kGreaterEqual ||
+      zfunc == xenos::CompareFunction::kEqual;
+
+  // Keep this aimed at visible coplanar redraws. Don't require exact LessEqual
+  // here: reversed depth and material-specific paths can still express the same
+  // "equal depth should pass" intent through other compare modes.
+  if (!primitive_polygonal || !normalized_depth_control.z_enable ||
+      normalized_depth_control.z_write_enable ||
+      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways ||
+      !zfunc_equal_including ||
+      !normalized_color_mask) {
+    return false;
+  }
+  HostDepthPolygonOffset polygon_offset;
+
+  if (!GetHostDepthPolygonOffset(
+          regs, primitive_polygonal,
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format, 1, 1, polygon_offset)) {
+    return false;
+  }
+
+  float max_abs_offset =
+      std::max(std::abs(polygon_offset.front_offset),
+               std::abs(polygon_offset.back_offset));
+  if (max_abs_offset == 0.0f) {
+    return false;
+  }
+  if (max_abs_offset > float(cvars::depth_bias_shader_offset_max_abs_offset)) {
+    return false;
+  }
+
+  return true;
+}
 
 void GetPreferredFacePolygonOffset(const RegisterFile& regs,
                                    bool primitive_polygonal, float& scale_out,

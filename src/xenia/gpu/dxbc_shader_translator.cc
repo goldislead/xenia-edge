@@ -3321,7 +3321,8 @@ void DxbcShaderTranslator::WriteOutputSignature() {
 
       // Depth (SV_Depth or SV_DepthLessEqual).
       size_t depth_position = SIZE_MAX;
-      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth()) {
+      if (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
+          DSV_IsApplyingPolygonOffset()) {
         depth_position = shader_object_.size();
         shader_object_.resize(shader_object_.size() + kParameterDwords);
         ++parameter_count;
@@ -3364,6 +3365,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
         }
         const char* depth_semantic_name;
         if (!current_shader().writes_depth() &&
+            !DSV_IsApplyingPolygonOffset() &&
             shader_modification.pixel.depth_stencil_mode ==
                 Modification::DepthStencilMode::kFloat24Truncating) {
           depth_semantic_name = "SV_DepthLessEqual";
@@ -3735,8 +3737,9 @@ void DxbcShaderTranslator::WriteShaderCode() {
         ao_.OpDclOutput(dxbc::Dest::OMask());
       }
       // Depth output.
-      if (is_writing_float24_depth || shader_writes_depth) {
-        if (!shader_writes_depth &&
+      if (is_writing_float24_depth || DSV_IsApplyingPolygonOffset() ||
+          shader_writes_depth) {
+        if (!shader_writes_depth && !DSV_IsApplyingPolygonOffset() &&
             GetDxbcShaderModification().pixel.depth_stencil_mode ==
                 Modification::DepthStencilMode::kFloat24Truncating) {
           ao_.OpDclOutput(dxbc::Dest::ODepthLE());

@@ -93,7 +93,8 @@ class PipelineCache {
       uint32_t interpolator_mask) const;
   DxbcShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-      reg::RB_DEPTHCONTROL normalized_depth_control) const;
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask) const;
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
   // MUST be made nullptr BEFORE calling this!

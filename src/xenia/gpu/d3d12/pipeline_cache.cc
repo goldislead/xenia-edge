@@ -650,7 +650,8 @@ PipelineCache::GetCurrentVertexShaderModification(
 DxbcShaderTranslator::Modification
 PipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-    reg::RB_DEPTHCONTROL normalized_depth_control) const {
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -684,19 +685,33 @@ PipelineCache::GetCurrentPixelShaderModification(
       RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode =
         DxbcShaderTranslator::Modification::DepthStencilMode;
+    // Let RTV draws with projected decal characteristics use the ROV polygon
+    // offset formula. Other draws keep fixed function depth bias.
+    bool apply_polygon_offset_in_shader =
+        !shader.writes_depth() &&
+        draw_util::IsHostDepthPolygonOffsetNeeded(
+            regs, draw_util::IsPrimitivePolygonal(regs),
+            normalized_depth_control, normalized_color_mask);
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
             xenos::DepthRenderTargetFormat::kD24FS8) {
       modification.pixel.depth_stencil_mode =
-          render_target_cache_.depth_float24_round()
-              ? DepthStencilMode::kFloat24Rounding
-              : DepthStencilMode::kFloat24Truncating;
+          apply_polygon_offset_in_shader
+              ? (render_target_cache_.depth_float24_round()
+                     ? DepthStencilMode::kFloat24RoundingPolygonOffset
+                     : DepthStencilMode::kFloat24TruncatingPolygonOffset)
+              : (render_target_cache_.depth_float24_round()
+                     ? DepthStencilMode::kFloat24Rounding
+                     : DepthStencilMode::kFloat24Truncating);
     } else {
-      if (shader.implicit_early_z_write_allowed() &&
-          (!shader.writes_color_target(0) ||
-           !draw_util::DoesCoverageDependOnAlpha(
-               regs.Get<reg::RB_COLORCONTROL>()))) {
+      if (apply_polygon_offset_in_shader) {
+        modification.pixel.depth_stencil_mode =
+            DepthStencilMode::kPolygonOffset;
+      } else if (shader.implicit_early_z_write_allowed() &&
+                 (!shader.writes_color_target(0) ||
+                  !draw_util::DoesCoverageDependOnAlpha(
+                      regs.Get<reg::RB_COLORCONTROL>()))) {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
@@ -1351,11 +1366,25 @@ bool PipelineCache::GetCurrentStateDescription(
   }
 
   // Pixel shader.
+  bool depth_bias_in_pixel_shader = false;
   if (pixel_shader) {
     runtime_description_out.pixel_shader = pixel_shader;
     description_out.pixel_shader_hash =
         pixel_shader->shader().ucode_data_hash();
     description_out.pixel_shader_modification = pixel_shader->modification();
+    auto pixel_shader_modification =
+        DxbcShaderTranslator::Modification(pixel_shader->modification());
+    using DepthStencilMode =
+        DxbcShaderTranslator::Modification::DepthStencilMode;
+    switch (pixel_shader_modification.pixel.depth_stencil_mode) {
+      case DepthStencilMode::kPolygonOffset:
+      case DepthStencilMode::kFloat24TruncatingPolygonOffset:
+      case DepthStencilMode::kFloat24RoundingPolygonOffset:
+        depth_bias_in_pixel_shader = true;
+        break;
+      default:
+        break;
+    }
   }
 
   // Rasterizer state.
@@ -1414,7 +1443,9 @@ bool PipelineCache::GetCurrentStateDescription(
     cull_front = false;
     cull_back = false;
   }
-  if (!edram_rov_used) {
+  // When the pixel shader writes the biased depth, leave fixed function depth
+  // bias at zero so the same guest offset is not applied twice.
+  if (!edram_rov_used && !depth_bias_in_pixel_shader) {
     float polygon_offset, polygon_offset_scale;
     draw_util::GetPreferredFacePolygonOffset(
         regs, primitive_polygonal, polygon_offset_scale, polygon_offset);

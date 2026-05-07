@@ -499,7 +499,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
                           bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control,
                           uint32_t draw_resolution_scale_x,
-                          uint32_t draw_resolution_scale_y);
+                          uint32_t draw_resolution_scale_y,
+                          bool depth_bias_in_pixel_shader);
   void UpdateSystemConstantValues(
       bool primitive_polygonal,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,

@@ -398,6 +398,7 @@ VulkanPipelineCache::GetCurrentVertexShaderModification(
 SpirvShaderTranslator::Modification
 VulkanPipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
@@ -432,10 +433,26 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
       RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
-    if (shader.implicit_early_z_write_allowed() &&
-        (!shader.writes_color_target(0) ||
-         !draw_util::DoesCoverageDependOnAlpha(
-             regs.Get<reg::RB_COLORCONTROL>()))) {
+    bool apply_polygon_offset_in_shader =
+        !shader.writes_depth() &&
+        draw_util::IsHostDepthPolygonOffsetNeeded(
+            regs, draw_util::IsPrimitivePolygonal(regs),
+            normalized_depth_control, normalized_color_mask);
+    if (apply_polygon_offset_in_shader &&
+        render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+        normalized_depth_control.z_enable &&
+        regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
+            xenos::DepthRenderTargetFormat::kD24FS8) {
+      modification.pixel.depth_stencil_mode =
+          render_target_cache_.depth_float24_round()
+              ? DepthStencilMode::kFloat24RoundingPolygonOffset
+              : DepthStencilMode::kFloat24TruncatingPolygonOffset;
+    } else if (apply_polygon_offset_in_shader) {
+      modification.pixel.depth_stencil_mode = DepthStencilMode::kPolygonOffset;
+    } else if (shader.implicit_early_z_write_allowed() &&
+               (!shader.writes_color_target(0) ||
+                !draw_util::DoesCoverageDependOnAlpha(
+                    regs.Get<reg::RB_COLORCONTROL>()))) {
       modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
     } else {
       modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;

@@ -235,6 +235,25 @@ inline int32_t GetD3D10IntegerPolygonOffset(
   return polygon_offset < 0 ? -polygon_offset_int : polygon_offset_int;
 }
 
+struct HostDepthPolygonOffset {
+  float front_scale = 0.0f;
+  float front_offset = 0.0f;
+  float back_scale = 0.0f;
+  float back_offset = 0.0f;
+};
+
+bool GetHostDepthPolygonOffset(const RegisterFile& regs,
+                               bool primitive_polygonal,
+                               xenos::DepthRenderTargetFormat depth_format,
+                               uint32_t draw_resolution_scale_x,
+                               uint32_t draw_resolution_scale_y,
+                               HostDepthPolygonOffset& polygon_offset_out);
+
+bool IsHostDepthPolygonOffsetNeeded(
+    const RegisterFile& regs, bool primitive_polygonal,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask);
+
 // For hosts not supporting separate front and back polygon offsets, returns the
 // polygon offset for the face which likely needs the offset the most (and that
 // will not be culled). The values returned will have the units of the original

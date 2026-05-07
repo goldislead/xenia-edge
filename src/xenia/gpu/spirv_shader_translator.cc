@@ -273,6 +273,8 @@ void SpirvShaderTranslator::Reset() {
   var_main_fsi_color_written_ = spv::NoResult;
   std::fill(output_fragment_data_.begin(), output_fragment_data_.end(),
             spv::NoResult);
+  output_or_var_fragment_depth_ = spv::NoResult;
+  output_fragment_sample_mask_ = spv::NoResult;
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -855,7 +857,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeEarlyFragmentTests);
     }
-    if (current_shader().writes_depth()) {
+    if (current_shader().writes_depth() || FBO_IsApplyingPolygonOffset()) {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeDepthReplacing);
     }
@@ -2417,6 +2419,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // alpha-to-coverage can actually run (no early fragment tests).
   bool need_frag_coord =
       edram_fragment_shader_interlock_ || param_gen_needed ||
+      FBO_IsApplyingPolygonOffset() ||
       (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
        current_shader().writes_color_target(0) &&
        !IsExecutionModeEarlyFragmentTests());
@@ -2429,7 +2432,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Is front facing.
-  if (edram_fragment_shader_interlock_ ||
+  if (edram_fragment_shader_interlock_ || FBO_IsApplyingPolygonOffset() ||
       (param_gen_needed &&
        !GetSpirvShaderModification().pixel.param_gen_point)) {
     input_front_facing_ = builder_->createVariable(
@@ -2496,7 +2499,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 
   // Depth output.
   output_or_var_fragment_depth_ = spv::NoResult;
-  if (current_shader().writes_depth()) {
+  if (current_shader().writes_depth() || FBO_IsApplyingPolygonOffset()) {
     if (!edram_fragment_shader_interlock_) {
       // Create gl_FragDepth output.
       output_or_var_fragment_depth_ =
