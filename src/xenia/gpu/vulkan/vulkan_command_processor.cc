@@ -3080,6 +3080,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   uint32_t normalized_color_mask;
+  draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
+  bool apply_host_depth_polygon_offset = false;
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -3119,6 +3121,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         pixel_shader ? draw_util::GetNormalizedColorMask(
                            regs, pixel_shader->writes_color_targets())
                      : 0;
+    apply_host_depth_polygon_offset =
+        pixel_shader && !pixel_shader->writes_depth() &&
+        render_target_cache_->GetPath() ==
+            RenderTargetCache::Path::kHostRenderTargets &&
+        draw_util::GetHostDepthPolygonOffsetIfNeeded(
+            regs, primitive_polygonal, normalized_depth_control,
+            normalized_color_mask, host_depth_polygon_offset);
 
     // Shader modifications.
     vertex_shader_modification =
@@ -3128,7 +3137,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     pixel_shader_modification =
         pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
                            *pixel_shader, interpolator_mask, ps_param_gen_pos,
-                           normalized_depth_control, normalized_color_mask)
+                           normalized_depth_control, normalized_color_mask,
+                           apply_host_depth_polygon_offset)
                      : SpirvShaderTranslator::Modification(0);
 
     // Translate the shaders now to obtain the sampler bindings.
@@ -3383,10 +3393,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           Shader::HostVertexShaderType::kVertex;
 
   // Update system constants before uploading them.
-  UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
-                             shader_32bit_index_dma, viewport_info,
-                             used_texture_mask, normalized_depth_control,
-                             normalized_color_mask);
+  UpdateSystemConstantValues(
+      primitive_polygonal, primitive_processing_result, shader_32bit_index_dma,
+      viewport_info, used_texture_mask, normalized_depth_control,
+      normalized_color_mask,
+      apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -5983,7 +5994,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask,
+    const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6392,16 +6404,15 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     }
   }
 
-  if (!edram_fragment_shader_interlock &&
-      draw_util::IsHostDepthPolygonOffsetNeeded(
-          regs, primitive_polygonal, normalized_depth_control,
-          normalized_color_mask)) {
+  if (!edram_fragment_shader_interlock && host_depth_polygon_offset) {
     // For FBO, reuse the existing polygon offset constants. FSI still fills
     // them in its own block below.
-    draw_util::HostDepthPolygonOffset polygon_offset;
-    draw_util::GetHostDepthPolygonOffset(
-        regs, primitive_polygonal, rb_depth_info.depth_format,
-        draw_resolution_scale_x, draw_resolution_scale_y, polygon_offset);
+    draw_util::HostDepthPolygonOffset polygon_offset =
+        *host_depth_polygon_offset;
+    float scale_factor =
+        float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
+    polygon_offset.front_scale *= scale_factor;
+    polygon_offset.back_scale *= scale_factor;
     dirty |= system_constants_.edram_poly_offset_front_scale !=
              polygon_offset.front_scale;
     system_constants_.edram_poly_offset_front_scale =

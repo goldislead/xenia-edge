@@ -663,6 +663,18 @@ void DxbcShaderTranslator::StartPixelShader() {
                             in_position_z);
       }
     }
+  } else if (DSV_IsApplyingPolygonOffset() &&
+             !current_shader().writes_depth()) {
+    // Get depth derivatives before translated shader control flow can diverge
+    // or kill pixels. The polygon-offset completion uses these later.
+    assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+    dxbc::Src in_position_z(
+        dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
+    in_position_used_ |= 0b0100;
+    a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0001),
+                        in_position_z);
+    a_.OpDerivRTYCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0010),
+                        in_position_z);
   }
 
   // If not translating anything, we only need the depth.
@@ -916,6 +928,9 @@ void DxbcShaderTranslator::StartTranslation() {
         // X holds the guest oDepth - make sure it's always initialized because
         // assumptions can't be made about the integrity of the guest code.
         depth_stencil_temp_zero_mask = 0b0001;
+      } else if (DSV_IsApplyingPolygonOffset()) {
+        // XY hold Z gradients, written unconditionally in the beginning.
+        depth_stencil_temp_zero_mask = 0b0000;
       } else {
         assert_true(edram_rov_used_);
         if (ROV_IsDepthStencilEarly()) {

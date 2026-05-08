@@ -108,8 +108,6 @@ constexpr int8_t kD3D10StandardSamplePositions4x[4][2] = {
 bool GetHostDepthPolygonOffset(const RegisterFile& regs,
                                bool primitive_polygonal,
                                xenos::DepthRenderTargetFormat depth_format,
-                               uint32_t draw_resolution_scale_x,
-                               uint32_t draw_resolution_scale_y,
                                HostDepthPolygonOffset& polygon_offset_out) {
   polygon_offset_out = {};
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -142,12 +140,11 @@ bool GetHostDepthPolygonOffset(const RegisterFile& regs,
 
   // Host render targets feed this to SV_Depth or gl_FragDepth, so constants
   // need to be in host depth units. D24FS stores guest 0 - 1 depth in host
-  // 0 - 0.5, while the slope already comes from host depth derivatives.
-  float scale_factor =
-      xenos::kPolygonOffsetScaleSubpixelUnit *
-      float(std::max(draw_resolution_scale_x, draw_resolution_scale_y));
-  polygon_offset_out.front_scale *= scale_factor;
-  polygon_offset_out.back_scale *= scale_factor;
+  // 0 - 0.5, while the slope already comes from host depth derivatives. The
+  // draw resolution scale is applied later by the backend when uploading the
+  // per-draw constants.
+  polygon_offset_out.front_scale *= xenos::kPolygonOffsetScaleSubpixelUnit;
+  polygon_offset_out.back_scale *= xenos::kPolygonOffsetScaleSubpixelUnit;
   if (depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     polygon_offset_out.front_offset *= 0.5f;
     polygon_offset_out.back_offset *= 0.5f;
@@ -155,10 +152,12 @@ bool GetHostDepthPolygonOffset(const RegisterFile& regs,
   return true;
 }
 
-bool IsHostDepthPolygonOffsetNeeded(
+bool GetHostDepthPolygonOffsetIfNeeded(
     const RegisterFile& regs, bool primitive_polygonal,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask,
+    HostDepthPolygonOffset& polygon_offset_out) {
+  polygon_offset_out = {};
   if (!cvars::depth_bias_shader_offset) {
     return false;
   }
@@ -170,32 +169,26 @@ bool IsHostDepthPolygonOffsetNeeded(
   }
 
   xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
-  bool zfunc_equal_including =
-      zfunc == xenos::CompareFunction::kLessEqual ||
-      zfunc == xenos::CompareFunction::kGreaterEqual ||
-      zfunc == xenos::CompareFunction::kEqual;
+  bool zfunc_equal_including = zfunc == xenos::CompareFunction::kLessEqual ||
+                               zfunc == xenos::CompareFunction::kGreaterEqual ||
+                               zfunc == xenos::CompareFunction::kEqual;
 
   // Keep this aimed at visible coplanar redraws. Don't require exact LessEqual
   // here: reversed depth and material-specific paths can still express the same
   // "equal depth should pass" intent through other compare modes.
   if (!primitive_polygonal || !normalized_depth_control.z_enable ||
-      normalized_depth_control.z_write_enable ||
-      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways ||
-      !zfunc_equal_including ||
-      !normalized_color_mask) {
-    return false;
-  }
-  HostDepthPolygonOffset polygon_offset;
-
-  if (!GetHostDepthPolygonOffset(
-          regs, primitive_polygonal,
-          regs.Get<reg::RB_DEPTH_INFO>().depth_format, 1, 1, polygon_offset)) {
+      !zfunc_equal_including || !normalized_color_mask) {
     return false;
   }
 
-  float max_abs_offset =
-      std::max(std::abs(polygon_offset.front_offset),
-               std::abs(polygon_offset.back_offset));
+  if (!GetHostDepthPolygonOffset(regs, primitive_polygonal,
+                                 regs.Get<reg::RB_DEPTH_INFO>().depth_format,
+                                 polygon_offset_out)) {
+    return false;
+  }
+
+  float max_abs_offset = std::max(std::abs(polygon_offset_out.front_offset),
+                                  std::abs(polygon_offset_out.back_offset));
   if (max_abs_offset == 0.0f) {
     return false;
   }

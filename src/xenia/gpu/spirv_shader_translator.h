@@ -745,8 +745,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
         depth_stencil_mode == DepthStencilMode::kPolygonOffset ||
         depth_stencil_mode ==
             DepthStencilMode::kFloat24TruncatingPolygonOffset ||
-        depth_stencil_mode ==
-            DepthStencilMode::kFloat24RoundingPolygonOffset;
+        depth_stencil_mode == DepthStencilMode::kFloat24RoundingPolygonOffset;
     return is_polygon_offset;
   }
   void FSI_LoadSampleMask(spv::Id msaa_samples);
@@ -1073,6 +1072,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Used by both FSI and FBO paths for proper alpha test / alpha-to-coverage
   // behavior.
   spv::Id var_main_fsi_color_written_;
+  // PS FBO shader polygon offset - unbiased depth captured with the
+  // derivatives below.
+  spv::Id main_fbo_depth_unbiased_;
+  // PS FBO shader polygon offset - depth derivatives captured before
+  // translated shader control flow can diverge or kill pixels.
+  std::array<spv::Id, 2> main_fbo_depth_derivatives_;
   // Loaded by FSI_LoadSampleMask.
   // Can be modified on the outermost control flow level in the main function.
   // 0:3 - Per-sample coverage at the current stage of the shader's execution.

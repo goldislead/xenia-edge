@@ -506,7 +506,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       bool shader_32bit_index_dma, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-      uint32_t normalized_color_mask);
+      uint32_t normalized_color_mask,
+      const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
   bool UpdateBindings(const VulkanShader* vertex_shader,
                       const VulkanShader* pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet

@@ -399,7 +399,7 @@ SpirvShaderTranslator::Modification
 VulkanPipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) const {
+    uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -433,11 +433,6 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
       RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
-    bool apply_polygon_offset_in_shader =
-        !shader.writes_depth() &&
-        draw_util::IsHostDepthPolygonOffsetNeeded(
-            regs, draw_util::IsPrimitivePolygonal(regs),
-            normalized_depth_control, normalized_color_mask);
     if (apply_polygon_offset_in_shader &&
         render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&

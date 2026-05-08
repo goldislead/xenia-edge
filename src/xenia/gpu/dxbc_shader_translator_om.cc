@@ -1875,15 +1875,15 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
       uint32_t temp = PushSystemTemp();
       dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
       dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
-      dxbc::Dest temp_y_dest(dxbc::Dest::R(temp, 0b0010));
-      dxbc::Src temp_y_src(dxbc::Src::R(temp, dxbc::Src::kYYYY));
       dxbc::Src in_position_z(
           dxbc::Src::V1D(in_reg_ps_position_, dxbc::Src::kZZZZ));
       in_position_used_ |= 0b0100;
       in_front_face_used_ = true;
-      a_.OpDerivRTXCoarse(temp_x_dest, in_position_z);
-      a_.OpDerivRTYCoarse(temp_y_dest, in_position_z);
-      a_.OpMax(temp_x_dest, temp_x_src.Abs(), temp_y_src.Abs());
+      assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+      a_.OpMax(
+          temp_x_dest,
+          dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX).Abs(),
+          dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kYYYY).Abs());
       a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_,
                                    dxbc::Src::kXXXX));
       a_.OpMAd(
@@ -1932,12 +1932,12 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
     if (apply_polygon_offset) {
       // Bias in host depth first. For D24FS the constants were already adjusted
       // for the host 0 - 0.5 mapping, so the float24 remap can stay the same.
-      dxbc::Dest temp_y_dest(dxbc::Dest::R(temp, 0b0010));
-      dxbc::Src temp_y_src(dxbc::Src::R(temp, dxbc::Src::kYYYY));
       in_front_face_used_ = true;
-      a_.OpDerivRTXCoarse(temp_x_dest, in_position_z);
-      a_.OpDerivRTYCoarse(temp_y_dest, in_position_z);
-      a_.OpMax(temp_x_dest, temp_x_src.Abs(), temp_y_src.Abs());
+      assert_true(system_temp_depth_stencil_ != UINT32_MAX);
+      a_.OpMax(
+          temp_x_dest,
+          dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kXXXX).Abs(),
+          dxbc::Src::R(system_temp_depth_stencil_, dxbc::Src::kYYYY).Abs());
       a_.OpIf(true, dxbc::Src::V1D(in_reg_ps_front_face_sample_index_,
                                    dxbc::Src::kXXXX));
       a_.OpMAd(
@@ -1973,7 +1973,8 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
   Modification::DepthStencilMode depth_stencil_mode =
       GetDxbcShaderModification().pixel.depth_stencil_mode;
   bool depth_float24_truncating =
-      depth_stencil_mode == Modification::DepthStencilMode::kFloat24Truncating ||
+      depth_stencil_mode ==
+          Modification::DepthStencilMode::kFloat24Truncating ||
       depth_stencil_mode ==
           Modification::DepthStencilMode::kFloat24TruncatingPolygonOffset;
   if (depth_float24_truncating) {

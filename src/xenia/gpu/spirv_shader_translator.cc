@@ -271,6 +271,8 @@ void SpirvShaderTranslator::Reset() {
   var_main_point_size_edge_flag_kill_vertex_ = spv::NoResult;
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  main_fbo_depth_unbiased_ = spv::NoResult;
+  main_fbo_depth_derivatives_.fill(spv::NoResult);
   std::fill(output_fragment_data_.begin(), output_fragment_data_.end(),
             spv::NoResult);
   output_or_var_fragment_depth_ = spv::NoResult;
@@ -2596,6 +2598,24 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
           spv::NoPrecision, spv::StorageClassFunction, type_float_,
           "xe_var_fragment_depth", const_float_0_);
     }
+  }
+
+  if (FBO_IsApplyingPolygonOffset()) {
+    // Capture derivatives before translated shader control flow can diverge or
+    // kill pixels.
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(2));
+    main_fbo_depth_unbiased_ =
+        builder_->createLoad(builder_->createAccessChain(
+                                 spv::StorageClassInput,
+                                 input_fragment_coordinates_, id_vector_temp_),
+                             spv::NoPrecision);
+    builder_->addCapability(spv::CapabilityDerivativeControl);
+    main_fbo_depth_derivatives_[0] = builder_->createUnaryOp(
+        spv::OpDPdxCoarse, type_float_, main_fbo_depth_unbiased_);
+    main_fbo_depth_derivatives_[1] = builder_->createUnaryOp(
+        spv::OpDPdyCoarse, type_float_, main_fbo_depth_unbiased_);
   }
 
   if (edram_fragment_shader_interlock_ && FSI_IsDepthStencilEarly()) {

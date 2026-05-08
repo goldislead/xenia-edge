@@ -1491,18 +1491,12 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     assert_true(input_fragment_coordinates_ != spv::NoResult);
     assert_true(input_front_facing_ != spv::NoResult);
     assert_true(output_or_var_fragment_depth_ != spv::NoResult);
-    id_vector_temp_.clear();
-    id_vector_temp_.push_back(builder_->makeIntConstant(2));
-    spv::Id depth_unbiased =
-        builder_->createLoad(builder_->createAccessChain(
-                                 spv::StorageClassInput,
-                                 input_fragment_coordinates_, id_vector_temp_),
-                             spv::NoPrecision);
-    builder_->addCapability(spv::CapabilityDerivativeControl);
-    spv::Id depth_dx =
-        builder_->createUnaryOp(spv::OpDPdxCoarse, type_float_, depth_unbiased);
-    spv::Id depth_dy =
-        builder_->createUnaryOp(spv::OpDPdyCoarse, type_float_, depth_unbiased);
+    assert_true(main_fbo_depth_unbiased_ != spv::NoResult);
+    spv::Id depth_unbiased = main_fbo_depth_unbiased_;
+    assert_true(main_fbo_depth_derivatives_[0] != spv::NoResult);
+    assert_true(main_fbo_depth_derivatives_[1] != spv::NoResult);
+    spv::Id depth_dx = main_fbo_depth_derivatives_[0];
+    spv::Id depth_dy = main_fbo_depth_derivatives_[1];
     depth_dx = builder_->createUnaryBuiltinCall(
         type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs, depth_dx);
     depth_dy = builder_->createUnaryBuiltinCall(

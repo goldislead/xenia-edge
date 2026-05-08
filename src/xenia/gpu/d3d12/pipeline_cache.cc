@@ -651,7 +651,7 @@ DxbcShaderTranslator::Modification
 PipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) const {
+    bool apply_polygon_offset_in_shader) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -687,11 +687,6 @@ PipelineCache::GetCurrentPixelShaderModification(
         DxbcShaderTranslator::Modification::DepthStencilMode;
     // Let RTV draws with projected decal characteristics use the ROV polygon
     // offset formula. Other draws keep fixed function depth bias.
-    bool apply_polygon_offset_in_shader =
-        !shader.writes_depth() &&
-        draw_util::IsHostDepthPolygonOffsetNeeded(
-            regs, draw_util::IsPrimitivePolygonal(regs),
-            normalized_depth_control, normalized_color_mask);
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format ==

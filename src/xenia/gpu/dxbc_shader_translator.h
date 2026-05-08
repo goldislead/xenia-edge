@@ -747,6 +747,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // With ROV, need to store it to write later.
       return true;
     }
+    if (DSV_IsApplyingPolygonOffset()) {
+      // Needed to calculate depth derivatives before translated shader control
+      // flow can diverge or kill pixels.
+      return true;
+    }
     return false;
   }
   // Whether the current non-ROV pixel shader should convert the depth to 20e4.
