@@ -1117,8 +1117,15 @@ bool CommandProcessor::BeginZPDReport(uint32_t report_address) {
   }
 
   // Resolve same slot hazards before invalidating pending writes from the prior
-  // lifetime.
-  PumpQueryResolves();
+  // lifetime. In strict mode, refresh the completion timeline cache first so
+  // that queries the GPU has already finished (but whose completion wasn't
+  // polled yet) are drained here rather than triggering an unnecessary blocking
+  // wait in AwaitQueryResolve below.
+  if (GetZPDMode() == ZPDMode::kStrict) {
+    PollCompletedSubmission();
+  } else {
+    PumpQueryResolves();
+  }
 
   PendingZPDSlot pending_slot = GetPendingZPDSlot(slot_base, end_record);
 

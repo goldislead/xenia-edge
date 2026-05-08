@@ -168,10 +168,11 @@ bool GetHostDepthPolygonOffsetIfNeeded(
     return false;
   }
 
-  xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
-  bool zfunc_equal_including = zfunc == xenos::CompareFunction::kLessEqual ||
-                               zfunc == xenos::CompareFunction::kGreaterEqual ||
-                               zfunc == xenos::CompareFunction::kEqual;
+  const xenos::CompareFunction zfunc = normalized_depth_control.zfunc;
+  const bool zfunc_equal_including =
+      zfunc == xenos::CompareFunction::kLessEqual ||
+      zfunc == xenos::CompareFunction::kGreaterEqual ||
+      zfunc == xenos::CompareFunction::kEqual;
 
   // Keep this aimed at visible coplanar redraws. Don't require exact LessEqual
   // here: reversed depth and material-specific paths can still express the same

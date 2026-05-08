@@ -578,23 +578,26 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_edram.pImageInfo = nullptr;
     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
     write_descriptor_set_edram.pTexelBufferView = nullptr;
-    // ZPD FSI counter.
-    VkWriteDescriptorSet& write_descriptor_set_zpd_fallback =
+    // ZPD FSI counter - initially backed by EDRAM as a placeholder; the real
+    // counter buffer is bound in EnsureZPDQueryResources once it is allocated.
+    // Writes are guarded by the zpd_fsi_counter_index UINT32_MAX sentinel, so
+    // EDRAM is never actually modified through this binding.
+    VkWriteDescriptorSet& write_descriptor_set_zpd_fsi_counter_init =
         write_descriptor_sets[2];
-    write_descriptor_set_zpd_fallback.sType =
+    write_descriptor_set_zpd_fsi_counter_init.sType =
         VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write_descriptor_set_zpd_fallback.pNext = nullptr;
-    write_descriptor_set_zpd_fallback.dstSet =
+    write_descriptor_set_zpd_fsi_counter_init.pNext = nullptr;
+    write_descriptor_set_zpd_fsi_counter_init.dstSet =
         shared_memory_and_edram_descriptor_set_;
-    write_descriptor_set_zpd_fallback.dstBinding = 2;
-    write_descriptor_set_zpd_fallback.dstArrayElement = 0;
-    write_descriptor_set_zpd_fallback.descriptorCount = 1;
-    write_descriptor_set_zpd_fallback.descriptorType =
+    write_descriptor_set_zpd_fsi_counter_init.dstBinding = 2;
+    write_descriptor_set_zpd_fsi_counter_init.dstArrayElement = 0;
+    write_descriptor_set_zpd_fsi_counter_init.descriptorCount = 1;
+    write_descriptor_set_zpd_fsi_counter_init.descriptorType =
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write_descriptor_set_zpd_fallback.pImageInfo = nullptr;
-    write_descriptor_set_zpd_fallback.pBufferInfo =
+    write_descriptor_set_zpd_fsi_counter_init.pImageInfo = nullptr;
+    write_descriptor_set_zpd_fsi_counter_init.pBufferInfo =
         &edram_descriptor_buffer_info;
-    write_descriptor_set_zpd_fallback.pTexelBufferView = nullptr;
+    write_descriptor_set_zpd_fsi_counter_init.pTexelBufferView = nullptr;
   }
   dfn.vkUpdateDescriptorSets(device,
                              1 + 2 * uint32_t(edram_fragment_shader_interlock),
@@ -4864,9 +4867,6 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
       if (in_render_pass_) {
         saved_render_pass = current_render_pass_;
         saved_framebuffer = current_framebuffer_;
-      }
-
-      if (in_render_pass_) {
         EndRenderPass();
       }
       if (!EndSubmission(false)) {
