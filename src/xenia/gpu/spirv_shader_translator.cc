@@ -4163,6 +4163,24 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result,
     }
   }
 
+  if (result.storage_target == InstructionStorageTarget::kDepth &&
+      !edram_fragment_shader_interlock_) {
+    // FBO float24 scales raster depth with viewport maxDepth = 0.5, but
+    // gl_FragDepth bypasses that, so scale guest oDepth to the host range.
+    spv::Id depth_needs_scale = builder_->createBinOp(
+        spv::OpINotEqual, type_bool_,
+        builder_->createBinOp(
+            spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+            builder_->makeUintConstant(kSysFlag_DepthFloat24)),
+        const_uint_0_);
+    spv::Id depth_scaled = builder_->createNoContractionBinOp(
+        spv::OpFMul, type_float_, value_to_store,
+        builder_->makeFloatConstant(0.5f));
+    value_to_store =
+        builder_->createTriOp(spv::OpSelect, type_float_, depth_needs_scale,
+                              depth_scaled, value_to_store);
+  }
+
   if (result.storage_target ==
           InstructionStorageTarget::kPointSizeEdgeFlagKillVertex &&
       used_write_mask & 0b001) {
