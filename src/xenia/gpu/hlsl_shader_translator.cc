@@ -2454,16 +2454,52 @@ void HlslShaderTranslator::EmitROVOutputMerger() {
 }
 
 void HlslShaderTranslator::EmitROVZpdCounter() {
-  // Transcribed from DxbcShaderTranslator::ROV_AddPassedMSAASamplesToZPD. When
-  // a ZPD (occlusion query) segment is open, add the number of samples that
-  // survived depth/stencil to the active counter slot. UINT32_MAX means no
+  // When a ZPD (occlusion query) segment is open, add the number of samples
+  // that survived depth/stencil to the active counter slot. UINT32_MAX means no
   // segment is open. The counter UAV is raw, addressed in bytes (one uint32 per
   // slot). Only the low 4 coverage bits count.
+  // To cut down on atomic pressure, WaveActiveSum is used to combine per-lane
+  // counts before issuing the InterlockedAdd. This turns a pile of atomics
+  // into one atomic for the wave while keeping the same result. If the slot
+  // ever diverges within the wave, bail out to the old method.
+  // https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/hlsl-shader-model-6-0-features-for-direct3d-12
+  // https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/waveallsum
   EmitLine("// ROV occlusion query sample counter");
-  EmitLine("if (xe_zpd_rov_counter_index != 0xFFFFFFFFu) {");
-  Indent();
   EmitLine("uint xe_zpd_passed = countbits(xe_rov_coverage & 0xFu);");
-  EmitLine("if (xe_zpd_passed != 0u) {");
+  EmitLine("");
+  // Helper lanes can exist for derivatives, but can't contribute to the count.
+  // Zero before wave reduction.
+  EmitLine("if (IsHelperLane()) {");
+  Indent();
+  EmitLine("xe_zpd_passed = 0u;");
+  Outdent();
+  EmitLine("}");
+  EmitLine("");
+  EmitLine(
+      "bool xe_zpd_contributes = xe_zpd_rov_counter_index != 0xFFFFFFFFu && "
+      "xe_zpd_passed != 0u;");
+  EmitLine("");
+  EmitLine("if (WaveActiveAllEqual(xe_zpd_rov_counter_index)) {");
+  Indent();
+  EmitLine("uint xe_zpd_wave_passed = WaveActiveSum(xe_zpd_passed);");
+  // Using WaveIsFirstLane is probably not the smart choice. Let's avoid
+  // needless helper lanes. Choose the first lane that contributed
+  // samples via prefix bitcount.
+  EmitLine(
+      "if (xe_zpd_contributes && "
+      "WavePrefixCountBits(xe_zpd_contributes) == 0u) {");
+  Indent();
+  EmitLine("uint xe_zpd_previous;");
+  EmitLine(
+      "xe_zpd_rov_counter_uav.InterlockedAdd("
+      "xe_zpd_rov_counter_index * 4u, xe_zpd_wave_passed, xe_zpd_previous);");
+  Outdent();
+  EmitLine("}");
+  Outdent();
+  // Should be rare.
+  EmitLine("} else {");
+  Indent();
+  EmitLine("if (xe_zpd_contributes) {");
   Indent();
   EmitLine("uint xe_zpd_prev;");
   EmitLine(
