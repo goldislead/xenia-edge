@@ -342,6 +342,11 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     while (true) {
+#if !XE_PLATFORM_ANDROID
+      // Cancellation point, clear of the alloc below.
+      pthread_testcancel();
+#endif
+
       // Check all handles to see if any/all are signaled.
       // Use try_lock to avoid deadlocks from lock ordering issues.
       size_t first_signaled = std::numeric_limits<size_t>::max();
@@ -1066,6 +1071,10 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 
     {
       std::unique_lock lock(state_mutex_);
+      if (state_ == State::kFinished) {
+        // Don't resurrect an exiting thread to kSuspended and signal it.
+        return false;
+      }
       if (out_previous_suspend_count) {
         *out_previous_suspend_count = suspend_count_;
       }
@@ -1503,7 +1512,8 @@ thread_local PosixThread* current_thread_ = nullptr;
 
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !XE_PLATFORM_ANDROID
-  if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
+  // Deferred so cancellation unwinds only at safe points, never mid-malloc.
+  if (pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, nullptr) != 0) {
     assert_always();
   }
 #endif
@@ -1524,16 +1534,20 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #endif
   {
     std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.state_ =
-        create_suspended ? State::kSuspended : State::kRunning;
+    // Arm suspend_count_ in the same lock that publishes kSuspended, else a
+    // Resume() can land between, see count==0, bail, and wedge us at the gate.
+    if (create_suspended) {
+      thread->handle_.state_ = State::kSuspended;
+      thread->handle_.suspend_count_ = 1;
+    } else {
+      thread->handle_.state_ = State::kRunning;
+    }
     thread->handle_.state_signal_.notify_all();
   }
 
+  // Park where Resume() signals (sem on Linux) so its post can't leak.
   if (create_suspended) {
-    std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
-    thread->handle_.state_signal_.wait(
-        lock, [thread] { return thread->handle_.suspend_count_ == 0; });
+    thread->handle_.WaitSuspended();
   }
 
   try {
