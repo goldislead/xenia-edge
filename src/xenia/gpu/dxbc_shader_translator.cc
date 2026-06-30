@@ -2151,6 +2151,8 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
 
         {"xe_texture_swizzled_signs", ShaderRdefTypeIndex::kUint4Array2,
          sizeof(uint32_t) * 4 * 2},
+        {"xe_texture_integer_scale_bits", ShaderRdefTypeIndex::kUint4Array8,
+         sizeof(uint32_t) * 32},
 
         {"xe_textures_resolution_scaled", ShaderRdefTypeIndex::kUint,
          sizeof(uint32_t)},

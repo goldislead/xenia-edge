@@ -532,6 +532,11 @@ union ResolveEdramInfo {
     // of the resolve region with the contents of the first surely covered
     // column / row with resolution scaling.
     uint32_t fill_half_pixel_offset : 1;
+    // Controlled by gamma_decode_pwl_resolve. Decode 8_8_8_8_GAMMA through the
+    // PWL curve before MSAA averaging and conversion, then encode again for
+    // gamma dests. The cvar is mostly a safety value in case a title likes the
+    // old behavior better.
+    uint32_t decode_pwl_gamma : 1;
   };
   ResolveEdramInfo() : packed(0) { static_assert_size(*this, sizeof(packed)); }
 };

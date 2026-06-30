@@ -119,6 +119,7 @@ class D3D12TextureCache final : public TextureCache {
       D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(
       const D3D12Shader::TextureBinding& host_shader_binding);
+  uint32_t GetActiveIntegerScaleBits(uint32_t fetch_constant_index) const;
   void PrefetchSamplerParameters(
       const D3D12Shader::SamplerBinding& binding) const;
   SamplerParameters GetSamplerParameters(
@@ -187,10 +188,10 @@ class D3D12TextureCache final : public TextureCache {
     LoadShaderIndex load_shader_signed;
 
     // Do NOT add integer DXGI formats to this - they are not filterable, can
-    // only be read with Load, not Sample! If any game is seen using num_format
-    // 1 for fixed-point formats (for floating-point, it's normally set to 1
-    // though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // only be read with Load, not Sample! Games that fetch fixed-point formats
+    // are handled after sampling by scaling the normalized host value back to
+    // the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled float/normalized views.
 
     // Whether the DXGI format, if not uncompressing the texture, consists of
     // blocks, thus copy regions must be aligned to block size (assuming it's

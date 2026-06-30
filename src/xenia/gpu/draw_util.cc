@@ -1329,6 +1329,8 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
+    color_edram_info.decode_pwl_gamma =
+        cvars::gamma_decode_pwl_resolve ? 1u : 0u;
     if ((fixed_rg16_truncated_to_minus_1_to_1 &&
          color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
         (fixed_rgba16_truncated_to_minus_1_to_1 &&
@@ -1377,6 +1379,27 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   return true;
 }
 XE_MSVC_OPTIMIZE_REVERT()
+
+// Raw copy only really makes sense when the destination wants the same bits the
+// active EDRAM view already has. Signed/integer color dests are suspicious
+// since copy_dest_number says the data should be repacked instead of just
+// copied. This is guarded by a cvar for now since I don't trust this yet.
+static constexpr bool ColorResolveNumberFormatMatches(
+    xenos::ColorFormat color_format, xenos::SurfaceNumberFormat num_format) {
+  switch (color_format) {
+    case xenos::ColorFormat::k_16_FLOAT:
+    case xenos::ColorFormat::k_16_16_FLOAT:
+    case xenos::ColorFormat::k_16_16_16_16_FLOAT:
+    case xenos::ColorFormat::k_32_FLOAT:
+    case xenos::ColorFormat::k_32_32_FLOAT:
+    case xenos::ColorFormat::k_32_32_32_32_FLOAT:
+      return num_format == xenos::SurfaceNumberFormat::kFloat;
+    default:
+      return num_format ==
+             xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction;
+  }
+}
+
 ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
     ResolveCopyShaderConstants& constants_out, uint32_t& group_count_x_out,
@@ -1385,12 +1408,20 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(
   bool is_depth = IsCopyingDepth();
   ResolveEdramInfo edram_info = is_depth ? depth_edram_info : color_edram_info;
   bool source_is_64bpp = !is_depth && color_edram_info.format_is_64bpp != 0;
+  // Fast resolve is just a bit copy. The optional number-format check is
+  // stricter. Signed/integer color dests go through full resolve so
+  // copy_dest_number can repack them. This is probably more correct.
+  // Depth stays raw.
   if (is_depth || (!copy_dest_info.copy_dest_exp_bias &&
                    xenos::IsSingleCopySampleSelected(
                        copy_dest_coordinate_info.copy_sample_select) &&
                    xenos::IsColorResolveFormatBitwiseEquivalent(
                        xenos::ColorRenderTargetFormat(color_edram_info.format),
-                       xenos::ColorFormat(copy_dest_info.copy_dest_format)))) {
+                       xenos::ColorFormat(copy_dest_info.copy_dest_format)) &&
+                   (!cvars::resolve_check_number_format ||
+                    ColorResolveNumberFormatMatches(
+                        xenos::ColorFormat(copy_dest_info.copy_dest_format),
+                        copy_dest_info.copy_dest_number)))) {
     if (edram_info.msaa_samples >= xenos::MsaaSamples::k4X) {
       shader = source_is_64bpp ? ResolveCopyShaderIndex::kFast64bpp4xMSAA
                                : ResolveCopyShaderIndex::kFast32bpp4xMSAA;

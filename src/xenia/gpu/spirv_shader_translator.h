@@ -247,6 +247,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
     uint32_t texture_swizzled_signs[8];
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1; bit 4 = signed; zero means 1x
+    uint32_t texture_integer_scale_bits[32];
 
     // If the imageViewFormatSwizzle portability subset is not supported, the
     // component swizzle (taking both guest and host swizzles into account) to
@@ -334,10 +338,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // xenos_draw.glsli reads these tessellation fields from the system constants
   // UBO at these fixed std140 offsets. Keep them in sync.
   static_assert(
-      offsetof(SystemConstants, tessellation_factor_range) == 512 &&
-          offsetof(SystemConstants, tessellation_vertex_index_endian) == 528 &&
-          offsetof(SystemConstants, tessellation_vertex_index_offset) == 532 &&
-          offsetof(SystemConstants, tessellation_vertex_index_min_max) == 536,
+      offsetof(SystemConstants, tessellation_factor_range) == 640 &&
+          offsetof(SystemConstants, tessellation_vertex_index_endian) == 656 &&
+          offsetof(SystemConstants, tessellation_vertex_index_offset) == 660 &&
+          offsetof(SystemConstants, tessellation_vertex_index_min_max) == 664,
       "Keep xenos_draw.glsli tessellation offsets in sync with "
       "SystemConstants");
 
@@ -1002,6 +1006,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantPointConstantDiameter,
     kSystemConstantPointScreenDiameterToNdcRadius,
     kSystemConstantTextureSwizzledSigns,
+    kSystemConstantTextureIntegerScaleBits,
     kSystemConstantTextureSwizzles,
     kSystemConstantTexturesResolved,
     kSystemConstantAlphaTestReference,

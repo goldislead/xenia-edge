@@ -403,6 +403,10 @@ void SpirvShaderTranslator::StartTranslation() {
       type_uint4_, builder_->makeUintConstant(4), sizeof(uint32_t) * 4);
   builder_->addDecoration(type_uint4_array_4, spv::DecorationArrayStride,
                           sizeof(uint32_t) * 4);
+  spv::Id type_uint4_array_8 = builder_->makeArrayType(
+      type_uint4_, builder_->makeUintConstant(8), sizeof(uint32_t) * 4);
+  builder_->addDecoration(type_uint4_array_8, spv::DecorationArrayStride,
+                          sizeof(uint32_t) * 4);
   spv::Id type_float4_array_6 = builder_->makeArrayType(
       type_float4_, builder_->makeUintConstant(6), sizeof(float) * 4);
   builder_->addDecoration(type_float4_array_6, spv::DecorationArrayStride,
@@ -430,6 +434,9 @@ void SpirvShaderTranslator::StartTranslation() {
        type_float2_},
       {"texture_swizzled_signs",
        offsetof(SystemConstants, texture_swizzled_signs), type_uint4_array_2},
+      {"texture_integer_scale_bits",
+       offsetof(SystemConstants, texture_integer_scale_bits),
+       type_uint4_array_8},
       {"texture_swizzles", offsetof(SystemConstants, texture_swizzles),
        type_uint4_array_4},
       {"textures_resolved", offsetof(SystemConstants, textures_resolved),

@@ -250,6 +250,7 @@ void HlslShaderTranslator::EmitSystemConstants() {
   EmitLine("float2 xe_point_screen_diameter_to_ndc_radius;");
   EmitLine("");
   EmitLine("uint4 xe_texture_swizzled_signs[2];");
+  EmitLine("uint4 xe_texture_integer_scale_bits[8];");
   EmitLine("");
   EmitLine("uint xe_textures_resolution_scaled;");
   EmitLine("uint2 xe_sample_count_log2;");
@@ -1192,6 +1193,23 @@ void HlslShaderTranslator::EmitHelperFunctions() {
   EmitLine("if (sign == 2u) { return unsigned_value * 2.0f - 1.0f; }");
   EmitLine("if (sign == 3u) { return XePWLGammaToLinear(unsigned_value); }");
   EmitLine("return unsigned_value;");
+  Outdent();
+  EmitLine("}");
+  EmitLine("");
+
+  EmitLine(
+      "float4 XeApplyTextureIntegerScale(float4 value, uint scale_bits) {");
+  Indent();
+  EmitLine("if (scale_bits == 0u) { return value; }");
+  EmitLine(
+      "uint4 scale_bits4 = uint4(scale_bits, scale_bits, scale_bits, "
+      "scale_bits);");
+  EmitLine(
+      "uint4 fields = (scale_bits4 >> uint4(0u, 5u, 10u, 15u)) & "
+      "0x1Fu;");
+  EmitLine("uint4 shifts = (fields & 0xFu) + 1u - (fields >> 4u);");
+  EmitLine("uint4 scale = (uint4(1u, 1u, 1u, 1u) << shifts) - 1u;");
+  EmitLine("return value * float4(scale);");
   Outdent();
   EmitLine("}");
   EmitLine("");

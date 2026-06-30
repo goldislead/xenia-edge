@@ -869,6 +869,17 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
   }
   return descriptor_index;
 }
+
+uint32_t D3D12TextureCache::GetActiveIntegerScaleBits(
+    uint32_t fetch_constant_index) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return 0;
+  }
+  return GetIntegerScaleBits(binding->guest_format, binding->num_format,
+                             binding->host_swizzle, binding->swizzled_signs);
+}
+
 void D3D12TextureCache::PrefetchSamplerParameters(
     const D3D12Shader::SamplerBinding& binding) const {
   swcache::PrefetchL1(&register_file()[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
@@ -914,18 +925,19 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
       binding.mip_filter == xenos::TextureFilter::kUseFetchConst
           ? fetch.mip_filter
           : binding.mip_filter;
+  xenos::AnisoFilter aniso_filter =
+      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+          ? fetch.aniso_filter
+          : binding.aniso_filter;
+  // Force base mag/min/mip and disable anistropy for point-only texture formats
+  ClampFiltersForFormat(fetch.format, mag_filter, min_filter, mip_filter,
+                        aniso_filter);
   bool min_mag_linear = (mag_filter == xenos::TextureFilter::kLinear) &&
                         (min_filter == xenos::TextureFilter::kLinear);
   bool mip_filter_bilinear_or_trilinear =
       mip_filter == xenos::TextureFilter::kPoint ||
       mip_filter == xenos::TextureFilter::kLinear;
   bool mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
-  // high cache miss count here, prefetch fetch earlier
-  //  TODO(Triang3l): Disable filtering for texture formats not supporting it.
-  xenos::AnisoFilter aniso_filter =
-      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
-          ? fetch.aniso_filter
-          : binding.aniso_filter;
   // Apply anisotropic override, but only for mipmapped textures
   // that are already using bilinear/trilinear filtering.
   if (cvars::anisotropic_override > -1 && cvars::anisotropic_override < 6 &&

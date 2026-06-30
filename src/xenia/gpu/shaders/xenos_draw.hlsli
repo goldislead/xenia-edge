@@ -22,6 +22,7 @@ cbuffer xe_system_cbuffer : register(b0) {
   float2 xe_point_screen_diameter_to_ndc_radius;
 
   uint4 xe_texture_swizzled_signs[2];
+  uint4 xe_texture_integer_scale_bits[8];
 
   uint xe_textures_resolution_scaled;
   uint2 xe_sample_count_log2;

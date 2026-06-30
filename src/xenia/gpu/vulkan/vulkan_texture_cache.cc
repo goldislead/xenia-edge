@@ -654,6 +654,16 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
   }
 }
 
+uint32_t VulkanTextureCache::GetActiveIntegerScaleBits(
+    uint32_t fetch_constant_index) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding) {
+    return 0;
+  }
+  return GetIntegerScaleBits(binding->guest_format, binding->num_format,
+                             binding->host_swizzle, binding->swizzled_signs);
+}
+
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     const VulkanShader::SamplerBinding& binding) const {
   const auto& regs = register_file();
@@ -680,16 +690,22 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       binding.mag_filter == xenos::TextureFilter::kUseFetchConst
           ? fetch.mag_filter
           : binding.mag_filter;
-  parameters.mag_linear = mag_filter == xenos::TextureFilter::kLinear;
   xenos::TextureFilter min_filter =
       binding.min_filter == xenos::TextureFilter::kUseFetchConst
           ? fetch.min_filter
           : binding.min_filter;
-  parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
   xenos::TextureFilter mip_filter =
       binding.mip_filter == xenos::TextureFilter::kUseFetchConst
           ? fetch.mip_filter
           : binding.mip_filter;
+  xenos::AnisoFilter aniso_filter =
+      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+          ? fetch.aniso_filter
+          : binding.aniso_filter;
+  ClampFiltersForFormat(fetch.format, mag_filter, min_filter, mip_filter,
+                        aniso_filter);
+  parameters.mag_linear = mag_filter == xenos::TextureFilter::kLinear;
+  parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
   parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear) {
     // Check if the texture is actually filterable on the host.
@@ -712,12 +728,9 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       parameters.mag_linear = 0;
       parameters.min_linear = 0;
       parameters.mip_linear = 0;
+      aniso_filter = xenos::AnisoFilter::kDisabled;
     }
   }
-  xenos::AnisoFilter aniso_filter =
-      binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
-          ? fetch.aniso_filter
-          : binding.aniso_filter;
   parameters.mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
 
   uint32_t mip_min_level, mip_max_level;

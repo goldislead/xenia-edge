@@ -214,3 +214,26 @@ DEFINE_bool(use_fuzzy_alpha_epsilon, false,
             "Use approximate compare for alpha values to prevent flickering on "
             "NVIDIA graphics cards",
             "GPU");
+
+DEFINE_bool(
+    texture_clamp_point_only_filters, true,
+    "Force point filtering for formats that real hardware doesn't filter "
+    "directly, mostly ordinary float/depth formats. Also disables anisotropy "
+    "for those fetches. Disable to let the host use the requested filter.",
+    "GPU");
+
+DEFINE_bool(
+    resolve_check_number_format, false,
+    "Require the resolve dest number format to match before taking the raw "
+    "fast copy. Mismatches use the full resolve shader so signed/integer "
+    "dests are repacked instead of blindly copied. Off by default while this "
+    "gets more testing.",
+    "GPU");
+
+DEFINE_bool(
+    gamma_decode_pwl_resolve, true,
+    "Decode 8_8_8_8_GAMMA through the Xenos PWL curve before MSAA averaging "
+    "or conversion, then encode again for gamma dests. This avoids averaging "
+    "gamma encoded bytes as if they were linear color. Disable for the old "
+    "behavior.",
+    "GPU");

@@ -93,6 +93,7 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension,
                                               bool is_signed);
+  uint32_t GetActiveIntegerScaleBits(uint32_t fetch_constant_index) const;
 
   // Descriptor set (kStorageBufferCompute layout) binding the whole shared
   // memory buffer for compute load/store, or VK_NULL_HANDLE if the buffer
@@ -246,10 +247,10 @@ class VulkanTextureCache final : public TextureCache {
   struct HostFormat {
     LoadShaderIndex load_shader;
     // Do NOT add integer formats to this - they are not filterable, can only be
-    // read with ImageFetch, not ImageSample! If any game is seen using
-    // num_format 1 for fixed-point formats (for floating-point, it's normally
-    // set to 1 though), add a constant buffer containing multipliers for the
-    // textures and multiplication to the tfetch implementation.
+    // read with ImageFetch, not ImageSample! Games that fetch fixed-point
+    // formats are handled after sampling by scaling the normalized host value
+    // back to the guest integer range (see GetIntegerScaleBits). Keep these as
+    // sampled normalized views.
     VkFormat format;
     // Whether the format is block-compressed on the host (the host block size
     // matches the guest format block size in this case), and isn't decompressed

@@ -518,6 +518,11 @@ class TextureCache {
 
   struct TextureBinding {
     TextureKey key;
+    // The original guest format and num_format are kept so an integer
+    // num_format fetch can restore the guest integer range
+    // (see GetIntegerScaleBits).
+    xenos::TextureFormat guest_format;
+    TextureNumFormat num_format;
     // Destination swizzle merged with guest to host format swizzle.
     uint32_t host_swizzle;
     // Packed TextureSign values, 2 bit per each component, with guest-side
@@ -595,6 +600,12 @@ class TextureCache {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];
   }
+  // Integer num_format on fixed textures. Returns the packed scale used by the
+  // shader to restore guest integer units from normalized samples.
+  static uint32_t GetIntegerScaleBits(xenos::TextureFormat guest_format,
+                                      TextureNumFormat num_format,
+                                      uint32_t host_swizzle,
+                                      uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
   // Writes the texture data (for base, mips or both - but not neither) from the

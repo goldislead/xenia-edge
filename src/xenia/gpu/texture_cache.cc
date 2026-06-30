@@ -338,6 +338,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
+    xenos::TextureFormat old_guest_format = binding.guest_format;
+    TextureNumFormat old_num_format = binding.num_format;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     const bool binding_was_outdated =
         old_key.is_valid && IsBindingOutdatedForUse(binding);
@@ -350,6 +352,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       binding.Reset();
       continue;
     }
+    // The key is just storage. Guest format and num_format are kept beside it
+    // because views/shaders may need the original meaning, not just the layout.
+    binding.guest_format = fetch.format;
+    binding.num_format = GetNumFormat(fetch.num_format);
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle =
         GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
@@ -366,7 +372,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         texture_util::IsAnySignNotSigned(binding.swizzled_signs);
     bool any_sign_is_signed =
         texture_util::IsAnySignSigned(binding.swizzled_signs);
-    if (key_changed || binding.host_swizzle != old_host_swizzle ||
+    if (key_changed || binding.guest_format != old_guest_format ||
+        binding.num_format != old_num_format ||
+        binding.host_swizzle != old_host_swizzle ||
         any_sign_is_not_signed != any_sign_was_not_signed ||
         any_sign_is_signed != any_sign_was_signed) {
       bindings_changed |= index_bit;
@@ -727,6 +735,31 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   texture->LogAction("Created");
   return texture;
 }
+
+uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
+                                           TextureNumFormat num_format,
+                                           uint32_t host_swizzle,
+                                           uint8_t swizzled_signs) {
+  if (num_format != TextureNumFormat::kInteger ||
+      !FormatInfo::Get(guest_format)->fixed) {
+    return 0;
+  }
+
+  uint32_t scale_bits = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t source_component = (host_swizzle >> (i * 3)) & 0b111;
+    if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
+      continue;
+    }
+    xenos::TextureSign sign =
+        xenos::TextureSign((swizzled_signs >> (i * 2)) & 0b11);
+    scale_bits |= GetFetchIntegerScaleBits(guest_format, source_component, sign)
+                  << (i * 5);
+  }
+
+  return scale_bits;
+}
+
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
   assert_true(n_textures <= 64);
   if (n_textures < 2) {

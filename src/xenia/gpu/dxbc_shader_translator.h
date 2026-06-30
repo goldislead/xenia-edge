@@ -114,7 +114,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260608;
+    static constexpr uint32_t kVersion = 0x20260627;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -326,6 +326,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
     uint32_t texture_swizzled_signs[8];
+    // Integer num_format on fixed textures. Each dword packs the scale needed
+    // to turn normalized host samples back into guest integer values.
+    // bits 0:3 = component_bits - 1; bit 4 = signed; zero means 1x
+    uint32_t texture_integer_scale_bits[32];
 
     // Whether each texture in fetch constants contains resolution-scaled data.
     uint32_t textures_resolution_scaled;
@@ -436,6 +440,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kPointScreenDiameterToNDCRadius,
 
       kTextureSwizzledSigns,
+      kTextureIntegerScaleBits,
 
       kTexturesResolutionScaled,
       kSampleCountLog2,
