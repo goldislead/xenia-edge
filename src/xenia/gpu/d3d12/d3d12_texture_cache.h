@@ -816,10 +816,10 @@ class D3D12TextureCache final : public TextureCache {
   bool bindless_resources_used_;
 
   // Bit per guest format: whether the unsigned / signed host SRV format
-  // supports linear filtering on this device (queried in Initialize). Used to
-  // fall back to point sampling for formats the device can't filter.
-  uint64_t host_format_linear_filterable_unsigned_ = 0;
-  uint64_t host_format_linear_filterable_signed_ = 0;
+  // supports filtering on this device (queried in Initialize). Used to fall
+  // back to point sampling for formats the device can't filter.
+  uint64_t host_format_filterable_unsigned_ = 0;
+  uint64_t host_format_filterable_signed_ = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount>

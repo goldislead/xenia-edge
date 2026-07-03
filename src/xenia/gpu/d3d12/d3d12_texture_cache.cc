@@ -172,10 +172,11 @@ bool D3D12TextureCache::Initialize() {
   }
   scaled_resolve_heap_count_ = 0;
 
-  // Query which host SRV formats the device can linearly filter, so samplers
-  // can fall back to point sampling for the ones it can't (mirrors the Vulkan
-  // backend's linear_filterable check).
-  auto is_linear_filterable = [device](DXGI_FORMAT format) {
+  // Query which host SRV formats the device can filter, so samplers can fall
+  // back to point sampling for the ones it can't. Vulkan does the same thing,
+  // but D3D12 has no separate linear filter bit. SHADER_SAMPLE covers
+  // sampling and filtering together.
+  auto is_filterable = [device](DXGI_FORMAT format) {
     if (format == DXGI_FORMAT_UNKNOWN) {
       return false;
     }
@@ -189,11 +190,11 @@ bool D3D12TextureCache::Initialize() {
   };
   for (uint32_t i = 0; i < xe::countof(host_formats_); ++i) {
     uint64_t format_bit = uint64_t(1) << i;
-    if (is_linear_filterable(host_formats_[i].dxgi_format_unsigned)) {
-      host_format_linear_filterable_unsigned_ |= format_bit;
+    if (is_filterable(host_formats_[i].dxgi_format_unsigned)) {
+      host_format_filterable_unsigned_ |= format_bit;
     }
-    if (is_linear_filterable(host_formats_[i].dxgi_format_signed)) {
-      host_format_linear_filterable_signed_ |= format_bit;
+    if (is_filterable(host_formats_[i].dxgi_format_signed)) {
+      host_format_filterable_signed_ |= format_bit;
     }
   }
 
@@ -970,28 +971,21 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
   }
   parameters.mip_base_map = mip_base_map;
 
-  // Fall back to point sampling for host formats the device can't linearly
-  // filter (matches the Vulkan backend).
-  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
-      parameters.aniso_filter != xenos::AnisoFilter::kDisabled) {
+  // Fall back to point sampling for host formats the device can't filter
+  // (matches the Vulkan backend). Anistropy is left untouched, as it is there.
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear) {
     TextureKey texture_key;
     uint8_t texture_swizzled_signs;
     BindingInfoFromFetchConstant(fetch, texture_key, &texture_swizzled_signs);
-    bool linear_filterable = texture_key.is_valid;
-    if (linear_filterable) {
-      uint64_t format_bit = uint64_t(1) << uint32_t(texture_key.format);
-      if ((texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
-           !(host_format_linear_filterable_unsigned_ & format_bit)) ||
-          (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
-           !(host_format_linear_filterable_signed_ & format_bit))) {
-        linear_filterable = false;
-      }
-    }
-    if (!linear_filterable) {
+    uint64_t format_bit = uint64_t(1) << uint32_t(texture_key.format);
+    if (!texture_key.is_valid ||
+        (texture_util::IsAnySignNotSigned(texture_swizzled_signs) &&
+         !(host_format_filterable_unsigned_ & format_bit)) ||
+        (texture_util::IsAnySignSigned(texture_swizzled_signs) &&
+         !(host_format_filterable_signed_ & format_bit))) {
       parameters.mag_linear = 0;
       parameters.min_linear = 0;
       parameters.mip_linear = 0;
-      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
     }
   }
 
