@@ -201,6 +201,15 @@ class DeferredCommandList {
     args.query_index = index;
   }
 
+  void D3DSetPredication(ID3D12Resource* buffer, UINT64 aligned_buffer_offset,
+                         D3D12_PREDICATION_OP operation) {
+    auto& args = *reinterpret_cast<D3DSetPredicationArguments*>(WriteCommand(
+        Command::kD3DSetPredication, sizeof(D3DSetPredicationArguments)));
+    args.buffer = buffer;
+    args.aligned_buffer_offset = aligned_buffer_offset;
+    args.operation = operation;
+  }
+
   void D3DResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type,
                            UINT start_index, UINT query_count,
                            ID3D12Resource* destination_buffer,
@@ -519,6 +528,7 @@ class DeferredCommandList {
     kD3DBeginQuery,
     kD3DEndQuery,
     kD3DResolveQueryData,
+    kD3DSetPredication,
     kD3DIASetIndexBuffer,
     kD3DIASetPrimitiveTopology,
     kD3DIASetVertexBuffers,
@@ -690,6 +700,12 @@ class DeferredCommandList {
   struct D3DWriteBufferImmediateArguments {
     D3D12_GPU_VIRTUAL_ADDRESS dest;
     UINT value;
+  };
+
+  struct D3DSetPredicationArguments {
+    ID3D12Resource* buffer;
+    UINT64 aligned_buffer_offset;
+    D3D12_PREDICATION_OP operation;
   };
 
   struct DebugMarkerHeader {

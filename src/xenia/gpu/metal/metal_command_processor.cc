@@ -1936,10 +1936,15 @@ Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return result;
 }
 
-bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
-                                      uint32_t index_count,
-                                      IndexBufferInfo* index_buffer_info,
-                                      bool major_mode_explicit) {
+bool MetalCommandProcessor::IssueDraw(
+    xenos::PrimitiveType primitive_type, uint32_t index_count,
+    IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+    VIZQueryDrawResult* viz_query_draw_result) {
+  if (viz_query_draw_result) {
+    // Metal VIZ is a no-op.
+    *viz_query_draw_result = VIZQueryDrawResult::kFallback;
+    return true;
+  }
   const RegisterFile& regs = *register_file_;
   uint32_t normalized_color_mask = 0;
 

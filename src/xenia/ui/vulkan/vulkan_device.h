@@ -160,6 +160,10 @@ class VulkanDevice {
     bool fragmentShaderSampleInterlock = false;
     bool fragmentShaderPixelInterlock = false;
 
+    // VK_EXT_conditional_rendering (#82)
+
+    bool conditionalRendering = false;
+
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 
     bool shaderDemoteToHelperInvocation = false;
@@ -231,6 +235,8 @@ class VulkanDevice {
     // VK_EXT_device_fault (#342). For driver-side fault description after
     // VK_ERROR_DEVICE_LOST.
     bool ext_EXT_device_fault = false;
+    // VK_EXT_conditional_rendering (#82). Predication query draw skipping.
+    bool ext_EXT_conditional_rendering = false;
   };
 
   const Extensions& extensions() const { return extensions_; }
@@ -254,6 +260,8 @@ class VulkanDevice {
 #include "xenia/ui/vulkan/functions/device_1_3_khr_maintenance4.inc"
     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
 #include "xenia/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc"
+    // VK_EXT_conditional_rendering (#82)
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 #undef XE_UI_VULKAN_FUNCTION
   };

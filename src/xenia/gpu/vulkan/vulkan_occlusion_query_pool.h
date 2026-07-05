@@ -7,8 +7,8 @@
  ******************************************************************************
  */
 
-#ifndef XENIA_GPU_VULKAN_VULKAN_ZPD_QUERY_POOL_H_
-#define XENIA_GPU_VULKAN_VULKAN_ZPD_QUERY_POOL_H_
+#ifndef XENIA_GPU_VULKAN_VULKAN_OCCLUSION_QUERY_POOL_H_
+#define XENIA_GPU_VULKAN_VULKAN_OCCLUSION_QUERY_POOL_H_
 
 #include <cstdint>
 #include <vector>
@@ -28,30 +28,37 @@ namespace vulkan {
 
 class DeferredCommandBuffer;
 
-// Vulkan occlusion query pool for ZPD reports. Queries live in VkQueryPool,
-// results are copied to a persistent buffer via vkCmdCopyQueryPoolResults.
-// vkCmdBeginQuery is only valid inside a render pass, queries get deferred
-// when no pass is open and segments split at pass boundaries.
-// Requires VK_EXT_host_query_reset (1.2 core) so slots can be reset on the
-// CPU at release time, no paired vkCmdEndQuery needed, and also allows
-// DiscardHostZPDQuery work outside a pass.
+// Vulkan occlusion query pool, used by ZPD and VIZ through separate instances.
+// Query results copy into a persistent readback buffer.
+//
+// vkCmdBeginQuery is only valid inside a render pass, so callers split segments
+// at pass boundaries and defer opens when no pass is active. Host query reset
+// lets released slots reset without a paired vkCmdEndQuery.
 //
 // VK_QUERY_RESULT_WAIT_BIT in the copy removes the need for a separate
 // availability check. Transfer barrier before InvalidateReadback covers non-
 // coherent memory.
 //
 // Per-slot generation counter has same purpose as D3D12 pool.
-class VulkanZPDQueryPool {
+class VulkanOcclusionQueryPool {
  public:
-  VulkanZPDQueryPool() = default;
-  VulkanZPDQueryPool(const VulkanZPDQueryPool&) = delete;
-  VulkanZPDQueryPool& operator=(const VulkanZPDQueryPool&) = delete;
-  ~VulkanZPDQueryPool() { Shutdown(); }
+  // ZPD asks for precise sample counts. VIZ only needs zero vs nonzero.
+  explicit VulkanOcclusionQueryPool(bool precise_queries)
+      : precise_queries_(precise_queries) {}
+  VulkanOcclusionQueryPool(const VulkanOcclusionQueryPool&) = delete;
+  VulkanOcclusionQueryPool& operator=(const VulkanOcclusionQueryPool&) = delete;
+  ~VulkanOcclusionQueryPool() { Shutdown(); }
 
   bool EnsureInitialized(const ui::vulkan::VulkanDevice* vulkan_device,
                          uint32_t requested_capacity, bool can_recreate,
                          bool initialize_fsi_counter = false);
   void Shutdown();
+
+  bool EnsureVIZFSICounters(
+      const ui::vulkan::VulkanDevice* vulkan_device,
+      uint32_t requested_capacity, bool can_recreate,
+      VkDescriptorSet shared_memory_and_edram_descriptor_set);
+  void ShutdownVIZ();
 
   bool is_initialized() const {
     return query_pool_ != VK_NULL_HANDLE &&
@@ -75,6 +82,8 @@ class VulkanZPDQueryPool {
 
   VkBuffer fsi_counter_buffer() const { return fsi_counter_buffer_; }
 
+  VkQueryPool query_pool() const { return query_pool_; }
+
   bool has_free_indices() const { return !free_indices_.empty(); }
 
   bool AcquireQueryIndex(uint32_t& query_index, uint32_t& query_generation);
@@ -96,6 +105,8 @@ class VulkanZPDQueryPool {
                                  bool uses_fsi_counter = false) const;
 
  private:
+  const bool precise_queries_;
+
   const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
 
   VkQueryPool query_pool_ = VK_NULL_HANDLE;
@@ -113,6 +124,8 @@ class VulkanZPDQueryPool {
   VkDeviceMemory fsi_counter_readback_memory_ = VK_NULL_HANDLE;
   uint32_t* fsi_counter_readback_mapping_ = nullptr;
   bool fsi_counter_readback_is_coherent_ = true;
+  VkBuffer viz_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize viz_fsi_counter_descriptor_range_ = 0;
 
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
@@ -137,4 +150,4 @@ class VulkanZPDQueryPool {
 }  // namespace gpu
 }  // namespace xe
 
-#endif  // XENIA_GPU_VULKAN_VULKAN_ZPD_QUERY_POOL_H_
+#endif  // XENIA_GPU_VULKAN_VULKAN_OCCLUSION_QUERY_POOL_H_

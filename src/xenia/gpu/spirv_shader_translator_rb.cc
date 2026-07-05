@@ -743,7 +743,14 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       }
     }
 
-    FSI_AddPassedMSAASamplesToZPD();
+    FSI_AddPassedMSAASamplesToCounter(buffer_zpd_fsi_counter_,
+                                      kSystemConstantZpdFsiCounterIndex);
+    // VIZ query draws use the same post depth sample count. Their normalized
+    // state disables stencil and depth writes, leaving just the depth test.
+    if (edram_viz_fsi_counter_) {
+      FSI_AddPassedMSAASamplesToCounter(buffer_viz_fsi_counter_,
+                                        kSystemConstantVizFsiCounterIndex);
+    }
 
     if (color_write_depth_stencil_condition != spv::NoResult) {
       // Skip all color operations if the pixel has failed the tests entirely.
@@ -1951,14 +1958,14 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address,
                                sample_offset);
 }
 
-void SpirvShaderTranslator::FSI_AddPassedMSAASamplesToZPD() {
+void SpirvShaderTranslator::FSI_AddPassedMSAASamplesToCounter(
+    spv::Id counter_buffer, int counter_index_member) {
   assert_true(edram_fragment_shader_interlock_);
-  assert_true(buffer_zpd_fsi_counter_ != spv::NoResult);
+  assert_true(counter_buffer != spv::NoResult);
 
-  // UINT32_MAX means no ZPD segment is currently open for this draw.
+  // UINT32_MAX means no counter slot is open for this draw.
   id_vector_temp_.clear();
-  id_vector_temp_.push_back(
-      builder_->makeIntConstant(kSystemConstantZpdFsiCounterIndex));
+  id_vector_temp_.push_back(builder_->makeIntConstant(counter_index_member));
   spv::Id counter_index = builder_->createLoad(
       builder_->createAccessChain(spv::StorageClassUniform,
                                   uniform_system_constants_, id_vector_temp_),
@@ -1993,11 +2000,11 @@ void SpirvShaderTranslator::FSI_AddPassedMSAASamplesToZPD() {
   id_vector_temp_.push_back(
       builder_->createUnaryOp(spv::OpBitcast, type_int_, counter_index));
   spv::Id counter_ptr = builder_->createAccessChain(
-      storage_class, buffer_zpd_fsi_counter_, id_vector_temp_);
+      storage_class, counter_buffer, id_vector_temp_);
 
   // Add the number of samples that survived final depth/stencil for this
   // fragment to the active query slot, which is copied to the ZPD readback
-  // buffer when the query segment is closed.
+  // buffer and/or VIZ when their query segment is closed.
   builder_->createQuadOp(spv::OpAtomicIAdd, type_uint_, counter_ptr,
                          const_scope_device, const_semantics_relaxed,
                          passed_sample_count);

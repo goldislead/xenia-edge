@@ -25,6 +25,7 @@ DECLARE_bool(readback_memexport_fast);
 DECLARE_string(readback_resolve);
 DECLARE_bool(guest_display_refresh_cap);
 DECLARE_string(occlusion_query);
+DECLARE_bool(viz_query);
 
 namespace xe {
 namespace ui {
@@ -90,6 +91,9 @@ void ImGuiPerformanceDialog::LoadCurrentSettings() {
 
   // Load Frame Rate Limit (FPS, 0 = unlimited)
   framerate_limit_ = static_cast<int>(cvars::framerate_limit);
+
+  // Load VIZ predication queries setting
+  viz_query_ = cvars::viz_query;
 }
 
 void ImGuiPerformanceDialog::ShowNotification(const std::string& title,
@@ -213,6 +217,13 @@ void ImGuiPerformanceDialog::OnClearMemoryPageStateChanged(bool enabled) {
   config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
                                 "clear_memory_page_state", enabled);
   ShowNotification("Clear Memory Page State", enabled ? "Enabled" : "Disabled");
+}
+
+void ImGuiPerformanceDialog::OnVIZQueryChanged(bool enabled) {
+  gpu::SaveGPUSetting(gpu::GPUSetting::VIZQuery, enabled);
+  config::SaveGameConfigSetting(emulator_window_->emulator(), "GPU",
+                                "viz_query", enabled);
+  ShowNotification("VIZ Predication Queries", enabled ? "Enabled" : "Disabled");
 }
 
 void ImGuiPerformanceDialog::OnFramerateLimitChanged(int value) {
@@ -375,10 +386,6 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
     ImGui::PopID();
     ImGui::Unindent(10);
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
     // Display section
     ImGui::PushStyleColor(ImGuiCol_Text, xbox_green);
     ImGui::Text("Display");
@@ -416,6 +423,9 @@ void ImGuiPerformanceDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::Checkbox("Clear memory page state on GPU cache invalidation",
                         &clear_memory_page_state_)) {
       OnClearMemoryPageStateChanged(clear_memory_page_state_);
+    }
+    if (ImGui::Checkbox("Enable VIZ predication queries", &viz_query_)) {
+      OnVIZQueryChanged(viz_query_);
     }
 
     ImGui::Unindent(10);

@@ -72,6 +72,17 @@ DEFINE_string(
     "         Most accurate, but may be somewhat less performant.",
     "GPU");
 
+DEFINE_bool(
+    viz_query, false,
+    "Enables VIZ_QUERY (VIZ) visibility tests for draws with a VIZ token.\n"
+    "VIZ is visibility testing for conditional rendering / predication.\n"
+    "Titles mostly use it to combat overdraw, but it can also be used for\n"
+    "post-process effects like lens flares. When enabled, binary occlusion\n"
+    "queries feed predicates which, when available, can skip draws that\n"
+    "aren't visible. Since VIZ is primarily a GPU mechanism, most readback\n"
+    "sync is avoided, with minimal impact to performance.",
+    "GPU");
+
 DEFINE_string(
     readback_resolve, "fast",
     "Controls CPU readback of render-to-texture resolve results.\n"
@@ -125,6 +136,9 @@ void SaveGPUSetting(GPUSetting setting, uint64_t value) {
     case GPUSetting::ReadbackMemexportFast:
       OVERRIDE_bool(readback_memexport_fast, static_cast<bool>(value));
       break;
+    case GPUSetting::VIZQuery:
+      OVERRIDE_bool(viz_query, static_cast<bool>(value));
+      break;
   }
 }
 
@@ -136,6 +150,8 @@ bool GetGPUSetting(GPUSetting setting) {
       return cvars::readback_memexport;
     case GPUSetting::ReadbackMemexportFast:
       return cvars::readback_memexport_fast;
+    case GPUSetting::VIZQuery:
+      return cvars::viz_query;
     default:
       return false;
   }
@@ -157,6 +173,26 @@ static ReadbackResolveMode ParseReadbackResolveMode() {
 
 static void SetReadbackResolveCvar(const std::string& mode) {
   OVERRIDE_string(readback_resolve, mode);
+}
+
+static void SaveGPUConfigString(kernel::KernelState* kernel_state,
+                                const char* name, const char* value) {
+  uint32_t title_id = kernel_state ? kernel_state->title_id() : 0;
+  if (title_id == 0) {
+    return;
+  }
+
+  toml::table config_table = config::LoadGameConfig(title_id);
+  if (!config_table.contains("GPU")) {
+    config_table.insert("GPU", toml::table{});
+  }
+
+  auto* gpu_table = config_table["GPU"].as_table();
+  if (gpu_table) {
+    gpu_table->insert_or_assign(name, value);
+  }
+
+  config::SaveGameConfig(title_id, config_table);
 }
 
 static ZPDMode ParseZPDMode() {
@@ -371,23 +407,7 @@ void CommandProcessor::SetReadbackResolveMode(ReadbackResolveMode mode) {
       break;
   }
   SetReadbackResolveCvar(mode_str);
-
-  // Save to per-game config if a title is loaded
-  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
-  if (title_id != 0) {
-    toml::table config_table = config::LoadGameConfig(title_id);
-
-    if (!config_table.contains("GPU")) {
-      config_table.insert("GPU", toml::table{});
-    }
-
-    auto* gpu_table = config_table["GPU"].as_table();
-    if (gpu_table) {
-      gpu_table->insert_or_assign("readback_resolve", mode_str);
-    }
-
-    config::SaveGameConfig(title_id, config_table);
-  }
+  SaveGPUConfigString(kernel_state_, "readback_resolve", mode_str);
 }
 
 void CommandProcessor::SetZPDMode(ZPDMode mode) {
@@ -417,23 +437,7 @@ void CommandProcessor::SetZPDMode(ZPDMode mode) {
       break;
   }
   SetZPDModeCvar(mode_str);
-
-  // Save to per-game config if a title is loaded.
-  uint32_t title_id = kernel_state_ ? kernel_state_->title_id() : 0;
-  if (title_id != 0) {
-    toml::table config_table = config::LoadGameConfig(title_id);
-
-    if (!config_table.contains("GPU")) {
-      config_table.insert("GPU", toml::table{});
-    }
-
-    auto* gpu_table = config_table["GPU"].as_table();
-    if (gpu_table) {
-      gpu_table->insert_or_assign("occlusion_query", mode_str);
-    }
-
-    config::SaveGameConfig(title_id, config_table);
-  }
+  SaveGPUConfigString(kernel_state_, "occlusion_query", mode_str);
 }
 
 void CommandProcessor::SetDesiredSwapPostEffect(
@@ -617,11 +621,15 @@ bool CommandProcessor::Restore(ByteStream* stream) {
 }
 
 bool CommandProcessor::SetupContext() {
+  ResetVIZState();
   ResetZPDState();
   return true;
 }
 
-void CommandProcessor::ShutdownContext() { ResetZPDState(); }
+void CommandProcessor::ShutdownContext() {
+  ResetVIZState();
+  ResetZPDState();
+}
 
 uint32_t CommandProcessor::GuestReadPtrOffset(int32_t offset) const {
   return uint32_t(reader_.read_ptr() -
@@ -1038,9 +1046,10 @@ void CommandProcessor::MakeCoherent() {
 
 void CommandProcessor::PrepareForWait() {
   trace_writer_.Flush();
-  // Only refresh completion if there is a strict ZPD retire pending so
-  // PumpPendingRetire sees the latest progress without adding extra overhead.
-  if (zpd_pending_retire_handle_ != kInvalidReportHandle) {
+  // Poll once if the guest is likely waiting on query progress. ZPD has a
+  // retire handle. VIZ only has pending backend resolves.
+  if (zpd_pending_retire_handle_ != kInvalidReportHandle ||
+      !viz_resolves_in_flight_.empty()) {
     PollCompletedSubmission();
   }
   // Give strict ZPD a chance to retire a pending report before the guest's
@@ -1060,6 +1069,328 @@ void CommandProcessor::InitializeTrace() {
 
   trace_writer_.WriteGammaRamp(gamma_ramp_256_entry_table(),
                                gamma_ramp_pwl_rgb(), gamma_ramp_rw_component_);
+}
+
+void CommandProcessor::BeginVIZQuery(uint32_t id) {
+  // Any open segment belongs to a previous slot sequence.
+  if (viz_segment_.active) {
+    CloseVIZSegment();
+  }
+
+  VIZSlot& slot = viz_slots_[id];
+  ++viz_stats_.queries_begun;
+
+  const uint64_t generation = slot.slot_sequence_id + 1;
+  slot = {};
+  slot.slot_sequence_id = generation;
+  slot.has_result = false;
+  slot.visible = true;
+  slot.active = true;
+
+  // BEGIN resets the latch for this ID while the status bit stays visible.
+  // Draws carrying the token only start culling once END resolves the answer.
+  SetVIZStatus(id, true);
+}
+
+void CommandProcessor::EndVIZQuery(uint32_t id) {
+  VIZSlot& slot = viz_slots_[id];
+  const uint64_t generation = slot.slot_sequence_id;
+
+  if (viz_segment_.active && viz_segment_.slot_id == id &&
+      viz_segment_.slot_sequence_id == generation) {
+    CloseVIZSegment();
+  }
+  slot.active = false;
+
+  if (slot.has_result) {
+    return;
+  }
+
+  if (!slot.draw_seen) {
+    // No draw reached the backend while the sequence was open.
+    // This is a real not-visible.
+    ResolveVIZ(id, generation, false);
+    return;
+  }
+
+  TryResolveVIZ(id);
+}
+
+void CommandProcessor::ResolveVIZ(uint32_t id, uint64_t generation,
+                                  bool visible) {
+  // Only the first result for the sequence counts.
+  // Anything from an already recycled ID is dropped here.
+  VIZSlot& slot = viz_slots_[id];
+  if (slot.slot_sequence_id != generation || slot.has_result) {
+    return;
+  }
+
+  slot.has_result = true;
+  slot.visible = visible;
+  slot.active = false;
+  slot.draw_seen = false;
+
+  if (visible) {
+    ++viz_stats_.resolved_visible;
+  } else {
+    ++viz_stats_.resolved_hidden;
+  }
+
+  SetVIZStatus(id, visible);
+}
+
+void CommandProcessor::UpdateVIZSegment() {
+  uint32_t id = 0;
+  uint64_t generation = 0;
+  if (!cvars::viz_query || !GetActiveVIZQuery(id, generation)) {
+    return;
+  }
+
+  if (viz_segment_.active) {
+    if (viz_segment_.slot_id == id &&
+        viz_segment_.slot_sequence_id == generation) {
+      return;
+    }
+    CloseVIZSegment();
+  }
+
+  VIZSlot& slot = viz_slots_[id];
+  const QueryOpenResult open_result = OpenVIZQuery(id, generation);
+  if (open_result != QueryOpenResult::kOpened) {
+    if (open_result != QueryOpenResult::kDeferred) {
+      // The draw failed, so nothing measured it.
+      // Keep the generation visible instead of letting a failure equal hidden.
+      if (!slot.has_fallback) {
+        slot.has_fallback = true;
+        ++viz_stats_.fallback_sequences;
+      }
+    }
+    return;
+  }
+
+  if (slot.has_segments) {
+    ++viz_stats_.segment_splits;
+  }
+  slot.has_segments = true;
+  viz_segment_.slot_id = id;
+  viz_segment_.slot_sequence_id = generation;
+  viz_segment_.active = true;
+}
+
+void CommandProcessor::CloseVIZSegment() {
+  if (!viz_segment_.active) {
+    return;
+  }
+
+  const uint32_t id = viz_segment_.slot_id;
+  const uint64_t generation = viz_segment_.slot_sequence_id;
+  viz_segment_ = {};
+
+  VIZSlot& slot = viz_slots_[id];
+  if (!CloseVIZQuery(id, generation)) {
+    // The segment's result is gone. The draws it covered still ran, so the
+    // sequence can only stay conservatively visible.
+    if (slot.slot_sequence_id == generation && !slot.has_fallback) {
+      slot.has_fallback = true;
+      ++viz_stats_.fallback_sequences;
+    }
+    return;
+  }
+
+  if (slot.slot_sequence_id == generation) {
+    ++slot.pending_segments;
+  }
+}
+
+void CommandProcessor::OnVIZResolved(uint32_t id, uint64_t generation,
+                                     bool visible) {
+  VIZSlot& slot = viz_slots_[id];
+  if (slot.slot_sequence_id != generation || slot.has_result) {
+    return;
+  }
+
+  if (slot.pending_segments) {
+    --slot.pending_segments;
+  }
+
+  slot.accumulated_visible |= visible;
+  TryResolveVIZ(id);
+}
+
+void CommandProcessor::TryResolveVIZ(uint32_t id) {
+  const VIZSlot& slot = viz_slots_[id];
+  // Neither answer resolves while the query is open or segments are still
+  // pending. A fallback also blocks not-visible, since part of the query was
+  // never measured.
+  if (slot.has_result || slot.active || slot.pending_segments != 0 ||
+      !slot.has_segments || (!slot.accumulated_visible && slot.has_fallback)) {
+    return;
+  }
+
+  ResolveVIZ(id, slot.slot_sequence_id, slot.accumulated_visible);
+}
+
+bool CommandProcessor::GetVIZResolveSubmission(uint32_t id, uint64_t generation,
+                                               uint64_t& submission_out) const {
+  submission_out = 0;
+  bool found = false;
+  for (const PendingVIZResolve& resolve : viz_resolves_in_flight_) {
+    if (resolve.slot_id == id && resolve.slot_sequence_id == generation &&
+        (!found || resolve.end_submission > submission_out)) {
+      submission_out = resolve.end_submission;
+      found = true;
+    }
+  }
+
+  return found;
+}
+
+void CommandProcessor::ArmVIZPredicate(uint32_t id, uint64_t generation,
+                                       uint32_t query_index, bool is_fsi) {
+  if (viz_slots_[id].slot_sequence_id != generation) {
+    return;
+  }
+
+  VIZSlot& slot = viz_slots_[id];
+  if (slot.predicate_active || slot.predicate_blocked) {
+    // A second segment means no slot value covers the query anymore, and
+    // nothing later in the sequence can change that.
+    slot.predicate_active = false;
+    slot.predicate_blocked = true;
+    return;
+  }
+
+  slot.predicate_query_index = query_index;
+  slot.predicate_is_fsi = is_fsi;
+  slot.predicate_active = true;
+  slot.predicate_blocked = false;
+}
+
+void CommandProcessor::DisarmVIZPredicate(uint32_t id, uint64_t generation) {
+  if (viz_slots_[id].slot_sequence_id != generation) {
+    return;
+  }
+
+  // Blocked rather than cleared so a later segment can't quietly rearm a
+  // predicate that no longer describes the whole query.
+  VIZSlot& slot = viz_slots_[id];
+  slot.predicate_query_index = UINT32_MAX;
+  slot.predicate_is_fsi = false;
+  slot.predicate_active = false;
+  slot.predicate_blocked = true;
+}
+
+const CommandProcessor::VIZSlot* CommandProcessor::GetVIZPredicate() const {
+  if (!viz_predicate_draw_.active) {
+    return nullptr;
+  }
+
+  const VIZSlot& slot = viz_slots_[viz_predicate_draw_.slot_id];
+  if (!slot.predicate_active ||
+      slot.slot_sequence_id != viz_predicate_draw_.slot_sequence_id) {
+    return nullptr;
+  }
+
+  return &slot;
+}
+
+CommandProcessor::VIZDecision CommandProcessor::GetVIZDecision(uint32_t token) {
+  // PM4_DRAW_INDX uses bit 8 for VIZ and bits 0:5 for the ID.
+  // Pending results stay visible unless an already recorded backend predicate
+  // can cover the draw or an already submitted resolve can be consumed.
+  VIZDecision decision;
+  if (!(token & 0x100)) {
+    return decision;
+  }
+
+  const uint32_t id = token & 0x3F;
+  decision.slot_id = id;
+  ++viz_stats_.token_draws;
+  VIZSlot& slot = viz_slots_[id];
+  decision.slot_sequence_id = slot.slot_sequence_id;
+
+  uint64_t wait_for_submission = 0;
+  if (cvars::viz_query && !slot.has_result &&
+      GetVIZResolveSubmission(id, decision.slot_sequence_id,
+                              wait_for_submission)) {
+    // Pick up resolves that already completed.
+    PumpVIZResolves();
+    if (!slot.has_result &&
+        GetVIZResolveSubmission(id, decision.slot_sequence_id,
+                                wait_for_submission)) {
+      if (!slot.has_fallback && !slot.accumulated_visible &&
+          // Not in the predicate yet.
+          !(viz_segment_.active && viz_segment_.slot_id == id) &&
+          slot.predicate_active &&
+          slot.slot_sequence_id == decision.slot_sequence_id) {
+        decision.use_predicate = true;
+        return decision;
+      }
+      ++viz_stats_.waits;
+      AwaitSubmittedVIZResolve(id, decision.slot_sequence_id);
+    }
+  }
+
+  if (slot.has_result && !slot.visible) {
+    decision.draw = false;
+  }
+
+  return decision;
+}
+
+void CommandProcessor::NoteVIZDraw(bool measured) {
+  uint32_t id = 0;
+  uint64_t generation = 0;
+  if (GetActiveVIZQuery(id, generation)) {
+    VIZSlot& slot = viz_slots_[id];
+    slot.draw_seen = true;
+    if (!measured && !slot.has_fallback) {
+      // Query geometry existed, but we don't have a result.
+      slot.has_fallback = true;
+      ++viz_stats_.fallback_sequences;
+    }
+  }
+}
+
+bool CommandProcessor::GetActiveVIZQuery(uint32_t& id,
+                                         uint64_t& generation) const {
+  const reg::PA_SC_VIZ_QUERY viz_query =
+      register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+  if (!viz_query.viz_query_ena) {
+    return false;
+  }
+
+  id = viz_query.viz_query_id;
+  const VIZSlot& slot = viz_slots_[id];
+  generation = slot.slot_sequence_id;
+  return slot.active;
+}
+
+void CommandProcessor::ResetVIZState() {
+  viz_segment_ = {};
+  viz_predicate_draw_ = {};
+  viz_resolves_in_flight_.clear();
+  for (VIZSlot& slot : viz_slots_) {
+    slot = {};
+    slot.has_result = true;
+    slot.visible = true;
+  }
+  if (register_file_) {
+    register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] = 0;
+    register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] = 0;
+  }
+}
+
+void CommandProcessor::SetVIZStatus(uint32_t id, bool visible) {
+  uint32_t& status =
+      register_file_->values[id < 32 ? XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0
+                                     : XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1];
+  const uint32_t bit = UINT32_C(1) << (id & 31);
+  if (visible) {
+    status |= bit;
+  } else {
+    status &= ~bit;
+  }
 }
 
 CommandProcessor::PendingZPDSlot CommandProcessor::GetPendingZPDSlot(

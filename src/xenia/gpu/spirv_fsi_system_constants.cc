@@ -23,7 +23,8 @@ void WriteFragmentShaderInterlockSystemConstants(
     bool& dirty, const RegisterFile& regs, bool primitive_polygonal,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, uint32_t draw_resolution_scale_x,
-    uint32_t draw_resolution_scale_y, uint32_t zpd_fsi_counter_index) {
+    uint32_t draw_resolution_scale_y, uint32_t zpd_fsi_counter_index,
+    uint32_t viz_fsi_counter_index) {
   using SpirvTranslator = SpirvShaderTranslator;
   auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
@@ -95,6 +96,9 @@ void WriteFragmentShaderInterlockSystemConstants(
 
   dirty |= system_constants.zpd_fsi_counter_index != zpd_fsi_counter_index;
   system_constants.zpd_fsi_counter_index = zpd_fsi_counter_index;
+
+  dirty |= system_constants.viz_fsi_counter_index != viz_fsi_counter_index;
+  system_constants.viz_fsi_counter_index = viz_fsi_counter_index;
 
   uint32_t edram_tile_dwords_scaled =
       xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *

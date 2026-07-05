@@ -492,6 +492,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"texture_integer_scale_bits",
        offsetof(SystemConstants, texture_integer_scale_bits),
        type_uint4_array_8},
+      {"viz_fsi_counter_index",
+       offsetof(SystemConstants, viz_fsi_counter_index), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(xe::countof(system_constants));
@@ -3108,6 +3110,41 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     builder_->addDecoration(buffer_zpd_fsi_counter_, spv::DecorationBinding, 2);
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffer_zpd_fsi_counter_);
+    }
+
+    // VIZ query FSI counter buffer uint[].
+    if (edram_viz_fsi_counter_) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeRuntimeArray(type_uint_));
+      builder_->addDecoration(id_vector_temp_.back(),
+                              spv::DecorationArrayStride, sizeof(uint32_t));
+      spv::Id type_viz_fsi_counter =
+          builder_->makeStructType(id_vector_temp_, "XeVIZFSICounter");
+      builder_->addMemberName(type_viz_fsi_counter, 0, "counter");
+      builder_->addMemberDecoration(type_viz_fsi_counter, 0,
+                                    spv::DecorationCoherent);
+      builder_->addMemberDecoration(type_viz_fsi_counter, 0,
+                                    spv::DecorationRestrict);
+      builder_->addMemberDecoration(type_viz_fsi_counter, 0,
+                                    spv::DecorationOffset, 0);
+      builder_->addDecoration(type_viz_fsi_counter,
+                              features_.spirv_version >= spv::Spv_1_3
+                                  ? spv::DecorationBlock
+                                  : spv::DecorationBufferBlock);
+      buffer_viz_fsi_counter_ =
+          builder_->createVariable(spv::NoPrecision,
+                                   features_.spirv_version >= spv::Spv_1_3
+                                       ? spv::StorageClassStorageBuffer
+                                       : spv::StorageClassUniform,
+                                   type_viz_fsi_counter, "xe_viz_fsi_counter");
+      builder_->addDecoration(buffer_viz_fsi_counter_,
+                              spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(buffer_viz_fsi_counter_, spv::DecorationBinding,
+                              3);
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(buffer_viz_fsi_counter_);
+      }
     }
   }
 

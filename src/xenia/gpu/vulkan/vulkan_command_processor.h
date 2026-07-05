@@ -30,13 +30,13 @@
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
+#include "xenia/gpu/vulkan/vulkan_occlusion_query_pool.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_primitive_processor.h"
 #include "xenia/gpu/vulkan/vulkan_render_target_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_texture_cache.h"
-#include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/ui/vulkan/linked_type_descriptor_set_allocator.h"
@@ -215,6 +215,15 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
 
+  struct SavedRenderPass {
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    const VulkanRenderTargetCache::Framebuffer* framebuffer = nullptr;
+  };
+  // Temporarily leaves the current render pass for commands that can't be
+  // recorded inside it.
+  SavedRenderPass InterruptRenderPass();
+  bool ResumeRenderPass(const SavedRenderPass& saved_render_pass);
+
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -300,8 +309,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
                      uint32_t dword_count) override;
 
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info,
-                 bool major_mode_explicit) override;
+                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                 VIZQueryDrawResult* viz_query_draw_result = nullptr) override;
   bool IssueCopy() override;
 
   void IssueDraw_MemexportReadbackFullPath(uint32_t memexport_total_size);
@@ -494,6 +503,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
 
+  // VIZ_QUERY backend. Base CP owns IDs and predicates, the backend owns the
+  // physical slots and FSI counters.
+  QueryOpenResult OpenVIZQuery(uint32_t id, uint64_t generation) override;
+  bool CloseVIZQuery(uint32_t id, uint64_t generation) override;
+  void PumpVIZResolves() override;
+  // One uint32_t predicate slot per ID.
+  bool EnsureVIZPredicateBuffer();
+  // Records the pending predicate copy outside a render pass.
+  void RecordVIZCopy();
+  // Conditional rendering binding for the active predicate.
+  bool GetVIZPredicateBinding(VkBuffer& buffer_out,
+                              VkDeviceSize& offset_out) const;
+
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info,
                           bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control,
@@ -571,11 +593,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool zpd_fsi_counter_index_force_update_ = true;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
   // Fallback buffer for EDRAM descriptor binding 2.
-  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  VkBuffer fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
   // Currently installed binding 2 buffer.
   VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
   VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+  bool viz_fsi_counter_index_force_update_ = true;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   // Completion of resolve readback copies on the dedicated transfer queue.
@@ -679,7 +702,29 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
+  std::unique_ptr<VulkanOcclusionQueryPool> zpd_host_query_pool_;
+  std::unique_ptr<VulkanOcclusionQueryPool> viz_host_query_pool_;
+
+  // Physical query slot behind the open VIZ segment.
+  struct ActiveVIZQuery {
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool valid = false;
+    bool is_fsi = false;
+  };
+  ActiveVIZQuery viz_active_query_{};
+  VkBuffer viz_predicate_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory viz_predicate_buffer_memory_ = VK_NULL_HANDLE;
+  struct PendingVIZCopy {
+    uint32_t id = 0;
+    uint64_t generation = 0;
+    uint32_t query_index = UINT32_MAX;
+    bool pending = false;
+  };
+  PendingVIZCopy viz_pending_copy_{};
+  // Defers the copy while EndRenderPass is closing the segment.
+  bool viz_defer_copy_ = false;
+  bool AwaitSubmittedVIZResolve(uint32_t id, uint64_t generation) override;
 
   // Deferred query slot releases for discards that happen outside a render
   // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the

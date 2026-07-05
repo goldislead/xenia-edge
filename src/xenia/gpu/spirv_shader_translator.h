@@ -347,6 +347,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // Appended at the very tail (std140 uint4 [35]) so it disturbs neither the
     // xenos_draw.glsli tessellation offsets nor the interpreter [34] slot.
     uint32_t texture_integer_scale_bits[32];
+
+    // Kept last so old SPIR-V indices stay stable when the counter is disabled.
+    uint32_t viz_fsi_counter_index;
   };
 
   // xenos_draw.glsli reads these tessellation fields from the system constants
@@ -460,11 +463,14 @@ class SpirvShaderTranslator : public ShaderTranslator {
                         bool native_2x_msaa_no_attachments,
                         bool edram_fragment_shader_interlock,
                         uint32_t draw_resolution_scale_x = 1,
-                        uint32_t draw_resolution_scale_y = 1)
+                        uint32_t draw_resolution_scale_y = 1,
+                        bool edram_viz_fsi_counter = false)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
+        edram_viz_fsi_counter_(edram_fragment_shader_interlock &&
+                               edram_viz_fsi_counter),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y) {}
 
@@ -871,9 +877,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void FSI_DepthStencilTest(spv::Id msaa_samples,
                             bool sample_mask_potentially_narrowed_previouly);
 
-  // Adds the surviving coverage MSAA counts from FSI to the active ZPD counter
+  // Adds the surviving coverage MSAA counts from FSI to the selected counter
   // slot after final PS depth/stencil.
-  void FSI_AddPassedMSAASamplesToZPD();
+  void FSI_AddPassedMSAASamplesToCounter(spv::Id counter_buffer,
+                                         int counter_index_member);
 
   // Alpha to coverage helper - tests one sample.
   // coverage_out is modified to include this sample if it passes.
@@ -929,6 +936,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // flow of the main function, and that there are no returns before either
   // (there's a single return from the shader).
   bool edram_fragment_shader_interlock_;
+
+  // FSI shaders declare and write the VIZ survey counter at set 0 binding 3.
+  // Off for hosts without the binding, so their shaders never reference it.
+  bool edram_viz_fsi_counter_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
@@ -1054,6 +1065,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantInterpreterUcodeBaseDwords,
     kSystemConstantInterpreterCfInstrCount,
     kSystemConstantTextureIntegerScaleBits,
+    // Keep last so old SPIR-V member indices stay stable.
+    kSystemConstantVizFsiCounterIndex,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -1063,6 +1076,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id buffers_shared_memory_;
   spv::Id buffer_edram_;
   spv::Id buffer_zpd_fsi_counter_;
+  spv::Id buffer_viz_fsi_counter_;
 
   // Not using combined images and samplers because
   // maxPerStageDescriptorSamplers is often lower than

@@ -100,7 +100,8 @@ std::unique_ptr<SpirvShaderTranslator> VulkanPipelineCache::CreateTranslator()
       render_target_cache_.msaa_2x_no_attachments_supported(),
       edram_fragment_shader_interlock,
       render_target_cache_.draw_resolution_scale_x(),
-      render_target_cache_.draw_resolution_scale_y());
+      render_target_cache_.draw_resolution_scale_y(),
+      /*edram_viz_fsi_counter=*/edram_fragment_shader_interlock);
 }
 
 bool VulkanPipelineCache::precise_interpolation_supported() const {
@@ -1092,7 +1093,8 @@ void VulkanPipelineCache::TranslateShadersForStorage(
     // Each thread needs its own translator.
     SpirvShaderTranslator translator(
         SpirvShaderTranslator::Features(vulkan_device), msaa_2x_attachments,
-        msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y);
+        msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y,
+        /*edram_viz_fsi_counter=*/edram_fsi_used);
 
     while (true) {
       size_t index = translation_index.fetch_add(1);

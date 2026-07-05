@@ -305,9 +305,9 @@ void COMMAND_PROCESSOR::DisassembleCurrentPacket() XE_RESTRICT {
           LOG_ACTION_FIELD(context_update, maybe_unused);
           break;
         case PType::kVizQuery:
-          LOG_ACTION_FIELD_DEC(vizquery, id);
-          LOG_ACTION_FIELD_DEC(vizquery, end);
-          LOG_ACTION_FIELD(vizquery, dword0);
+          LOG_ACTION_FIELD(vizquery, initiator);
+          LOG_ACTION_FIELD_DEC(vizquery, query_id);
+          LOG_ACTION_FIELD_DEC(vizquery, is_end);
           break;
         case PType::kEventWriteZPD:
           LOG_ACTION_FIELD(event_write_zpd, initiator);
@@ -1274,12 +1274,6 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
 bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
     uint32_t packet, const char* opcode_name, uint32_t viz_query_condition,
     uint32_t count_remaining) XE_RESTRICT {
-  // if viz_query_condition != 0, this is a conditional draw based on viz query.
-  // This ID matches the one issued in PM4_VIZ_QUERY
-  // uint32_t viz_id = viz_query_condition & 0x3F;
-  // when true, render conditionally based on query result
-  // uint32_t viz_use = viz_query_condition & 0x100;
-
   assert_not_zero(count_remaining);
   if (!count_remaining) {
     XELOGE("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
@@ -1360,36 +1354,118 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   reader_.AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
-    auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
-    if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
-      // TODO(Triang3l): Don't drop the draw call completely if the vertex
-      // shader has memexport.
-      // TODO(Triang3l || JoelLinn): Handle this properly in the render
-      // backends.
-
-      // Push PM4 command marker as parent for IssueDraw/IssueCopy operations.
-      if (COMMAND_PROCESSOR::debug_markers_enabled()) {
-        COMMAND_PROCESSOR::PushDebugMarker("%s", opcode_name);
-      }
-
-      draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
-          vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-          is_indexed ? &index_buffer_info : nullptr,
-          xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
-                                     vgt_draw_initiator.prim_type));
-
-      // Pop PM4 command marker.
-      if (COMMAND_PROCESSOR::debug_markers_enabled()) {
-        COMMAND_PROCESSOR::PopDebugMarker();
-      }
-
-      if (!draw_succeeded) {
-        XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
-               vgt_draw_initiator.num_indices,
-               uint32_t(vgt_draw_initiator.prim_type),
-               uint32_t(vgt_draw_initiator.source_select));
-      }
+    const auto viz_decision =
+        COMMAND_PROCESSOR::GetVIZDecision(viz_query_condition);
+    // Assume any unanalyzed memexport shader might export.
+    // Don't let VIZ skip those writes.
+    const auto shader_may_memexport = [](const Shader* shader) {
+      return shader &&
+             (!shader->is_ucode_analyzed() || shader->memexport_eM_written());
+    };
+    const bool viz_token_has_memexport =
+        (viz_query_condition & 0x100) &&
+        (shader_may_memexport(active_vertex_shader_) ||
+         shader_may_memexport(active_pixel_shader_));
+    if (viz_token_has_memexport) {
+      ++viz_stats_.memexport_draws;
     }
+    if ((viz_query_condition & 0x100) &&
+        register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
+            xenos::EdramMode::kCopy) {
+      ++viz_stats_.copy_passthroughs;
+    }
+    if (viz_decision.draw || viz_token_has_memexport ||
+        register_file_->Get<reg::RB_MODECONTROL>().edram_mode ==
+            xenos::EdramMode::kCopy) {
+      IndexBufferInfo* draw_index_buffer_info =
+          is_indexed ? &index_buffer_info : nullptr;
+      const bool major_mode_explicit = xenos::IsMajorModeExplicit(
+          vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      const bool use_viz_predicate =
+          viz_decision.use_predicate && !viz_token_has_memexport &&
+          register_file_->Get<reg::RB_MODECONTROL>().edram_mode !=
+              xenos::EdramMode::kCopy;
+      if (const auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+          viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z) {
+        // This draw sets up the visibility query geometry. Titles often submit
+        // cheap bounding boxes here, then follow up with the real draw with the
+        // token set. Since the same packet might still be blocked by an older
+        // ID, the backend predicate is only used for the draw call itself.
+        if (use_viz_predicate) {
+          viz_predicate_draw_.slot_id = viz_decision.slot_id;
+          viz_predicate_draw_.slot_sequence_id = viz_decision.slot_sequence_id;
+          viz_predicate_draw_.active = true;
+        }
+        CommandProcessor::VIZQueryDrawResult query_draw_result =
+            CommandProcessor::VIZQueryDrawResult::kFallback;
+        if (cvars::viz_query) {
+          if (!COMMAND_PROCESSOR::IssueDraw(
+                  vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                  draw_index_buffer_info, major_mode_explicit,
+                  &query_draw_result)) {
+            query_draw_result = CommandProcessor::VIZQueryDrawResult::kFailed;
+          }
+        }
+        if (use_viz_predicate) {
+          viz_predicate_draw_ = {};
+        }
+        if (query_draw_result ==
+            CommandProcessor::VIZQueryDrawResult::kFailed) {
+          draw_succeeded = false;
+          XELOGE("{}({}, {}, {}): Failed in backend VIZ query draw",
+                 opcode_name, vgt_draw_initiator.num_indices,
+                 uint32_t(vgt_draw_initiator.prim_type),
+                 uint32_t(vgt_draw_initiator.source_select));
+        } else if (query_draw_result !=
+                   CommandProcessor::VIZQueryDrawResult::kEmpty) {
+          COMMAND_PROCESSOR::NoteVIZDraw(true);
+        }
+      } else {
+        // Memexport writes memory, not just color or depth. A hidden VIZ
+        // result or host predicate would skip the whole packet and lose those
+        // writes, so draws carrying VIZ tokens stay visible until backends can
+        // run the export without rasterizing the query geometry.
+
+        // Push PM4 command marker as parent for IssueDraw/IssueCopy
+        // operations.
+        if (COMMAND_PROCESSOR::debug_markers_enabled()) {
+          COMMAND_PROCESSOR::PushDebugMarker("%s", opcode_name);
+        }
+        if (use_viz_predicate) {
+          viz_predicate_draw_.slot_id = viz_decision.slot_id;
+          viz_predicate_draw_.slot_sequence_id = viz_decision.slot_sequence_id;
+          viz_predicate_draw_.active = true;
+        }
+        draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
+            vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+            draw_index_buffer_info, major_mode_explicit);
+        if (use_viz_predicate) {
+          viz_predicate_draw_ = {};
+        }
+        if (draw_succeeded) {
+          COMMAND_PROCESSOR::NoteVIZDraw(true);
+        }
+        // Pop PM4 command marker.
+        if (COMMAND_PROCESSOR::debug_markers_enabled()) {
+          COMMAND_PROCESSOR::PopDebugMarker();
+        }
+        if (!draw_succeeded) {
+          XELOGE("{}({}, {}, {}): Failed in backend", opcode_name,
+                 vgt_draw_initiator.num_indices,
+                 uint32_t(vgt_draw_initiator.prim_type),
+                 uint32_t(vgt_draw_initiator.source_select));
+        }
+      }
+    } else {
+      // A hidden VIZ result culled the packet.
+      ++viz_stats_.draws_culled;
+    }
+  }
+
+  if (!draw_succeeded) {
+    // A failed VIZ query draw wasn't measured. Hidden would be a made up
+    // answer anyways, so record the generation as conservative.
+    COMMAND_PROCESSOR::NoteVIZDraw(false);
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1665,39 +1741,21 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INVALIDATE_STATE(
 
 bool COMMAND_PROCESSOR::ExecutePacketType3_VIZ_QUERY(
     uint32_t packet, uint32_t count) XE_RESTRICT {
-  // begin/end initiator for viz query extent processing
+  // BEGIN/END for the visibility latch. This is a CP packet around query
+  // geometry, not a memory report like ZPD.
   // https://www.google.com/patents/US20050195186
   assert_true(count == 1);
 
-  uint32_t dword0 = reader_.ReadAndSwap<uint32_t>();
-
-  uint32_t id = dword0 & 0x3F;
-  uint32_t end = dword0 & 0x100;
-
-  if (COMMAND_PROCESSOR::debug_markers_enabled()) {
-    COMMAND_PROCESSOR::InsertDebugMarker("PM4_VIZ_QUERY: %s id=%u",
-                                         end ? "end" : "begin", id);
-  }
-
-  if (!end) {
-    // begin a new viz query @ id
-    // On hardware this clears the internal state of the scan converter (which
-    // is different to the register)
+  uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
+  uint32_t query_id = initiator & 0x3F;
+  bool is_end = (initiator & 0x100) != 0;
+  if (!is_end) {
+    // BEGIN clears the scan converter state, not the CP status register.
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_START);
-    // XELOGGPU("Begin viz query ID {:02X}", id);
+    COMMAND_PROCESSOR::BeginVIZQuery(query_id);
   } else {
-    // end the viz query
     COMMAND_PROCESSOR::WriteEventInitiator(VIZQUERY_END);
-    // XELOGGPU("End viz query ID {:02X}", id);
-    // The scan converter writes the internal result back to the register here.
-    // We just fake it and say it was visible in case it is read back.
-    if (id < 32) {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0] |= uint32_t(1)
-                                                                     << id;
-    } else {
-      register_file_->values[XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_1] |=
-          uint32_t(1) << (id - 32);
-    }
+    COMMAND_PROCESSOR::EndVIZQuery(query_id);
   }
 
   return true;

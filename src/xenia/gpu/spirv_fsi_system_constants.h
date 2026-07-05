@@ -31,14 +31,15 @@ namespace gpu {
 // OR'd into it (the caller owns the base bits and the final assignment). dirty
 // is OR'd with true when any written constant changed, for the Vulkan caller's
 // constant buffer invalidation. The D3D12 caller ignores it.
-// zpd_fsi_counter_index is computed per backend (UINT32_MAX to disable) and
+// Counter indices are computed per backend (UINT32_MAX to disable) and
 // passed in.
 void WriteFragmentShaderInterlockSystemConstants(
     SpirvShaderTranslator::SystemConstants& system_constants, uint32_t& flags,
     bool& dirty, const RegisterFile& regs, bool primitive_polygonal,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, uint32_t draw_resolution_scale_x,
-    uint32_t draw_resolution_scale_y, uint32_t zpd_fsi_counter_index);
+    uint32_t draw_resolution_scale_y, uint32_t zpd_fsi_counter_index,
+    uint32_t viz_fsi_counter_index);
 
 }  // namespace gpu
 }  // namespace xe

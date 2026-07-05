@@ -241,3 +241,6 @@ DEFINE_bool(use_fuzzy_alpha_epsilon, false,
             "Use approximate compare for alpha values to prevent flickering on "
             "NVIDIA graphics cards",
             "GPU");
+
+DEFINE_bool(viz_query_log, false, "Log VIZ query decision and summary stats.",
+            "GPU");

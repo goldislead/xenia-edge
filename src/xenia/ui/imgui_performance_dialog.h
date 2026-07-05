@@ -50,6 +50,7 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
   void OnReadbackResolveChanged(int value);
   void OnReadbackMemexportChanged(int value);
   void OnOcclusionQueryChanged(int value);
+  void OnVIZQueryChanged(bool enabled);
   void OnEmulatedDisplayUncappedChanged(bool uncapped);
   void OnClearMemoryPageStateChanged(bool enabled);
   void OnFramerateLimitChanged(int value);
@@ -60,10 +61,11 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
   // Current settings state (selected values)
   int readback_resolve_mode_ = 2;    // 0=None, 1=Some, 2=Fast, 3=Full
   int readback_memexport_mode_ = 1;  // 0=None, 1=Fast, 2=Full
-  int occlusion_query_mode_ = 0;     // 0=Fake, 1=Fast, 2=Strict
+  int occlusion_query_mode_ = 0;     // 0=Fake, 1=Fast, 2=Fast-Alt, 3=Strict
   bool display_uncapped_ = false;
   bool clear_memory_page_state_ = false;
   int framerate_limit_ = 0;  // FPS, 0 = unlimited
+  bool viz_query_ = false;
 
   // Highlight positions for navigation
   int resolve_highlight_ = 2;

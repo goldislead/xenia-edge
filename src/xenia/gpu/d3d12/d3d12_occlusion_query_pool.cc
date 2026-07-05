@@ -7,7 +7,7 @@
  ******************************************************************************
  */
 
-#include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
+#include "xenia/gpu/d3d12/d3d12_occlusion_query_pool.h"
 
 #include <algorithm>
 
@@ -20,7 +20,7 @@ namespace xe {
 namespace gpu {
 namespace d3d12 {
 
-bool D3D12ZPDQueryPool::EnsureInitialized(
+bool D3D12OcclusionQueryPool::EnsureInitialized(
     const ui::d3d12::D3D12Provider& provider, uint32_t requested_capacity,
     bool can_recreate, bool initialize_rov_counter) {
   bool rtv_initialized = is_initialized();
@@ -53,9 +53,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
 
     if (FAILED(
             device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&query_heap_)))) {
-      XELOGW(
-          "D3D12ZPDQueryPool: Failed to create the ZPD query "
-          "heap, falling back to fake sample counts.");
+      XELOGW("D3D12OcclusionQueryPool: Failed to create the query heap.");
       return false;
     }
 
@@ -70,8 +68,8 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
             IID_PPV_ARGS(&readback_buffer_)))) {
       XELOGW(
-          "D3D12ZPDQueryPool: Failed to allocate the ZPD query "
-          "readback buffer, falling back to fake sample counts.");
+          "D3D12OcclusionQueryPool: Failed to allocate the query readback "
+          "buffer.");
       Shutdown();
       return false;
     }
@@ -84,8 +82,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
     void* mapping = nullptr;
     if (FAILED(readback_buffer_->Map(0, &read_range, &mapping))) {
       XELOGW(
-          "D3D12ZPDQueryPool: Failed to map the ZPD query "
-          "readback buffer, falling back to fake sample counts.");
+          "D3D12OcclusionQueryPool: Failed to map the query readback buffer.");
       Shutdown();
       return false;
     }
@@ -130,7 +127,8 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
           provider.GetHeapFlagCreateNotZeroed(), &counter_buffer_desc,
           D3D12_RESOURCE_STATE_COMMON, nullptr,
           IID_PPV_ARGS(&rov_counter_buffer_)))) {
-    XELOGW("D3D12ZPDQueryPool: Failed to allocate the ZPD ROV counter buffer.");
+    XELOGW(
+        "D3D12OcclusionQueryPool: Failed to allocate the ROV counter buffer.");
     return false;
   }
   rov_counter_buffer_->SetName(L"ZPD ROV Counter Buffer");
@@ -147,7 +145,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
           D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
           IID_PPV_ARGS(&rov_counter_readback_buffer_)))) {
     XELOGW(
-        "D3D12ZPDQueryPool: Failed to allocate the ZPD ROV counter readback "
+        "D3D12OcclusionQueryPool: Failed to allocate the ROV counter readback "
         "buffer.");
     rov_counter_buffer_.Reset();
     return false;
@@ -161,7 +159,7 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
   void* mapping = nullptr;
   if (FAILED(rov_counter_readback_buffer_->Map(0, &read_range, &mapping))) {
     XELOGW(
-        "D3D12ZPDQueryPool: Failed to map the ZPD ROV counter readback "
+        "D3D12OcclusionQueryPool: Failed to map the ROV counter readback "
         "buffer.");
     rov_counter_readback_buffer_.Reset();
     rov_counter_buffer_.Reset();
@@ -172,7 +170,32 @@ bool D3D12ZPDQueryPool::EnsureInitialized(
   return true;
 }
 
-void D3D12ZPDQueryPool::Shutdown() {
+bool D3D12OcclusionQueryPool::EnsurePredicateBuffer(
+    const ui::d3d12::D3D12Provider& provider, uint32_t requested_capacity) {
+  if (predicate_buffer_) {
+    return true;
+  }
+
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc,
+                                          sizeof(uint64_t) * requested_capacity,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Device* device = provider.GetDevice();
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COMMON, nullptr,
+          IID_PPV_ARGS(&predicate_buffer_)))) {
+    XELOGE("D3D12OcclusionQueryPool: Failed to allocate the predicate buffer.");
+    return false;
+  }
+
+  predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  predicate_buffer_state_submission_ = UINT64_MAX;
+  return true;
+}
+
+void D3D12OcclusionQueryPool::Shutdown() {
   resolve_batch_pending_.clear();
   resolve_batch_indices_.clear();
   resolve_batch_ranges_.clear();
@@ -199,10 +222,13 @@ void D3D12ZPDQueryPool::Shutdown() {
   rov_counter_readback_mapping_ = nullptr;
   rov_counter_readback_buffer_.Reset();
   rov_counter_buffer_.Reset();
+  predicate_buffer_.Reset();
+  predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+  predicate_buffer_state_submission_ = UINT64_MAX;
 }
 
-bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
-                                          uint32_t& query_generation) {
+bool D3D12OcclusionQueryPool::AcquireQueryIndex(uint32_t& query_index,
+                                                uint32_t& query_generation) {
   if (free_indices_.empty()) {
     query_index = UINT32_MAX;
     query_generation = 0;
@@ -219,15 +245,15 @@ bool D3D12ZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
   return true;
 }
 
-void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
-                                          uint32_t query_generation) {
+void D3D12OcclusionQueryPool::ReleaseQueryIndex(uint32_t query_index,
+                                                uint32_t query_generation) {
   if (query_index >= capacity_) {
     return;
   }
 
   if (!GenerationMatches(query_index, query_generation)) {
-    XELOGW("D3D12ZPDQueryPool: stale release index={} gen={}", query_index,
-           query_generation);
+    XELOGW("D3D12OcclusionQueryPool: stale release index={} gen={}",
+           query_index, query_generation);
     return;
   }
 
@@ -236,34 +262,34 @@ void D3D12ZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
   free_indices_.push_back(query_index);
 }
 
-bool D3D12ZPDQueryPool::GenerationMatches(uint32_t query_index,
-                                          uint32_t query_generation) const {
+bool D3D12OcclusionQueryPool::GenerationMatches(
+    uint32_t query_index, uint32_t query_generation) const {
   return query_index < index_generations_.size() &&
          index_generations_[query_index] == query_generation;
 }
 
-void D3D12ZPDQueryPool::BeginQuery(DeferredCommandList& deferred_command_list,
-                                   uint32_t query_index) const {
+void D3D12OcclusionQueryPool::BeginQuery(
+    DeferredCommandList& deferred_command_list, uint32_t query_index) const {
   if (!query_heap_ || query_index >= capacity_) {
     return;
   }
 
-  deferred_command_list.D3DBeginQuery(query_heap_.Get(),
-                                      D3D12_QUERY_TYPE_OCCLUSION, query_index);
+  deferred_command_list.D3DBeginQuery(query_heap_.Get(), query_type_,
+                                      query_index);
 }
 
-void D3D12ZPDQueryPool::EndQuery(DeferredCommandList& deferred_command_list,
-                                 uint32_t query_index) const {
+void D3D12OcclusionQueryPool::EndQuery(
+    DeferredCommandList& deferred_command_list, uint32_t query_index) const {
   if (!query_heap_ || query_index >= capacity_) {
     return;
   }
 
-  deferred_command_list.D3DEndQuery(query_heap_.Get(),
-                                    D3D12_QUERY_TYPE_OCCLUSION, query_index);
+  deferred_command_list.D3DEndQuery(query_heap_.Get(), query_type_,
+                                    query_index);
 }
 
-void D3D12ZPDQueryPool::QueueQueryResolve(uint32_t query_index,
-                                          bool uses_rov_counter) {
+void D3D12OcclusionQueryPool::QueueQueryResolve(uint32_t query_index,
+                                                bool uses_rov_counter) {
   if (query_index >= capacity_) {
     return;
   }
@@ -284,7 +310,7 @@ void D3D12ZPDQueryPool::QueueQueryResolve(uint32_t query_index,
   }
 }
 
-void D3D12ZPDQueryPool::TransitionROVCounterBuffer(
+void D3D12OcclusionQueryPool::TransitionROVCounterBuffer(
     DeferredCommandList& deferred_command_list, uint64_t submission,
     D3D12_RESOURCE_STATES new_state) {
   // The buffer decayed to COMMON when the previous submission finished, so
@@ -306,7 +332,50 @@ void D3D12ZPDQueryPool::TransitionROVCounterBuffer(
   rov_counter_buffer_state_ = new_state;
 }
 
-void D3D12ZPDQueryPool::ClearROVCounter(
+void D3D12OcclusionQueryPool::TransitionPredicateBuffer(
+    DeferredCommandList& deferred_command_list, uint64_t submission,
+    D3D12_RESOURCE_STATES new_state) {
+  if (!predicate_buffer_) {
+    return;
+  }
+
+  // The buffer decayed to COMMON when the previous submission finished, so
+  // start each submission from COMMON regardless of the last tracked state.
+  if (submission != predicate_buffer_state_submission_) {
+    predicate_buffer_state_ = D3D12_RESOURCE_STATE_COMMON;
+    predicate_buffer_state_submission_ = submission;
+  }
+  if (predicate_buffer_state_ == new_state) {
+    return;
+  }
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = predicate_buffer_.Get();
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = predicate_buffer_state_;
+  barrier.Transition.StateAfter = new_state;
+  deferred_command_list.D3DResourceBarrier(1, &barrier);
+  predicate_buffer_state_ = new_state;
+}
+
+void D3D12OcclusionQueryPool::ResolveQueryToPredicateBuffer(
+    DeferredCommandList& deferred_command_list, uint64_t submission,
+    uint32_t query_index, uint32_t predicate_index) {
+  if (!is_initialized() || !predicate_buffer_ || query_index >= capacity_) {
+    return;
+  }
+
+  TransitionPredicateBuffer(deferred_command_list, submission,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+  deferred_command_list.D3DResolveQueryData(
+      query_heap_.Get(), query_type_, query_index, 1, predicate_buffer_.Get(),
+      static_cast<uint64_t>(predicate_index) * sizeof(uint64_t));
+  TransitionPredicateBuffer(deferred_command_list, submission,
+                            D3D12_RESOURCE_STATE_PREDICATION);
+}
+
+void D3D12OcclusionQueryPool::ClearROVCounter(
     DeferredCommandList& deferred_command_list, uint64_t submission,
     uint32_t query_index) {
   if (!rov_counter_initialized() || query_index >= capacity_) {
@@ -331,7 +400,7 @@ void D3D12ZPDQueryPool::ClearROVCounter(
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
-void D3D12ZPDQueryPool::FlushResolveBatch(
+void D3D12OcclusionQueryPool::FlushResolveBatch(
     DeferredCommandList& deferred_command_list, uint64_t submission,
     bool submission_open) {
   if (!submission_open || (resolve_batch_indices_.empty() &&
@@ -380,9 +449,8 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
       build_ranges(resolve_batch_indices_, resolve_batch_pending_);
       for (const ResolveRange& range : resolve_batch_ranges_) {
         deferred_command_list.D3DResolveQueryData(
-            query_heap_.Get(), D3D12_QUERY_TYPE_OCCLUSION, range.start,
-            range.count, readback_buffer_.Get(),
-            range.start * sizeof(uint64_t));
+            query_heap_.Get(), query_type_, range.start, range.count,
+            readback_buffer_.Get(), range.start * sizeof(uint64_t));
       }
     }
   }
@@ -420,8 +488,8 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
-uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index,
-                                                  bool uses_rov_counter) const {
+uint64_t D3D12OcclusionQueryPool::GetQueryReadbackValue(
+    uint32_t query_index, bool uses_rov_counter) const {
   if (query_index >= capacity_) {
     return 0;
   }

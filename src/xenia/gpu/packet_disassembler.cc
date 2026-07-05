@@ -618,9 +618,9 @@ bool PacketDisassembler::DisasmPacketType3(const uint8_t* base_ptr,
 
       PacketAction vzq;
       vzq.type = Type::kVizQuery;
-      vzq.vizquery.dword0 = value;
-      vzq.vizquery.id = value & 0x3F;
-      vzq.vizquery.end = !!(value & 0x100);
+      vzq.vizquery.initiator = value;
+      vzq.vizquery.query_id = value & 0x3F;
+      vzq.vizquery.is_end = !!(value & 0x100);
       out_actions.emplace_back(std::move(vzq));
       break;
     }

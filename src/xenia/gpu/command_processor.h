@@ -40,7 +40,8 @@ namespace gpu {
 enum class GPUSetting {
   ClearMemoryPageState,
   ReadbackMemexport,
-  ReadbackMemexportFast
+  ReadbackMemexportFast,
+  VIZQuery
 };
 
 enum class ReadbackResolveMode {
@@ -55,7 +56,7 @@ enum class ZPDMode {
   kFake,     // Fake sample counts, no real GPU queries (fake)
   kFast,     // Real queries with speculative cached writes (fast)
   kFastAlt,  // Fast queries, but preserves cached zeroes (fast-alt)
-  kStrict,   // Real queries, waits before writeback. May hang. (strict)
+  kStrict,   // Real queries, waits before writeback. May stall. (strict)
 };
 
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
@@ -63,6 +64,7 @@ bool GetGPUSetting(GPUSetting setting);
 
 // Shared pool capacity for D3D12 and Vulkan.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
+constexpr uint32_t kVIZQueryPoolCapacity = 256;
 
 // Contiguous range of query indices for batched resolve/copy operations.
 struct ResolveRange {
@@ -332,7 +334,7 @@ class CommandProcessor {
 
   virtual void OnPrimaryBufferEnd() {}
 
-  // TODO(boma): Add tracking for VIZ & EXT queries.
+  // TODO(boma): Add tracking for EXT queries.
   enum class QueryOpenResult {
     kOpened,
     kDeferred,
@@ -476,6 +478,126 @@ class CommandProcessor {
     zpd_force_fake_fallback_ = false;
   }
 
+  // VIZ_QUERY is NOT a sample counter. The scan converter tracks 64 query IDs,
+  // and an ID is visible when its geometry is still potentially visible after
+  // hi-Z. Draws carrying a VIZ token can then be dropped before they reach
+  // the backend. Anything unmeasured, for whatever reason, stay visible.
+  // Sequencing exists because titles reuse the 6 bit IDs while older host
+  // queries and predicates are still retiring.
+  struct VIZSlot {
+    uint64_t slot_sequence_id = 0;
+    uint32_t pending_segments = 0;
+    bool has_result = true;
+    bool visible = true;
+    bool active = false;
+    // A query draw reached the backend during this sequence. Without one
+    // the hardware would have surveyed nothing at all.
+    bool draw_seen = false;
+    // OR of resolved segment visibility for this slot sequence.
+    bool accumulated_visible = false;
+    bool has_segments = false;
+    // Not zero samples, just means something went wrong and it can't be
+    // reported not visible.
+    bool has_fallback = false;
+    // Physical query slot a consumer draw may predicate on while the CPU
+    // result is still outstanding.
+    uint32_t predicate_query_index = UINT32_MAX;
+    bool predicate_is_fsi = false;
+    bool predicate_active = false;
+    // Once the predicate stops covering the whole unresolved query, later
+    // segments can't make it exact again.
+    bool predicate_blocked = false;
+  };
+
+  struct VIZBinding {
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    bool active = false;
+  };
+
+  struct PendingVIZResolve {
+    uint64_t end_submission = 0;
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_sequence_id = 0;
+    bool is_fsi = false;
+  };
+
+  // PM4 decision for a VIZ token.
+  // Run it, skip it, or run it under a backend predicate.
+  struct VIZDecision {
+    uint32_t slot_id = 0;
+    uint64_t slot_sequence_id = 0;
+    bool draw = true;
+    bool use_predicate = false;
+  };
+
+  enum class VIZQueryDrawResult {
+    kDrawn,
+    kFallback,
+    kEmpty,
+    kFailed,
+  };
+
+  // Logged by the backend every 100 frames if VIZ logging cvar is true.
+  struct VIZStats {
+    uint64_t queries_begun = 0;
+    uint64_t resolved_visible = 0;
+    uint64_t resolved_hidden = 0;
+    // Sequences that went conservative, not unmeasured draws.
+    uint64_t fallback_sequences = 0;
+    // Segments opened after a sequence's first, blocking the predicate.
+    uint64_t segment_splits = 0;
+    uint64_t token_draws = 0;
+    uint64_t draws_culled = 0;
+    uint64_t draws_predicated = 0;
+    // Tokened draws that bypassed VIZ.
+    uint64_t memexport_draws = 0;
+    uint64_t copy_passthroughs = 0;
+    uint64_t waits = 0;
+    uint64_t last_log_frame = 0;
+
+    void Reset(uint64_t current_frame) {
+      *this = {};
+      last_log_frame = current_frame;
+    }
+  };
+
+  bool GetVIZResolveSubmission(uint32_t id, uint64_t generation,
+                               uint64_t& submission_out) const;
+  virtual void PumpVIZResolves() {}
+  virtual bool AwaitSubmittedVIZResolve(uint32_t id, uint64_t generation) {
+    return false;
+  }
+  void ArmVIZPredicate(uint32_t id, uint64_t generation,
+                       uint32_t query_index = UINT32_MAX, bool is_fsi = false);
+  void DisarmVIZPredicate(uint32_t id, uint64_t generation);
+  const VIZSlot* GetVIZPredicate() const;
+
+  // Backend hooks for VIZ query segments. Base CP here owns IDs, slot
+  // generations and the guest visible status bits (though the guest rarely
+  // actually reads back).
+  virtual QueryOpenResult OpenVIZQuery(uint32_t id, uint64_t generation) {
+    return QueryOpenResult::kFailed;
+  }
+  // Closes the physical query and queues a resolve. False means no result will
+  // arrive, which is treated as conservative.
+  virtual bool CloseVIZQuery(uint32_t id, uint64_t generation) { return false; }
+  void BeginVIZQuery(uint32_t id);
+  void EndVIZQuery(uint32_t id);
+  void ResolveVIZ(uint32_t id, uint64_t generation, bool visible);
+  VIZDecision GetVIZDecision(uint32_t token);
+  void UpdateVIZSegment();
+  void CloseVIZSegment();
+  // Backend reports a resolved segment here.
+  void OnVIZResolved(uint32_t id, uint64_t generation, bool visible);
+  void TryResolveVIZ(uint32_t id);
+  void NoteVIZDraw(bool measured);
+  bool GetActiveVIZQuery(uint32_t& id, uint64_t& generation) const;
+  void ResetVIZState();
+  void SetVIZStatus(uint32_t id, bool visible);
+
 #include "pm4_command_processor_declare.h"
 
   virtual Shader* LoadShader(xenos::ShaderType shader_type,
@@ -486,7 +608,12 @@ class CommandProcessor {
 
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info,
-                         bool major_mode_explicit) {
+                         bool major_mode_explicit,
+                         VIZQueryDrawResult* viz_query_draw_result = nullptr) {
+    if (viz_query_draw_result) {
+      *viz_query_draw_result = VIZQueryDrawResult::kFallback;
+      return true;
+    }
     return false;
   }
   virtual bool IssueCopy() { return false; }
@@ -546,6 +673,12 @@ class CommandProcessor {
 
   uint32_t fake_zpd_sample_count_ = 0;
   ZPDStats zpd_stats_;
+
+  std::array<VIZSlot, 64> viz_slots_{};
+  VIZStats viz_stats_;
+  VIZBinding viz_segment_{};
+  VIZBinding viz_predicate_draw_{};
+  std::deque<PendingVIZResolve> viz_resolves_in_flight_;
 
   TraceWriter trace_writer_;
   enum class TraceState {

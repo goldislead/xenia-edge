@@ -23,11 +23,11 @@
 #include "xenia/base/assert.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/gpu/d3d12/d3d12_occlusion_query_pool.h"
 #include "xenia/gpu/d3d12/d3d12_primitive_processor.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
-#include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/d3d12/deferred_command_list.h"
 #include "xenia/gpu/d3d12/pipeline_cache.h"
 #include "xenia/gpu/draw_util.h"
@@ -326,8 +326,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
                      uint32_t dword_count) override;
 
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info,
-                 bool major_mode_explicit) override;
+                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                 VIZQueryDrawResult* viz_query_draw_result = nullptr) override;
 
   bool IssueCopy() override;
   XE_NOINLINE
@@ -554,6 +554,17 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void RecordZPDResolveBatch();
 
+  // VIZ_QUERY backend. Base CP owns IDs and predicates, the backend owns the
+  // physical query slots.
+  QueryOpenResult OpenVIZQuery(uint32_t id, uint64_t generation) override;
+  bool CloseVIZQuery(uint32_t id, uint64_t generation) override;
+  void ShutdownVIZQueryResources();
+  void PumpVIZResolves() override;
+  bool GetVIZPredicateBinding(ID3D12Resource*& buffer_out,
+                              uint64_t& offset_out) const;
+  void RecordVIZResolveBatch();
+  bool AwaitSubmittedVIZResolve(uint32_t id, uint64_t generation) override;
+
   bool device_removed_ = false;
 
   bool cache_clear_requested_ = false;
@@ -613,11 +624,20 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
-  std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
+  std::unique_ptr<D3D12OcclusionQueryPool> zpd_host_query_pool_;
   // Tracks the ROV counter buffer captured by the current bindful page so we
   // can invalidate the page when the counter resource changes.
   ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
   uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+
+  std::unique_ptr<D3D12OcclusionQueryPool> viz_host_query_pool_;
+
+  struct ActiveVIZQuery {
+    uint32_t query_index = UINT32_MAX;
+    uint32_t query_generation = 0;
+    bool valid = false;
+  };
+  ActiveVIZQuery viz_active_query_{};
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 

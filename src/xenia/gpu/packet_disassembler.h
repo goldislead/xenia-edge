@@ -163,10 +163,9 @@ struct PacketAction {
     } context_update;
 
     struct {
-      uint32_t dword0;
-
-      uint32_t id;
-      bool end;
+      uint32_t initiator;
+      uint32_t query_id;
+      bool is_end;
     } vizquery;
 
     struct {

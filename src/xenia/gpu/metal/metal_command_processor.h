@@ -133,8 +133,8 @@ class MetalCommandProcessor : public CommandProcessor {
                      uint32_t dword_count) override;
 
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
-                 IndexBufferInfo* index_buffer_info,
-                 bool major_mode_explicit) override;
+                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit,
+                 VIZQueryDrawResult* viz_query_draw_result = nullptr) override;
   // SPIRV-Cross draw path — called from IssueDraw. Handles shader translation,
   // pipeline creation, resource binding, and draw dispatch using native Metal
   // encoder calls.

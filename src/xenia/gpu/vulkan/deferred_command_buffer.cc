@@ -126,6 +126,21 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         auto& args = *reinterpret_cast<const ArgsVkEndQuery*>(stream);
         dfn.vkCmdEndQuery(command_buffer, args.query_pool, args.query);
       } break;
+      case Command::kVkBeginConditionalRenderingEXT: {
+        auto& args =
+            *reinterpret_cast<const ArgsVkBeginConditionalRenderingEXT*>(
+                stream);
+        VkConditionalRenderingBeginInfoEXT conditional_rendering_begin_info = {
+            VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        conditional_rendering_begin_info.buffer = args.buffer;
+        conditional_rendering_begin_info.offset = args.offset;
+        conditional_rendering_begin_info.flags = args.flags;
+        dfn.vkCmdBeginConditionalRenderingEXT(
+            command_buffer, &conditional_rendering_begin_info);
+      } break;
+      case Command::kVkEndConditionalRenderingEXT:
+        dfn.vkCmdEndConditionalRenderingEXT(command_buffer);
+        break;
       case Command::kVkCopyQueryPoolResults: {
         auto& args =
             *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);

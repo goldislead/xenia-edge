@@ -214,6 +214,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float16_int8, 1, 2)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
+      // #82. VIZ GPU predication queries.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_conditional_rendering)
       // #55.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
       // #277.
@@ -339,6 +341,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT>
       features_EXT_fragment_shader_interlock;
   VulkanFeatures<
+      VkPhysicalDeviceConditionalRenderingFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT>
+      features_EXT_conditional_rendering;
+  VulkanFeatures<
       VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT,
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT>
       features_1_3_EXT_shader_demote_to_helper_invocation;
@@ -418,6 +424,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2,
                                                   device_create_info);
+    }
+    if (device->extensions_.ext_EXT_conditional_rendering) {
+      features_EXT_conditional_rendering.Link(supported_features_2,
+                                              device_create_info);
     }
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2,
@@ -875,6 +885,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+    if (with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_conditional_rendering,
+                             conditionalRendering)
+    }
+  }
+
   if (ext_EXT_non_seamless_cube_map) {
     if (with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE_2(features_EXT_non_seamless_cube_map,
@@ -1027,6 +1044,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include "xenia/ui/vulkan/functions/device_khr_swapchain.inc"
+  }
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 
