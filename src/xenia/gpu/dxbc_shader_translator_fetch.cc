@@ -1169,17 +1169,25 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
           // Denormalize and offset Z (re-apply the offset not to lose precision
           // as a result of division) if stacked.
           a_.OpIf(false, dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kWWWW));
+          a_.OpMAd(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                   coord_operand.SelectFromSwizzled(2),
+                   dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kZZZZ),
+                   dxbc::Src::LF(offsets[2]));
           {
+            // Host array-layer sampling can't safely consume non-finite Z from
+            // invalid guest data. Clamp after normalized guest Z has been
+            // lowered to stacked layer space. Use layer centers because stacked
+            // layer M is centered at M + 0.5.
+            uint32_t layer_clamp_temp = PushSystemTemp();
             a_.OpMax(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
                      dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
-                     dxbc::Src::LF(0.0f));
-            uint32_t clamp_temp = PushSystemTemp();
-            a_.OpAdd(dxbc::Dest::R(clamp_temp, 0b0001),
+                     dxbc::Src::LF(0.5f));
+            a_.OpAdd(dxbc::Dest::R(layer_clamp_temp, 0b0001),
                      dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kZZZZ),
-                     dxbc::Src::LF(-1.0f));
+                     dxbc::Src::LF(-0.5f));
             a_.OpMin(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
                      dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
-                     dxbc::Src::R(clamp_temp, dxbc::Src::kXXXX));
+                     dxbc::Src::R(layer_clamp_temp, dxbc::Src::kXXXX));
             PopSystemTemp();
           }
           a_.OpEndIf();
@@ -1188,6 +1196,21 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
           a_.OpMul(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
                    coord_operand.SelectFromSwizzled(2),
                    dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kZZZZ));
+          a_.OpIf(false, dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kWWWW));
+          {
+            uint32_t layer_clamp_temp = PushSystemTemp();
+            a_.OpMax(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
+                     dxbc::Src::LF(0.5f));
+            a_.OpAdd(dxbc::Dest::R(layer_clamp_temp, 0b0001),
+                     dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kZZZZ),
+                     dxbc::Src::LF(-0.5f));
+            a_.OpMin(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
+                     dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kZZZZ),
+                     dxbc::Src::R(layer_clamp_temp, dxbc::Src::kXXXX));
+            PopSystemTemp();
+          }
+          a_.OpEndIf();
           a_.OpMovC(dxbc::Dest::R(coord_and_sampler_temp, 0b0100),
                     dxbc::Src::R(size_and_is_3d_temp, dxbc::Src::kWWWW),
                     coord_operand.SelectFromSwizzled(2),
