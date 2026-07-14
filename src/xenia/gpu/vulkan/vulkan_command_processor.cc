@@ -3183,6 +3183,13 @@ bool VulkanCommandProcessor::IssueDraw(
     return true;
   }
 
+  if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
+    // Doesn't actually draw. Matches the Direct3D 12 backend.
+    // TODO(Triang3l): Do something so memexport still works in this case maybe?
+    // Unlikely that zero would even really be legal though.
+    return true;
+  }
+
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       GetVulkanDevice()->properties();
 
@@ -3941,8 +3948,14 @@ bool VulkanCommandProcessor::IssueDraw(
                                       memexport_range.size_bytes);
   }
 
-  // CPU readback for memexport data (if enabled).
-  if (GetGPUSetting(GPUSetting::ReadbackMemexport) &&
+  // CPU readback for memexport data (if enabled). Skipped entirely under
+  // zero-copy: the buffer aliases guest RAM, so memexport output is already
+  // visible to the guest with no copy - matching the Metal backend, which does
+  // no per-draw readback. A per-draw completion drain here corrupts mid-frame
+  // render state (and the double-buffer copy would clobber the GPU-written
+  // guest RAM), so do neither.
+  if (!shared_memory_->is_zero_copy() &&
+      GetGPUSetting(GPUSetting::ReadbackMemexport) &&
       !memexport_ranges_.empty()) {
     // Calculate total size of all memexport ranges.
     uint32_t memexport_total_size = 0;

@@ -195,6 +195,10 @@ class VulkanDevice {
     uint32_t maxSubgroupSize = 0;
     bool subgroupSizeControl = false;
     bool computeFullSubgroups = false;
+
+    // VK_EXT_external_memory_host (#179). Alignment a host pointer must satisfy
+    // to be imported. 0 if the extension is not enabled.
+    VkDeviceSize minImportedHostPointerAlignment = 0;
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -237,9 +241,18 @@ class VulkanDevice {
     bool ext_EXT_device_fault = false;
     // VK_EXT_conditional_rendering (#82). Predication query draw skipping.
     bool ext_EXT_conditional_rendering = false;
+    // VK_EXT_external_memory_host (#179). Imports guest RAM as device memory so
+    // the shared-memory buffer can alias guest RAM directly (zero-copy).
+    bool ext_EXT_external_memory_host = false;
   };
 
   const Extensions& extensions() const { return extensions_; }
+
+  // VK_EXT_external_memory_host entry point, or null if not enabled.
+  PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT()
+      const {
+    return vkGetMemoryHostPointerPropertiesEXT_;
+  }
 
   VkDevice device() const { return device_; }
 
@@ -396,6 +409,10 @@ class VulkanDevice {
   // VK_EXT_device_fault function pointer, loaded only if the extension is
   // enabled. Null otherwise.
   PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT_ = nullptr;
+  // VK_EXT_external_memory_host function pointer, loaded only if the extension
+  // is enabled. Null otherwise.
+  PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =
+      nullptr;
   // Set when LogFaultInfo() has already logged - prevents repeat logging from
   // multiple device-loss observers.
   std::atomic_flag fault_info_logged_ = ATOMIC_FLAG_INIT;
