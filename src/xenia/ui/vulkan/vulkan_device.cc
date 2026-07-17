@@ -180,6 +180,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_2_KHR_shader_float_controls = false;
   bool ext_EXT_fragment_shader_interlock = false;
   bool ext_1_3_EXT_shader_demote_to_helper_invocation = false;
+  bool ext_EXT_custom_border_color = false;
   bool ext_EXT_non_seamless_cube_map = false;
   if (with_gpu_emulation) {
     // #15.
@@ -202,6 +203,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       // #277.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(
           EXT_shader_demote_to_helper_invocation, 1, 3)
+      // #288.
+      XE_UI_VULKAN_LOCAL_EXTENSION(EXT_custom_border_color)
       // #423.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_non_seamless_cube_map)
     }
@@ -308,6 +311,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT>
       features_1_3_EXT_shader_demote_to_helper_invocation;
   VulkanFeatures<
+      VkPhysicalDeviceCustomBorderColorFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT>
+      features_EXT_custom_border_color;
+  VulkanFeatures<
       VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT,
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT>
       features_EXT_non_seamless_cube_map;
@@ -342,6 +349,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2,
                                                   device_create_info);
+    }
+    if (ext_EXT_custom_border_color) {
+      features_EXT_custom_border_color.Link(supported_features_2,
+                                            device_create_info);
     }
     if (ext_EXT_non_seamless_cube_map) {
       features_EXT_non_seamless_cube_map.Link(supported_features_2,
@@ -707,6 +718,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                              fragmentShaderSampleInterlock)
       XE_UI_VULKAN_FEATURE_2(features_EXT_fragment_shader_interlock,
                              fragmentShaderPixelInterlock)
+    }
+  }
+
+  if (ext_EXT_custom_border_color) {
+    if (with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_custom_border_color,
+                             customBorderColors)
+      XE_UI_VULKAN_FEATURE_2(features_EXT_custom_border_color,
+                             customBorderColorWithoutFormat)
     }
   }
 

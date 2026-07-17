@@ -765,8 +765,10 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
     parameters.border_color = fetch.border_color;
+    parameters.border_color_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
+    parameters.border_color_w_to_max = 0;
   }
 
   uint32_t mip_min_level, mip_max_level;
@@ -794,7 +796,6 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
       mip_filter == xenos::TextureFilter::kLinear;
   bool mip_base_map = mip_filter == xenos::TextureFilter::kBaseMap;
   // high cache miss count here, prefetch fetch earlier
-  //  TODO(Triang3l): Disable filtering for texture formats not supporting it.
   xenos::AnisoFilter aniso_filter =
       binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
           ? fetch.aniso_filter
@@ -890,6 +891,9 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
       desc.BorderColor[2] = 0.0f;
       desc.BorderColor[3] = 0.0f;
       break;
+  }
+  if (parameters.border_color_w_to_max) {
+    desc.BorderColor[3] = 1.0f;
   }
   desc.MinLOD = float(parameters.mip_min_level);
   if (parameters.mip_base_map) {

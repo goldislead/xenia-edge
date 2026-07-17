@@ -59,6 +59,9 @@ class D3D12TextureCache final : public TextureCache {
       xenos::AnisoFilter aniso_filter : 3;  // 17
       uint32_t mip_min_level : 4;           // 21
       uint32_t mip_base_map : 1;            // 22
+      // Forces the border color W component to the maximum, independently of
+      // the RGB border color selection.
+      uint32_t border_color_w_to_max : 1;  // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
       // can be used to limit fetching to mip_min_level.
     };

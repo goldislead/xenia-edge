@@ -159,6 +159,11 @@ class VulkanDevice {
 
     bool shaderDemoteToHelperInvocation = false;
 
+    // VK_EXT_custom_border_color (#288)
+
+    bool customBorderColors = false;
+    bool customBorderColorWithoutFormat = false;
+
     // VK_EXT_non_seamless_cube_map (#423)
 
     bool nonSeamlessCubeMap = false;

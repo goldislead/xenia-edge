@@ -668,8 +668,10 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
       xenos::ClampModeUsesBorder(parameters.clamp_y) ||
       xenos::ClampModeUsesBorder(parameters.clamp_z)) {
     parameters.border_color = fetch.border_color;
+    parameters.border_color_w_to_max = fetch.force_bc_w_to_max;
   } else {
     parameters.border_color = xenos::BorderColor::k_ABGR_Black;
+    parameters.border_color_w_to_max = 0;
   }
 
   xenos::TextureFilter mag_filter =
@@ -862,14 +864,53 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters,
   } else {
     sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
   }
-  // TODO(Triang3l): Custom border colors for CrYCb / YCrCb.
+  // The CrYCb / YCrCb black values and a forced-to-maximum W require
+  // VK_EXT_custom_border_color; the same values as on the Direct3D 12 backend
+  // are used. Without the extension, they are approximated with the closest
+  // built-in black.
+  VkSamplerCustomBorderColorCreateInfoEXT custom_border_color_create_info;
+  float custom_border_color_r = 0.0f;
+  float custom_border_color_g = 0.0f;
+  float custom_border_color_b = 0.0f;
+  bool custom_border_color_needed = false;
   switch (parameters.border_color) {
-    case xenos::BorderColor::k_ABGR_White:
-      sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    case xenos::BorderColor::k_ACBYCR_Black:
+      custom_border_color_r = 0.5f;
+      custom_border_color_b = 0.5f;
+      custom_border_color_needed = true;
+      break;
+    case xenos::BorderColor::k_ACBCRY_Black:
+      custom_border_color_g = 0.5f;
+      custom_border_color_b = 0.5f;
+      custom_border_color_needed = true;
       break;
     default:
-      sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
       break;
+  }
+  if (custom_border_color_needed &&
+      vulkan_device->properties().customBorderColors &&
+      vulkan_device->properties().customBorderColorWithoutFormat) {
+    custom_border_color_create_info.sType =
+        VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT;
+    custom_border_color_create_info.pNext = sampler_create_info.pNext;
+    custom_border_color_create_info.customBorderColor.float32[0] =
+        custom_border_color_r;
+    custom_border_color_create_info.customBorderColor.float32[1] =
+        custom_border_color_g;
+    custom_border_color_create_info.customBorderColor.float32[2] =
+        custom_border_color_b;
+    custom_border_color_create_info.customBorderColor.float32[3] =
+        parameters.border_color_w_to_max ? 1.0f : 0.0f;
+    custom_border_color_create_info.format = VK_FORMAT_UNDEFINED;
+    sampler_create_info.pNext = &custom_border_color_create_info;
+    sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+  } else if (parameters.border_color == xenos::BorderColor::k_ABGR_White) {
+    sampler_create_info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+  } else {
+    sampler_create_info.borderColor =
+        parameters.border_color_w_to_max
+            ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+            : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
   }
   VkSampler vulkan_sampler;
   if (dfn.vkCreateSampler(device, &sampler_create_info, nullptr,
