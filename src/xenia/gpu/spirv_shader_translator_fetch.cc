@@ -1909,7 +1909,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               }
               // For NaN, considering that magnification is being done.
               spv::Id is_minifying_z = builder_->createBinOp(
-                  spv::OpFOrdLessThan, type_bool_, layer_max_gradient,
+                  spv::OpFOrdGreaterThan, type_bool_, layer_max_gradient,
                   builder_->makeFloatConstant(1.0f));
               // Choose what filter is actually used, the minification or the
               // magnification one.
