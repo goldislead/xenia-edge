@@ -797,8 +797,16 @@ class D3D12TextureCache final : public TextureCache {
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
+  static bool IsDXGIFormatLinearFilterable(ID3D12Device* device,
+                                           DXGI_FORMAT format);
+
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
+
+  // Bits indexed with the guest base format, set when the host formats used
+  // for sampling support linear filtering. Initialized in Initialize.
+  uint64_t linear_filterable_unsigned_formats_ = 0;
+  uint64_t linear_filterable_signed_formats_ = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount>

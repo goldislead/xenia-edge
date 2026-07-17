@@ -126,6 +126,25 @@ bool D3D12TextureCache::Initialize() {
       command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
+  // Check which guest formats can be sampled with linear filtering on the
+  // host, so samplers of textures that can only be point sampled can be
+  // downgraded. The decompressing fallback format is checked too since whether
+  // it's used depends on the dimensions of the specific texture.
+  for (uint32_t i = 0; i < uint32_t(xe::countof(host_formats_)); ++i) {
+    const HostFormat& host_format = host_formats_[i];
+    uint64_t format_bit = UINT64_C(1) << i;
+    if (IsDXGIFormatLinearFilterable(device,
+                                     host_format.dxgi_format_unsigned) &&
+        (host_format.load_shader_decompress == kLoadShaderIndexUnknown ||
+         IsDXGIFormatLinearFilterable(device,
+                                      host_format.dxgi_format_uncompressed))) {
+      linear_filterable_unsigned_formats_ |= format_bit;
+    }
+    if (IsDXGIFormatLinearFilterable(device, host_format.dxgi_format_signed)) {
+      linear_filterable_signed_formats_ |= format_bit;
+    }
+  }
+
   if (IsDrawResolutionScaled()) {
     // Buffers not used yet - no need aliasing barriers to change ownership of
     // gigabytes between even and odd buffers.
@@ -818,9 +837,37 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     parameters.min_linear = min_filter == xenos::TextureFilter::kLinear;
     parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
   }
+  if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear) {
+    // Check if the texture format is actually filterable on the host.
+    uint64_t format_bit = UINT64_C(1) << uint32_t(GetBaseFormat(fetch.format));
+    uint8_t swizzled_signs = texture_util::SwizzleSigns(fetch);
+    if ((texture_util::IsAnySignNotSigned(swizzled_signs) &&
+         !(linear_filterable_unsigned_formats_ & format_bit)) ||
+        (texture_util::IsAnySignSigned(swizzled_signs) &&
+         !(linear_filterable_signed_formats_ & format_bit))) {
+      parameters.mag_linear = 0;
+      parameters.min_linear = 0;
+      parameters.mip_linear = 0;
+      parameters.aniso_filter = xenos::AnisoFilter::kDisabled;
+    }
+  }
   parameters.mip_base_map = mip_base_map;
 
   return parameters;
+}
+
+bool D3D12TextureCache::IsDXGIFormatLinearFilterable(ID3D12Device* device,
+                                                     DXGI_FORMAT format) {
+  if (format == DXGI_FORMAT_UNKNOWN) {
+    return false;
+  }
+  D3D12_FEATURE_DATA_FORMAT_SUPPORT format_support = {format};
+  if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                         &format_support,
+                                         sizeof(format_support)))) {
+    return false;
+  }
+  return (format_support.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE) != 0;
 }
 
 void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
