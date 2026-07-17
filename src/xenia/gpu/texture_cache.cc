@@ -342,15 +342,18 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     TextureKey old_key = binding.key;
     uint32_t old_integer_scale_bits = binding.integer_scale_bits;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
-    BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    BindingParseReason parse_reason = BindingInfoFromFetchConstant(
+        fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
       }
       binding.Reset();
+      binding.parse_reason = parse_reason;
       continue;
     }
+    binding.parse_reason = parse_reason;
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle =
         GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
@@ -798,6 +801,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       if (!shared_memory().RequestRange(
               texture_key.base_page << 12,
               xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+        LogLoadFailure(texture, "Failed to request guest memory range for");
         continue;
       }
     }
@@ -805,6 +809,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       if (!shared_memory().RequestRange(
               texture_key.mip_page << 12,
               xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+        LogLoadFailure(texture, "Failed to request guest memory range for");
         continue;
       }
     }
@@ -815,10 +820,12 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       // GPU won't be trying to access unmapped memory.
       if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
                                               texture.GetGuestBaseSize(), 4)) {
+        LogLoadFailure(texture, "Failed to commit scaled resolve memory for");
         continue;
       }
       if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
                                               texture.GetGuestMipsSize(), 4)) {
+        LogLoadFailure(texture, "Failed to commit scaled resolve memory for");
         continue;
       }
     }
@@ -827,6 +834,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
     if (!LoadTextureDataFromResidentMemoryImpl(
             texture, (index_base_outdated & (1ULL << i)) != 0,
             (index_mips_outdated & (1ULL << i)) != 0)) {
+      LogLoadFailure(texture, "Failed to load data of");
       continue;
     }
 
@@ -849,9 +857,18 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
         continue;
       }
 
+      texture->SetLoadFailureLogged(false);
       texture->LogAction("Loaded");
     }
   }
+}
+
+void TextureCache::LogLoadFailure(Texture& texture, const char* action) {
+  if (texture.load_failure_logged()) {
+    return;
+  }
+  texture.SetLoadFailureLogged(true);
+  texture.LogAction(action);
 }
 bool TextureCache::LoadTextureData(Texture& texture) {
   // Lockless pre-check: if texture appears up-to-date, skip the lock.
@@ -892,6 +909,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.base_page << 12,
             xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+      LogLoadFailure(texture, "Failed to request guest memory range for");
       return false;
     }
   }
@@ -899,6 +917,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.mip_page << 12,
             xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+      LogLoadFailure(texture, "Failed to request guest memory range for");
       return false;
     }
   }
@@ -909,10 +928,12 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     // GPU won't be trying to access unmapped memory.
     if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
                                             texture.GetGuestBaseSize(), 4)) {
+      LogLoadFailure(texture, "Failed to commit scaled resolve memory for");
       return false;
     }
     if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
                                             texture.GetGuestMipsSize(), 4)) {
+      LogLoadFailure(texture, "Failed to commit scaled resolve memory for");
       return false;
     }
   }
@@ -920,6 +941,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // Actually load the texture data.
   if (!LoadTextureDataFromResidentMemoryImpl(texture, base_outdated,
                                              mips_outdated)) {
+    LogLoadFailure(texture, "Failed to load data of");
     return false;
   }
 
@@ -931,12 +953,13 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     return false;
   }
 
+  texture.SetLoadFailureLogged(false);
   texture.LogAction("Loaded");
 
   return true;
 }
 
-void TextureCache::BindingInfoFromFetchConstant(
+TextureCache::BindingParseReason TextureCache::BindingInfoFromFetchConstant(
     const xenos::xe_gpu_texture_fetch_t& fetch, TextureKey& key_out,
     uint8_t* swizzled_signs_out) {
   // Reset the key and the signedness.
@@ -960,14 +983,15 @@ void TextureCache::BindingInfoFromFetchConstant(
           "--gpu_allow_invalid_fetch_constants=true.",
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
           fetch.dword_4, fetch.dword_5);
-      return;
+      return BindingParseReason::kInvalidType;
     default:
       XELOGW(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "is completely invalid!",
+          "has completely invalid type {} (vertex fetch constant in a texture "
+          "slot)!",
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
-          fetch.dword_4, fetch.dword_5);
-      return;
+          fetch.dword_4, fetch.dword_5, static_cast<uint32_t>(fetch.type));
+      return BindingParseReason::kWrongType;
   }
 
   uint32_t width_minus_1, height_minus_1, depth_or_array_size_minus_1;
@@ -976,8 +1000,17 @@ void TextureCache::BindingInfoFromFetchConstant(
       fetch, &width_minus_1, &height_minus_1, &depth_or_array_size_minus_1,
       &base_page, &mip_page, nullptr, &mip_max_level);
   if (base_page == 0 && mip_page == 0) {
-    // No texture data at all.
-    return;
+    // No texture data at all. Fully zero fetch constants are simply unset
+    // slots - only log constants that carry other state.
+    if (fetch.dword_0 | fetch.dword_1 | fetch.dword_2 | fetch.dword_3 |
+        fetch.dword_4 | fetch.dword_5) {
+      XELOGD(
+          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+          "has no base or mip data address",
+          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
+          fetch.dword_4, fetch.dword_5);
+    }
+    return BindingParseReason::kNoData;
   }
   if (fetch.dimension == xenos::DataDimension::k1D) {
     bool is_invalid_1d = false;
@@ -1006,7 +1039,7 @@ void TextureCache::BindingInfoFromFetchConstant(
       is_invalid_1d = true;
     }
     if (is_invalid_1d) {
-      return;
+      return BindingParseReason::kUnsupported1D;
     }
   }
 
@@ -1029,6 +1062,25 @@ void TextureCache::BindingInfoFromFetchConstant(
 
   if (swizzled_signs_out != nullptr) {
     *swizzled_signs_out = texture_util::SwizzleSigns(fetch);
+  }
+
+  return BindingParseReason::kValid;
+}
+
+const char* TextureCache::GetBindingParseReasonName(BindingParseReason reason) {
+  switch (reason) {
+    case BindingParseReason::kValid:
+      return "valid";
+    case BindingParseReason::kInvalidType:
+      return "invalid fetch constant type";
+    case BindingParseReason::kWrongType:
+      return "vertex fetch constant in texture slot";
+    case BindingParseReason::kNoData:
+      return "no data address";
+    case BindingParseReason::kUnsupported1D:
+      return "unsupported 1D layout";
+    default:
+      return "unset";
   }
 }
 

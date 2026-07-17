@@ -165,6 +165,29 @@ class TextureCache {
                                  // of the structure is 0x28
   }
 
+  // Why the most recent parse of a texture fetch constant did or didn't
+  // produce a valid binding. The host null resource is bound in all non-kValid
+  // cases.
+  enum class BindingParseReason : uint8_t {
+    // Not parsed yet, or the binding has been reset.
+    kUnset = 0,
+    kValid,
+    // Type is kInvalidTexture while --gpu_allow_invalid_fetch_constants is
+    // disabled.
+    kInvalidType,
+    // A vertex fetch constant type in a texture slot.
+    kWrongType,
+    // Base and mip addresses are both zero.
+    kNoData,
+    // 1D texture that is too wide, tiled, or has packed mips.
+    kUnsupported1D,
+  };
+  static const char* GetBindingParseReasonName(BindingParseReason reason);
+  BindingParseReason GetTextureBindingParseReason(
+      uint32_t fetch_constant_index) const {
+    return texture_bindings_[fetch_constant_index].parse_reason;
+  }
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
@@ -261,6 +284,11 @@ class TextureCache {
     bool force_load_3d_tiling() const { return force_load_3d_tiling_; }
     void SetForceLoad3DTiling(bool force) { force_load_3d_tiling_ = force; }
 
+    // Rate limiting for load failure logging - a failure is logged once until
+    // a load succeeds.
+    bool load_failure_logged() const { return load_failure_logged_; }
+    void SetLoadFailureLogged(bool logged) { load_failure_logged_ = logged; }
+
     uint64_t GetHostMemoryUsage() const { return host_memory_usage_; }
 
     uint64_t last_usage_submission_index() const {
@@ -324,6 +352,9 @@ class TextureCache {
     // For 3D-as-2D wrappers: use 3D tiling when loading even though the host
     // texture is 2D.
     bool force_load_3d_tiling_ = false;
+
+    // Whether a load failure has already been logged for this texture.
+    bool load_failure_logged_ = false;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -512,6 +543,8 @@ class TextureCache {
     // Packed TextureSign values, 2 bit per each component, with guest-side
     // destination swizzle from the fetch constant applied to them.
     uint8_t swizzled_signs;
+    // Diagnostic result of the last fetch constant parse for this slot.
+    BindingParseReason parse_reason;
     // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
     // Signed version of the texture if the data in the signed version is
@@ -592,6 +625,8 @@ class TextureCache {
                                       uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
+  // Logs a texture data load failure once per texture until a load succeeds.
+  static void LogLoadFailure(Texture& texture, const char* action);
   // Writes the texture data (for base, mips or both - but not neither) from the
   // shared memory or the scaled resolve memory. The shared memory management is
   // done outside this function, the implementation just needs to load the data
@@ -602,8 +637,8 @@ class TextureCache {
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
-  // post-guest-swizzle signedness.
-  static void BindingInfoFromFetchConstant(
+  // post-guest-swizzle signedness. Returns why the key is or isn't valid.
+  static BindingParseReason BindingInfoFromFetchConstant(
       const xenos::xe_gpu_texture_fetch_t& fetch, TextureKey& key_out,
       uint8_t* swizzled_signs_out);
 
