@@ -37,7 +37,9 @@ struct SamplerInfo {
     return min_filter == other.min_filter && mag_filter == other.mag_filter &&
            mip_filter == other.mip_filter && clamp_u == other.clamp_u &&
            clamp_v == other.clamp_v && clamp_w == other.clamp_w &&
-           aniso_filter == other.aniso_filter && lod_bias == other.lod_bias &&
+           aniso_filter == other.aniso_filter &&
+           border_color == other.border_color &&
+           lod_bias == other.lod_bias &&
            mip_min_level == other.mip_min_level &&
            mip_max_level == other.mip_max_level;
   }
