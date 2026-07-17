@@ -2714,7 +2714,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
             return false;
           default:
-            // Type is kTexture (2) or kInvalidTexture (3) - completely wrong
+            // Type is kTexture (2) or kInvalidTexture (0) - completely wrong
             // for vertex data
             if (cvars::gpu_allow_invalid_fetch_constants) {
               XELOGW(
@@ -2729,8 +2729,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             }
             XELOGW(
                 "Vertex fetch constant {} ({:08X} {:08X}) is completely "
-                "invalid! Type={} - this slot contains a texture fetch "
-                "constant (type 2), not a vertex fetch constant (type 0). "
+                "invalid! Type={} - expected a vertex fetch constant (type 3). "
                 "This may indicate the shader is reading from the wrong fetch "
                 "constant index, or the game has a bug.",
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
