@@ -743,7 +743,7 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     // FSI handles depth manually.
     if (!edram_fragment_shader_interlock_ &&
         (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
-         DSV_IsApplyingPolygonOffset())) {
+         DSV_IsWritingUnorm24Depth() || DSV_IsApplyingPolygonOffset())) {
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeDepthReplacing);
       // Truncating float24 conversion of the rasterizer's own depth rounds
@@ -2354,11 +2354,12 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     }
   }
 
-  // FBO fragment depth output. Used for guest oDepth, float24 conversion, and
-  // the narrow host RT decal path. FSI manages depth in EDRAM instead.
+  // FBO fragment depth output. Used for guest oDepth, float24 and unorm24
+  // conversion, and the narrow host RT decal path. FSI manages depth in EDRAM
+  // instead.
   if (!edram_fragment_shader_interlock_ &&
       (current_shader().writes_depth() || DSV_IsWritingFloat24Depth() ||
-       DSV_IsApplyingPolygonOffset())) {
+       DSV_IsWritingUnorm24Depth() || DSV_IsApplyingPolygonOffset())) {
     output_fragment_depth_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassOutput, type_float_, "gl_FragDepth");
     builder_->addDecoration(output_fragment_depth_, spv::DecorationBuiltIn,

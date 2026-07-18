@@ -34,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 11;
+    static constexpr uint32_t kVersion = 12;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -58,7 +58,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
       kPolygonOffset,
       kFloat24TruncatingPolygonOffset,
       kFloat24RoundingPolygonOffset,
-      // TODO(Triang3l): Unorm24 (rounding) output mode.
+      // Converting the depth to the closest 32-bit float representable exactly
+      // as a 24-bit unorm value (bit-exactly matching xenos::UNorm24To32 used
+      // for EDRAM uploads and clears), rounding to the nearest even like the
+      // fixed-function conversion. Only needed when the host depth buffer for
+      // the guest 24-bit unorm depth is 32-bit floating-point (Vulkan without
+      // VK_FORMAT_D24_UNORM_S8_UINT support) - with a native host unorm24
+      // buffer, the fixed-function conversion is already exact. MSAA depth
+      // must be per-sample, so the shader runs at sample frequency.
+      kUnorm24Rounding,
+      kUnorm24RoundingPolygonOffset,
     };
 
     struct {
@@ -98,7 +107,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // coordinates input, and also effects the flag bits in PsParamGen.
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
-      DepthStencilMode depth_stencil_mode : 3;
+      DepthStencilMode depth_stencil_mode : 4;
       // For host render targets with MIN/MAX blend op - the source blend factor
       // to pre-multiply the shader output by (since Vulkan/D3D12 MIN/MAX
       // ignores blend factors, but Xbox 360 applies them). kOne means no
@@ -491,6 +500,23 @@ class SpirvShaderTranslator : public ShaderTranslator {
                                uint32_t f24_shift, bool remap_to_0_to_0_5,
                                bool result_as_uint,
                                spv::Id ext_inst_glsl_std_450);
+  // Converts the depth value externally clamped to [0, 1] to a 24-bit unorm
+  // value, rounding to the nearest even integer like the fixed-function
+  // conversion. If host_depth_on_unorm24_grid is true, the host depth is known
+  // to contain only exact results of DepthUnorm24To32 (when the depth is
+  // converted to unorm24 in pixel shaders), and the bit-exact inverse of it is
+  // performed instead - the round-to-nearest-even quantizer is not an inverse
+  // of it for a quarter of the possible 24-bit values (the odd ones between
+  // 0x400000 and 0x800000, for which the multiplication by 0xFFFFFF rounds to
+  // a 0.5 that RoundEven then takes to the even neighbor).
+  static spv::Id PreClampedDepthToUnorm24(SpirvBuilder& builder,
+                                          spv::Id f32_scalar,
+                                          bool host_depth_on_unorm24_grid,
+                                          spv::Id ext_inst_glsl_std_450);
+  // Converts a 24-bit unorm depth value in bits 0:23 to a 32-bit float,
+  // bit-exactly matching xenos::UNorm24To32.
+  static spv::Id DepthUnorm24To32(SpirvBuilder& builder,
+                                  spv::Id n24_uint_scalar);
 
  protected:
   void Reset() override;
@@ -590,6 +616,20 @@ class SpirvShaderTranslator : public ShaderTranslator {
            depth_stencil_mode ==
                Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
   }
+  // Whether the current non-FSI pixel shader should convert the depth to
+  // 24-bit unorm (because the guest depth buffer is unorm24, but the host
+  // depth buffer is float32).
+  bool DSV_IsWritingUnorm24Depth() const {
+    if (edram_fragment_shader_interlock_) {
+      return false;
+    }
+    Modification::DepthStencilMode depth_stencil_mode =
+        GetSpirvShaderModification().pixel.depth_stencil_mode;
+    return depth_stencil_mode ==
+               Modification::DepthStencilMode::kUnorm24Rounding ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kUnorm24RoundingPolygonOffset;
+  }
   // Whether the current non-FSI pixel shader applies polygon offset via shader
   // depth output instead of fixed function bias.
   bool DSV_IsApplyingPolygonOffset() const {
@@ -603,13 +643,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
            depth_stencil_mode == Modification::DepthStencilMode::
                                      kFloat24TruncatingPolygonOffset ||
            depth_stencil_mode ==
-               Modification::DepthStencilMode::kFloat24RoundingPolygonOffset;
+               Modification::DepthStencilMode::kFloat24RoundingPolygonOffset ||
+           depth_stencil_mode ==
+               Modification::DepthStencilMode::kUnorm24RoundingPolygonOffset;
   }
   // Whether the shader runs at sample frequency - when converting depth to
-  // float24 from the rasterizer's own depth (not guest oDepth), each sample
-  // needs its own depth value for intersections to be antialiased.
+  // float24 or unorm24 from the rasterizer's own depth (not guest oDepth),
+  // each sample needs its own depth value for intersections to be antialiased.
   bool IsSampleRate() const {
-    return is_pixel_shader() && DSV_IsWritingFloat24Depth() &&
+    return is_pixel_shader() &&
+           (DSV_IsWritingFloat24Depth() || DSV_IsWritingUnorm24Depth()) &&
            !current_shader().writes_depth();
   }
 

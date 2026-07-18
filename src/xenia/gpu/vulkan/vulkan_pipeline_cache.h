@@ -441,6 +441,9 @@ class VulkanPipelineCache {
   // backend's float24_{truncate,round}_ps.
   VkShaderModule float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule float24_round_fragment_shader_ = VK_NULL_HANDLE;
+  // Similar substitute for in-PS unorm24 conversion of the rasterizer's depth
+  // for guest depth-only draws to D24S8 depth buffers emulated as float32.
+  VkShaderModule unorm24_round_fragment_shader_ = VK_NULL_HANDLE;
 
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
   // Outputs transparent black while the real shader compiles in background.

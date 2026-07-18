@@ -139,6 +139,29 @@ DEFINE_bool(
     "depth is always used directly.",
     "GPU");
 DEFINE_bool(
+    depth_unorm24_convert_in_pixel_shader, false,
+    "Whether to convert the depth values to 24-bit unsigned normalized from "
+    "the host precision (32-bit floating point) directly in the pixel shaders "
+    "of guest draws when a host depth buffer is used, but the host doesn't "
+    "support a 24-bit unorm depth format (currently possible only on Vulkan, "
+    "primarily on AMD GPUs - Direct3D 12 requires 24-bit unorm depth "
+    "support).\n"
+    "This prevents the same kinds of visual artifacts in reinterpretation "
+    "round trips of depth buffers as described for "
+    "depth_float24_convert_in_pixel_shader, but for the 24-bit unorm (as "
+    "opposed to 20e4 floating-point) guest depth format.\n"
+    "This is a costly option because it makes the GPU unable to use depth "
+    "buffer compression and early depth rejection, and also with MSAA, forces "
+    "the pixel shader to run for every subpixel sample rather than for the "
+    "entire pixel, making pixel shading 2 or 4 times heavier depending on the "
+    "MSAA sample count.\n"
+    "If sample-rate shading or a floating-point host depth buffer fallback is "
+    "not needed on the host GPU, this is ignored.\n"
+    "When the depth buffer is emulated in software (via the fragment shader "
+    "interlock / rasterizer-ordered view), this is ignored because 24-bit "
+    "depth is always used directly.",
+    "GPU");
+DEFINE_bool(
     draw_resolution_scaled_texture_offsets, true,
     "Apply offsets from texture fetch instructions taking resolution scale "
     "into account for render-to-texture, for more correct shadow filtering, "

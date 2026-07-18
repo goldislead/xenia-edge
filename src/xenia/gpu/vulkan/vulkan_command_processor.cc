@@ -2660,6 +2660,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       normalized_depth_control,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
+      host_render_targets_used &&
+          render_target_cache_->depth_unorm24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth());
   gviargs.SetupRegisterValues(regs);
 

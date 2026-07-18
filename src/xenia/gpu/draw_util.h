@@ -317,6 +317,7 @@ struct GetViewportInfoArgs {
           uint32_t origin_bottom_left : 1;
           uint32_t allow_reverse_z : 1;
           uint32_t convert_z_to_float24 : 1;
+          uint32_t convert_z_to_unorm24 : 1;
           uint32_t full_float24_in_0_to_1 : 1;
           uint32_t pixel_shader_writes_depth : 1;
           xenos::DepthRenderTargetFormat depth_format : 1;
@@ -366,8 +367,8 @@ struct GetViewportInfoArgs {
              bool _origin_bottom_left, uint32_t _x_max, uint32_t _y_max,
              bool _allow_reverse_z,
              reg::RB_DEPTHCONTROL _normalized_depth_control,
-             bool _convert_z_to_float24, bool _full_float24_in_0_to_1,
-             bool _pixel_shader_writes_depth) {
+             bool _convert_z_to_float24, bool _convert_z_to_unorm24,
+             bool _full_float24_in_0_to_1, bool _pixel_shader_writes_depth) {
     packed_portions = 0;
     padding_set_to_0 = 0;  // important to zero this
     draw_resolution_scale_x = _draw_resolution_scale_x;
@@ -380,6 +381,7 @@ struct GetViewportInfoArgs {
     allow_reverse_z = _allow_reverse_z;
     normalized_depth_control = _normalized_depth_control;
     convert_z_to_float24 = _convert_z_to_float24;
+    convert_z_to_unorm24 = _convert_z_to_unorm24;
     full_float24_in_0_to_1 = _full_float24_in_0_to_1;
     pixel_shader_writes_depth = _pixel_shader_writes_depth;
   }

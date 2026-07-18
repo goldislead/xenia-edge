@@ -2701,7 +2701,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       normalized_depth_control,
       host_render_targets_used &&
           render_target_cache_->depth_float24_convert_in_pixel_shader(),
-      host_render_targets_used, pixel_shader && pixel_shader->writes_depth());
+      // Direct3D 12 requires 24-bit unorm depth support, so the conversion of
+      // unorm24 depth in pixel shaders is never needed.
+      false, host_render_targets_used,
+      pixel_shader && pixel_shader->writes_depth());
   gviargs.SetupRegisterValues(regs);
 
   if (gviargs == previous_viewport_info_args_) {

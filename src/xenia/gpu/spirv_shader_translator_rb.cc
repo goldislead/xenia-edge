@@ -426,6 +426,67 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder,
   return f32;
 }
 
+spv::Id SpirvShaderTranslator::PreClampedDepthToUnorm24(
+    SpirvBuilder& builder, spv::Id f32_scalar, bool host_depth_on_unorm24_grid,
+    spv::Id ext_inst_glsl_std_450) {
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+  if (host_depth_on_unorm24_grid) {
+    // The host depth contains only exact results of DepthUnorm24To32, which
+    // is (n24 + (n24 >> 23)) * 2^-24 - multiplication by 2^24 thus exactly
+    // reconstructs the n24 + (n24 >> 23) integer, from which the bias needs to
+    // be subtracted for n24 of 0x800000 and above (biased values are
+    // 0x800001...0x1000000, unbiased ones are 0x0...0x7FFFFF, so exactly
+    // 0x800000 can't be received from an on-grid input, but as a safety
+    // measure for off-grid inputs, values above it are treated as biased).
+    spv::Id biased_uint = builder.createUnaryOp(
+        spv::OpConvertFToU, type_uint,
+        builder.createUnaryBuiltinCall(
+            type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
+            builder.createBinOp(spv::OpFMul, type_float, f32_scalar,
+                                builder.makeFloatConstant(float(1 << 24)))));
+    return builder.createBinOp(
+        spv::OpISub, type_uint, biased_uint,
+        builder.createTriOp(
+            spv::OpSelect, type_uint,
+            builder.createBinOp(spv::OpUGreaterThan, builder.makeBoolType(),
+                                biased_uint,
+                                builder.makeUintConstant(0x800000)),
+            builder.makeUintConstant(1), builder.makeUintConstant(0)));
+  }
+  // Round to the nearest even integer. This seems to be the correct
+  // conversion, adding +0.5 and rounding towards zero results in red instead
+  // of black in the 4D5307E6 clear shader.
+  return builder.createUnaryOp(
+      spv::OpConvertFToU, type_uint,
+      builder.createUnaryBuiltinCall(
+          type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
+          builder.createBinOp(spv::OpFMul, type_float, f32_scalar,
+                              builder.makeFloatConstant(float(0xFFFFFF)))));
+}
+
+spv::Id SpirvShaderTranslator::DepthUnorm24To32(SpirvBuilder& builder,
+                                                spv::Id n24_uint_scalar) {
+  // Multiplying by 1.0 / 0xFFFFFF produces an incorrect result (for 0xC00000,
+  // for instance - which is 2_10_10_10 clear to 0001) - rescale from
+  // 0...0xFFFFFF to 0...0x1000000 doing what true float division followed by
+  // multiplication does (on x86-64 MSVC with default SSE rounding) - values
+  // starting from 0x800000 become bigger by 1; then accurately bias the
+  // result's exponent. Matches xenos::UNorm24To32.
+  spv::Id type_float = builder.makeFloatType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+  return builder.createBinOp(
+      spv::OpFMul, type_float,
+      builder.createUnaryOp(
+          spv::OpConvertUToF, type_float,
+          builder.createBinOp(
+              spv::OpIAdd, type_uint, n24_uint_scalar,
+              builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                  n24_uint_scalar,
+                                  builder.makeUintConstant(23)))),
+      builder.makeFloatConstant(1.0f / float(1 << 24)));
+}
+
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
@@ -1518,12 +1579,14 @@ void SpirvShaderTranslator::CompleteFragmentShader_DSV_DepthTo24Bit() {
   }
   bool shader_writes_depth = current_shader().writes_depth();
   bool is_float24 = DSV_IsWritingFloat24Depth();
+  bool is_unorm24 = DSV_IsWritingUnorm24Depth();
   bool apply_polygon_offset =
       DSV_IsApplyingPolygonOffset() && !shader_writes_depth;
-  assert_true(shader_writes_depth || is_float24 || apply_polygon_offset);
+  assert_true(shader_writes_depth || is_float24 || is_unorm24 ||
+              apply_polygon_offset);
 
-  // Source depth from guest oDepth, or from raster depth for float24 conversion
-  // and the host RT decal path.
+  // Source depth from guest oDepth, or from raster depth for float24 / unorm24
+  // conversion and the host RT decal path.
   spv::Id depth_value;
   if (shader_writes_depth) {
     depth_value =
@@ -1586,9 +1649,30 @@ void SpirvShaderTranslator::CompleteFragmentShader_DSV_DepthTo24Bit() {
       depth_value = builder_->createTriBuiltinCall(
           type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, depth_value,
           const_float_0_, const_float_1_);
+    } else if (is_unorm24) {
+      // No host depth range remapping for unorm24, but clamp to [0, 1] for the
+      // unsigned conversion (mainly for the polygon offset path, which may
+      // push the depth out of the range).
+      depth_value = builder_->createTriBuiltinCall(
+          type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, host_depth,
+          const_float_0_, const_float_1_);
     } else {
       depth_value = host_depth;
     }
+  }
+
+  if (is_unorm24) {
+    // Unorm24 mode: the guest depth buffer is unorm24, but the host depth
+    // buffer is float32 - write the exact float32 representation of the
+    // quantized unorm24 value (the same that EDRAM uploads and clears produce
+    // via xenos::UNorm24To32), so the host buffer is the canonical encoding
+    // and survives reinterpretation round trips losslessly.
+    builder_->createStore(
+        DepthUnorm24To32(*builder_,
+                         PreClampedDepthToUnorm24(*builder_, depth_value, false,
+                                                  ext_inst_glsl_std_450_)),
+        output_fragment_depth_);
+    return;
   }
 
   if (!is_float24) {

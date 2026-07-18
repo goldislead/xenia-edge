@@ -532,6 +532,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     depth_float24_convert_in_pixel_shader_ =
         cvars::depth_float24_convert_in_pixel_shader &&
         device_properties.sampleRateShading;
+    // In-PS unorm24 conversion is only needed when the host doesn't support a
+    // 24-bit unorm depth format (with one, the fixed-function conversion is
+    // already exact); like float24, it requires per-sample shading under MSAA.
+    depth_unorm24_convert_in_pixel_shader_ =
+        cvars::depth_unorm24_convert_in_pixel_shader &&
+        !depth_unorm24_vulkan_format_supported_ &&
+        device_properties.sampleRateShading;
 
     // Host depth storing pipeline layout.
     VkDescriptorSetLayout host_depth_store_descriptor_set_layouts[] = {
@@ -740,6 +747,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
     // parity with the host render target path).
     depth_float24_round_ = true;
     depth_float24_convert_in_pixel_shader_ = true;
+    depth_unorm24_convert_in_pixel_shader_ = true;
 
     // The pipeline layout and the pipelines for clearing the EDRAM buffer in
     // resolves.
@@ -2026,7 +2034,11 @@ bool VulkanRenderTargetCache::IsHostDepthEncodingDifferent(
     xenos::DepthRenderTargetFormat format) const {
   switch (format) {
     case xenos::DepthRenderTargetFormat::kD24S8:
-      return !depth_unorm24_vulkan_format_supported();
+      // When converting in the pixel shader, the host float32 depth already
+      // holds unorm24-grid values, so it's the canonical encoding and the
+      // separate host depth tracking isn't needed.
+      return !depth_unorm24_vulkan_format_supported() &&
+             !depth_unorm24_convert_in_pixel_shader();
     case xenos::DepthRenderTargetFormat::kD24FS8:
       // When converting in the pixel shader, the host float32 depth already
       // holds float24-grid values, so it's the canonical encoding and the
@@ -3401,16 +3413,9 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
         spv::Id depth24 = spv::NoResult;
         switch (source_depth_format) {
           case xenos::DepthRenderTargetFormat::kD24S8: {
-            // Round to the nearest even integer. This seems to be the
-            // correct conversion, adding +0.5 and rounding towards zero results
-            // in red instead of black in the 4D5307E6 clear shader.
-            depth24 = builder.createUnaryOp(
-                spv::OpConvertFToU, type_uint,
-                builder.createUnaryBuiltinCall(
-                    type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
-                    builder.createBinOp(
-                        spv::OpFMul, type_float, source_depth_float[i],
-                        builder.makeFloatConstant(float(0xFFFFFF)))));
+            depth24 = SpirvShaderTranslator::PreClampedDepthToUnorm24(
+                builder, source_depth_float[i],
+                depth_unorm24_convert_in_pixel_shader(), ext_inst_glsl_std_450);
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
@@ -3685,16 +3690,9 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
       } else {
         switch (source_depth_format) {
           case xenos::DepthRenderTargetFormat::kD24S8: {
-            // Round to the nearest even integer. This seems to be the correct
-            // conversion, adding +0.5 and rounding towards zero results in red
-            // instead of black in the 4D5307E6 clear shader.
-            packed = builder.createUnaryOp(
-                spv::OpConvertFToU, type_uint,
-                builder.createUnaryBuiltinCall(
-                    type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
-                    builder.createBinOp(
-                        spv::OpFMul, type_float, source_depth_float[0],
-                        builder.makeFloatConstant(float(0xFFFFFF)))));
+            packed = SpirvShaderTranslator::PreClampedDepthToUnorm24(
+                builder, source_depth_float[0],
+                depth_unorm24_convert_in_pixel_shader(), ext_inst_glsl_std_450);
           } break;
           case xenos::DepthRenderTargetFormat::kD24FS8: {
             packed = SpirvShaderTranslator::PreClampedDepthTo20e4(
@@ -4158,16 +4156,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
             // matches the value in the currently owning guest render target.
             switch (dest_depth_format) {
               case xenos::DepthRenderTargetFormat::kD24S8: {
-                // Round to the nearest even integer. This seems to be the
-                // correct conversion, adding +0.5 and rounding towards zero
-                // results in red instead of black in the 4D5307E6 clear shader.
-                host_depth24 = builder.createUnaryOp(
-                    spv::OpConvertFToU, type_uint,
-                    builder.createUnaryBuiltinCall(
-                        type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
-                        builder.createBinOp(
-                            spv::OpFMul, type_float, host_depth32,
-                            builder.makeFloatConstant(float(0xFFFFFF)))));
+                host_depth24 = SpirvShaderTranslator::PreClampedDepthToUnorm24(
+                    builder, host_depth32,
+                    depth_unorm24_convert_in_pixel_shader(),
+                    ext_inst_glsl_std_450);
               } break;
               case xenos::DepthRenderTargetFormat::kD24FS8: {
                 host_depth24 = SpirvShaderTranslator::PreClampedDepthTo20e4(
@@ -4202,22 +4194,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(
           spv::Id guest_depth32 = spv::NoResult;
           switch (dest_depth_format) {
             case xenos::DepthRenderTargetFormat::kD24S8: {
-              // Multiplying by 1.0 / 0xFFFFFF produces an incorrect result (for
-              // 0xC00000, for instance - which is 2_10_10_10 clear to 0001) -
-              // rescale from 0...0xFFFFFF to 0...0x1000000 doing what true
-              // float division followed by multiplication does (on x86-64 MSVC
-              // with default SSE rounding) - values starting from 0x800000
-              // become bigger by 1; then accurately bias the result's exponent.
-              guest_depth32 = builder.createBinOp(
-                  spv::OpFMul, type_float,
-                  builder.createUnaryOp(
-                      spv::OpConvertUToF, type_float,
-                      builder.createBinOp(
-                          spv::OpIAdd, type_uint, guest_depth24,
-                          builder.createBinOp(spv::OpShiftRightLogical,
-                                              type_uint, guest_depth24,
-                                              builder.makeUintConstant(23)))),
-                  builder.makeFloatConstant(1.0f / float(1 << 24)));
+              guest_depth32 = SpirvShaderTranslator::DepthUnorm24To32(
+                  builder, guest_depth24);
             } break;
             case xenos::DepthRenderTargetFormat::kD24FS8: {
               guest_depth32 = SpirvShaderTranslator::Depth20e4To32(
@@ -5836,16 +5814,9 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
         builder.createCompositeExtract(source_vec4, type_float, 0);
     switch (key.GetDepthFormat()) {
       case xenos::DepthRenderTargetFormat::kD24S8: {
-        // Round to the nearest even integer. This seems to be the correct
-        // conversion, adding +0.5 and rounding towards zero results in red
-        // instead of black in the 4D5307E6 clear shader.
-        packed[0] = builder.createUnaryOp(
-            spv::OpConvertFToU, type_uint,
-            builder.createUnaryBuiltinCall(
-                type_float, ext_inst_glsl_std_450, GLSLstd450RoundEven,
-                builder.createBinOp(
-                    spv::OpFMul, type_float, source_depth32,
-                    builder.makeFloatConstant(float(0xFFFFFF)))));
+        packed[0] = SpirvShaderTranslator::PreClampedDepthToUnorm24(
+            builder, source_depth32, depth_unorm24_convert_in_pixel_shader(),
+            ext_inst_glsl_std_450);
       } break;
       case xenos::DepthRenderTargetFormat::kD24FS8: {
         packed[0] = SpirvShaderTranslator::PreClampedDepthTo20e4(

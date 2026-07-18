@@ -598,6 +598,19 @@ void GetHostViewportInfo(GetViewportInfoArgs* XE_RESTRICT args,
   }
 
   if (args->normalized_depth_control.z_enable &&
+      args->depth_format == xenos::DepthRenderTargetFormat::kD24S8 &&
+      args->convert_z_to_unorm24) {
+    // Similar to the float24 case below - the depth values will be converted
+    // in the pixel shader (to the closest float32 exactly representing a
+    // unorm24 value), so the clamping bounds must be on the unorm24 grid too.
+    // The GPU quantizer rounds to the nearest even, matching this.
+    z_min =
+        xenos::UNorm24To32(uint32_t(std::nearbyintf(z_min * float(0xFFFFFF))));
+    z_max =
+        xenos::UNorm24To32(uint32_t(std::nearbyintf(z_max * float(0xFFFFFF))));
+  }
+
+  if (args->normalized_depth_control.z_enable &&
       args->depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     if (args->convert_z_to_float24) {
       // Need to adjust the bounds that the resulting depth values will be
