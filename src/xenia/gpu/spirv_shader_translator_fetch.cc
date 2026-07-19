@@ -1352,9 +1352,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             z_3d = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
                                                       z_coordinate_ref, z_size);
           }
+          if_data_is_3d.makeBeginElse();
+          spv::Id z_stacked_clamped;
+          {
+            // Clamp the layer index to a valid range so an Inf or NaN
+            // coordinate does not select an undefined array layer or poison
+            // the inter-layer lerp factor - Vulkan's rounding of a non-finite
+            // layer coordinate doesn't produce a defined layer, unlike the
+            // defined NaN-to-zero conversion and array slice clamping of
+            // Direct3D. The normalized-coordinate stacked path below does the
+            // same after denormalization.
+            assert_true(z_size != spv::NoResult);
+            z_stacked_clamped = builder_->createTriBuiltinCall(
+                type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+                z_coordinate_ref, const_float_0_,
+                builder_->createNoContractionBinOp(
+                    spv::OpFSub, type_float_, z_size,
+                    builder_->makeFloatConstant(1.0f)));
+          }
           if_data_is_3d.makeEndIf();
           z_coordinate_ref =
-              if_data_is_3d.createMergePhi(z_3d, z_coordinate_ref);
+              if_data_is_3d.createMergePhi(z_3d, z_stacked_clamped);
         } else {
           // Denormalize the Z coordinate for a stacked texture, and apply the
           // offset.
@@ -1393,6 +1411,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             z_stacked = builder_->createNoContractionBinOp(
                 spv::OpFAdd, type_float_, z_stacked, z_offset);
           }
+          // Clamp the layer index to a valid range so an Inf or NaN coordinate
+          // does not select an undefined array layer.
+          z_stacked = builder_->createTriBuiltinCall(
+              type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp, z_stacked,
+              const_float_0_,
+              builder_->createNoContractionBinOp(
+                  spv::OpFSub, type_float_, z_size,
+                  builder_->makeFloatConstant(1.0f)));
           builder_->createBranch(&block_dimension_merge);
           // Select one of the two.
           builder_->setBuildPoint(&block_dimension_merge);
