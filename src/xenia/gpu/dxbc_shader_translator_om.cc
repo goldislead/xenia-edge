@@ -65,8 +65,8 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // system_temp_rov_params_.x = X sample 0 position
   // system_temp_rov_params_.y = Y sample 0 position
   {
-    uint32_t scale_x = draw_resolution_scale_x_;
-    uint32_t scale_y = draw_resolution_scale_y_;
+    uint32_t scale_x = GetCurrentDrawResolutionScaleX();
+    uint32_t scale_y = GetCurrentDrawResolutionScaleY();
     bool resolution_scaled = scale_x > 1 || scale_y > 1;
     uint32_t guest_pixel_temp = UINT32_MAX;
     if (resolution_scaled) {
@@ -177,11 +177,11 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // For depth-only:
   //   Same, but for full 80x16 tiles, not 40x16 half-tiles.
   uint32_t tile_width =
-      xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX();
   uint32_t tile_or_tile_half_width =
       tile_width >> uint32_t(any_color_targets_written);
   uint32_t tile_height =
-      xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
+      xenos::kEdramTileHeightSamples * GetCurrentDrawResolutionScaleY();
   // system_temp_rov_params_.x = X sample 0 position within the half-tile or
   //                             tile
   // system_temp_rov_params_.y = Y sample 0 position within the (half-)tile
@@ -455,6 +455,13 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_rov_params_, 0b0010),
             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
             dxbc::Src::LU(tile_size * edram_tile_count_));
+  // Native draws address the native region, its base added after the wrap.
+  uint32_t edram_region_base_dwords = GetNativeRegionBaseDwords();
+  if (edram_region_base_dwords) {
+    a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+              dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+              dxbc::Src::LU(edram_region_base_dwords));
+  }
 
   // ***************************************************************************
   // Sample coverage to system_temp_rov_params_.x.
@@ -1253,10 +1260,11 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     // address.
     {
       uint32_t tile_width =
-          xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
-      int32_t sample_column_delta = int32_t(2 * draw_resolution_scale_x_);
+          xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX();
+      int32_t sample_column_delta =
+          int32_t(2 * GetCurrentDrawResolutionScaleX());
       int32_t sample_row_delta =
-          int32_t(2 * draw_resolution_scale_y_ * tile_width);
+          int32_t(2 * GetCurrentDrawResolutionScaleY() * tile_width);
       int32_t sample_delta;
       if (!(i & 1)) {
         sample_delta = sample_column_delta;
@@ -2491,7 +2499,7 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   dxbc::Src temp_w_src(dxbc::Src::R(temp, dxbc::Src::kWWWW));
 
   uint32_t tile_width =
-      xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX();
 
   // Do late depth/stencil test (which includes writing) if needed or deferred
   // depth writing.
@@ -2521,9 +2529,10 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // Go to the next sample, with the same deltas as in the depth sample
       // loop above, just without restoring the sample 0 address at the end.
       if (i < 3) {
-        int32_t sample_column_delta = int32_t(2 * draw_resolution_scale_x_);
+        int32_t sample_column_delta =
+            int32_t(2 * GetCurrentDrawResolutionScaleX());
         int32_t sample_row_delta =
-            int32_t(2 * draw_resolution_scale_y_ * tile_width);
+            int32_t(2 * GetCurrentDrawResolutionScaleY() * tile_width);
         a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
                   dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
                   dxbc::Src::LI((i & 1) ? sample_row_delta - sample_column_delta
@@ -2555,8 +2564,8 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
   uint32_t shader_writes_color_targets =
       current_shader().writes_color_targets();
   uint32_t edram_size_32bpp_samples =
-      (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) * tile_width *
-      edram_tile_count_;
+      (xenos::kEdramTileHeightSamples * GetCurrentDrawResolutionScaleY()) *
+      tile_width * edram_tile_count_;
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(shader_writes_color_targets & (1 << i))) {
       continue;
@@ -2634,6 +2643,12 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
               dxbc::Dest::R(system_temp_rov_params_, 0b0010),
               dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
               dxbc::Src::LU(edram_size_32bpp_samples));
+    uint32_t edram_region_base_dwords = GetNativeRegionBaseDwords();
+    if (edram_region_base_dwords) {
+      a_.OpIAdd(dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+                dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+                dxbc::Src::LU(edram_region_base_dwords));
+    }
 
     dxbc::Src rt_blend_factors_ops_src(LoadSystemConstant(
         SystemConstants::Index::kEdramRTBlendFactorsOps,
@@ -3527,9 +3542,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
       // the address will be recalculated.
       if (j < 3) {
         int32_t sample_row_delta =
-            int32_t(2 * draw_resolution_scale_y_ * tile_width);
+            int32_t(2 * GetCurrentDrawResolutionScaleY() * tile_width);
         int32_t sample_column_delta_32bpp =
-            int32_t(2 * draw_resolution_scale_x_);
+            int32_t(2 * GetCurrentDrawResolutionScaleX());
         int32_t sample_column_delta_64bpp = 2 * sample_column_delta_32bpp;
         // temp.z = whether the render target is 64bpp.
         a_.OpAnd(temp_z_dest, rt_format_flags_src,

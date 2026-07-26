@@ -129,6 +129,17 @@ PipelineCache::PipelineCache(D3D12CommandProcessor& command_processor,
               true, DepthStencilMode::kFloat24Rounding));
     }
   }
+  if (edram_rov_used && render_target_cache_.HasNativeRegion()) {
+    // Variants for draws kept at 1x1 by draw_resolution_scale_threshold.
+    using DepthStencilMode =
+        DxbcShaderTranslator::Modification::DepthStencilMode;
+    depth_only_pixel_shader_native_ =
+        std::move(shader_translator_->CreateDepthOnlyPixelShader(
+            false, DepthStencilMode::kNoModifiers, false, true));
+    viz_survey_depth_only_pixel_shader_native_ =
+        std::move(shader_translator_->CreateDepthOnlyPixelShader(
+            false, DepthStencilMode::kNoModifiers, true, true));
+  }
 }
 
 PipelineCache::~PipelineCache() { Shutdown(); }
@@ -706,12 +717,12 @@ PipelineCache::GetCurrentPixelShaderModification(
     modification.pixel.param_gen_point = 0;
   }
 
+  // Whether this draw is native res due to a scale threshold.
+  modification.pixel.resolution_scale_native =
+      uint32_t(render_target_cache_.IsDrawScaleNative());
+
   if (render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
-    // Whether this draw is native res due to a scale threshold. (RTV only)
-    modification.pixel.resolution_scale_native =
-        uint32_t(render_target_cache_.IsDrawScaleNative());
-
     using DepthStencilMode =
         DxbcShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -1461,6 +1472,10 @@ bool PipelineCache::GetCurrentStateDescription(
     cull_front = false;
     cull_back = false;
   }
+  // The slope-scaled depth bias multiplier and the ROV depth-only shader
+  // variant depend on this at pipeline creation.
+  description_out.resolution_scale_native =
+      uint32_t(render_target_cache_.IsDrawScaleNative());
   if (!edram_rov_used && !depth_bias_in_pixel_shader) {
     float polygon_offset, polygon_offset_scale;
     draw_util::GetPreferredFacePolygonOffset(
@@ -1469,10 +1484,6 @@ bool PipelineCache::GetCurrentStateDescription(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
-    // The slope-scaled depth bias multiplier depends on this at pipeline
-    // creation.
-    description_out.resolution_scale_native =
-        uint32_t(render_target_cache_.IsDrawScaleNative());
   }
   description_out.zpd_total = uint32_t(zpd_total);
   description_out.viz_survey = uint32_t(viz_survey && edram_rov_used);
@@ -3053,13 +3064,25 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.pShaderBytecode = zpd_total_pixel_shader->data();
     state_desc.PS.BytecodeLength = zpd_total_pixel_shader->size();
   } else if (edram_rov_used) {
-    // VIZ surveys only use the ZPass counter.
-    const std::vector<uint8_t>& rov_pixel_shader =
-        description.viz_survey && !viz_survey_depth_only_pixel_shader_.empty()
-            ? viz_survey_depth_only_pixel_shader_
-            : depth_only_pixel_shader_;
-    state_desc.PS.pShaderBytecode = rov_pixel_shader.data();
-    state_desc.PS.BytecodeLength = rov_pixel_shader.size();
+    // VIZ surveys only use the ZPass counter. Stored pipelines from
+    // configurations where the native variant isn't created fall back to the
+    // scaled one, no draw can use them then.
+    const std::vector<uint8_t>* rov_pixel_shader;
+    if (description.viz_survey &&
+        !viz_survey_depth_only_pixel_shader_.empty()) {
+      rov_pixel_shader =
+          description.resolution_scale_native &&
+                  !viz_survey_depth_only_pixel_shader_native_.empty()
+              ? &viz_survey_depth_only_pixel_shader_native_
+              : &viz_survey_depth_only_pixel_shader_;
+    } else {
+      rov_pixel_shader = description.resolution_scale_native &&
+                                 !depth_only_pixel_shader_native_.empty()
+                             ? &depth_only_pixel_shader_native_
+                             : &depth_only_pixel_shader_;
+    }
+    state_desc.PS.pShaderBytecode = rov_pixel_shader->data();
+    state_desc.PS.BytecodeLength = rov_pixel_shader->size();
   } else {
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         (description.depth_func != xenos::CompareFunction::kAlways ||

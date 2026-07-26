@@ -391,13 +391,17 @@ class PipelineCache {
 
   // Empty depth-only pixel shader for writing to depth buffer via ROV when no
   // Xenos pixel shader provided, and for keeping RTV draws that write nothing
-  // rasterized for occlusion queries.
+  // rasterized for occlusion queries. The native variant addresses the 1x1
+  // tail region for ROV draws that draw_resolution_scale_threshold keeps
+  // unscaled.
   std::vector<uint8_t> depth_only_pixel_shader_;
+  std::vector<uint8_t> depth_only_pixel_shader_native_;
 
   std::vector<uint8_t> zpd_total_depth_only_pixel_shader_;
   std::vector<uint8_t> zpd_total_float24_truncate_pixel_shader_;
   std::vector<uint8_t> zpd_total_float24_round_pixel_shader_;
   std::vector<uint8_t> viz_survey_depth_only_pixel_shader_;
+  std::vector<uint8_t> viz_survey_depth_only_pixel_shader_native_;
 
   struct Pipeline {
     // nullptr if creation has failed or still pending.

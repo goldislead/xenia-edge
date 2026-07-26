@@ -93,7 +93,7 @@ DxbcShaderTranslator::~DxbcShaderTranslator() = default;
 
 std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(
     bool zpd_total, Modification::DepthStencilMode depth_stencil_mode,
-    bool viz_survey) {
+    bool viz_survey, bool resolution_scale_native) {
   is_depth_only_pixel_shader_ = true;
   is_viz_survey_pixel_shader_ = viz_survey;
   // TODO(Triang3l): Handle in a nicer way (is_depth_only_pixel_shader_ is a
@@ -105,6 +105,8 @@ std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader(
   Modification modification(0);
   modification.pixel.zpd_total = uint32_t(zpd_total);
   modification.pixel.depth_stencil_mode = depth_stencil_mode;
+  modification.pixel.resolution_scale_native =
+      uint32_t(resolution_scale_native);
   Shader::Translation& translation =
       *shader.GetOrCreateTranslation(modification.value);
   TranslateAnalyzedShader(translation);

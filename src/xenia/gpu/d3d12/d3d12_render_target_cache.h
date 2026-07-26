@@ -847,6 +847,21 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12PipelineState* resolve_rov_clear_32bpp_pipeline_ = nullptr;
   // Clearing 64bpp color.
   ID3D12PipelineState* resolve_rov_clear_64bpp_pipeline_ = nullptr;
+  // Unscaled variants: for clearing native surfaces in the native region
+  // draw_resolution_scale_threshold only.
+  ID3D12PipelineState* resolve_rov_clear_native_32bpp_pipeline_ = nullptr;
+  ID3D12PipelineState* resolve_rov_clear_native_64bpp_pipeline_ = nullptr;
+
+  // Scale class migrations between the scaled and native EDRAM regions.
+  // Compute shaders are generated like the dump ones.
+  // The key: (is_64bpp << 1) | to_native.
+  // May contain null after a generation failure so it's not retried.
+  ID3D12RootSignature* migration_root_signature_ = nullptr;
+  std::unordered_map<uint32_t, ID3D12PipelineState*> migration_pipelines_;
+  ID3D12PipelineState* GetOrCreateMigrationPipeline(bool is_64bpp,
+                                                    bool to_native);
+  void DispatchMigrations(const std::vector<Migration>& migrations);
+  std::vector<Migration> resolve_migrations_;
 };
 
 }  // namespace d3d12

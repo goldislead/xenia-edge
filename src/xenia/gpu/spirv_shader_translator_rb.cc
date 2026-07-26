@@ -791,8 +791,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       fsi_const_int_1 = builder_->makeIntConstant(1);
       // Apply resolution scaling to EDRAM size.
       fsi_const_edram_size_dwords = builder_->makeUintConstant(
-          xenos::kEdramTileWidthSamples * draw_resolution_scale_x_ *
-          xenos::kEdramTileHeightSamples * draw_resolution_scale_y_ *
+          xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX() *
+          xenos::kEdramTileHeightSamples * GetCurrentDrawResolutionScaleY() *
           edram_tile_count_);
       for (uint32_t i = 0; i < 4; ++i) {
         fsi_samples_covered[i] = builder_->createBinOp(
@@ -910,21 +910,29 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
             builder_->makeIntConstant(kSystemConstantEdramRTBaseDwordsScaled));
         id_vector_temp_.push_back(const_int_rt_index);
         // EDRAM addresses are wrapped on the Xenos (modulo the EDRAM size).
-        spv::Id rt_sample_0_address = builder_->createUnaryOp(
-            spv::OpBitcast, type_int_,
+        spv::Id rt_sample_0_address_wrapped = builder_->createBinOp(
+            spv::OpUMod, type_uint_,
             builder_->createBinOp(
-                spv::OpUMod, type_uint_,
-                builder_->createBinOp(
-                    spv::OpIAdd, type_uint_,
-                    builder_->createLoad(
-                        builder_->createAccessChain(spv::StorageClassUniform,
-                                                    uniform_system_constants_,
-                                                    id_vector_temp_),
-                        spv::NoPrecision),
-                    builder_->createTriOp(spv::OpSelect, type_uint_,
-                                          rt_is_64bpp, main_fsi_offset_64bpp_,
-                                          main_fsi_offset_32bpp_)),
-                fsi_const_edram_size_dwords));
+                spv::OpIAdd, type_uint_,
+                builder_->createLoad(
+                    builder_->createAccessChain(spv::StorageClassUniform,
+                                                uniform_system_constants_,
+                                                id_vector_temp_),
+                    spv::NoPrecision),
+                builder_->createTriOp(spv::OpSelect, type_uint_, rt_is_64bpp,
+                                      main_fsi_offset_64bpp_,
+                                      main_fsi_offset_32bpp_)),
+            fsi_const_edram_size_dwords);
+        // Native draws address the native region, its base added after the
+        // wrap.
+        uint32_t edram_region_base_dwords = GetNativeRegionBaseDwords();
+        if (edram_region_base_dwords) {
+          rt_sample_0_address_wrapped = builder_->createBinOp(
+              spv::OpIAdd, type_uint_, rt_sample_0_address_wrapped,
+              builder_->makeUintConstant(edram_region_base_dwords));
+        }
+        spv::Id rt_sample_0_address = builder_->createUnaryOp(
+            spv::OpBitcast, type_int_, rt_sample_0_address_wrapped);
 
         // Load the blending parameters for the render target.
         id_vector_temp_.clear();
@@ -1822,8 +1830,8 @@ void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
   spv::Id msaa_is_2x_or_4x = builder_->createBinOp(
       spv::OpUGreaterThanEqual, type_bool_, msaa_samples,
       builder_->makeUintConstant(uint32_t(xenos::MsaaSamples::k2X)));
-  const uint32_t resolution_scale[2] = {draw_resolution_scale_x_,
-                                        draw_resolution_scale_y_};
+  const uint32_t resolution_scale[2] = {GetCurrentDrawResolutionScaleX(),
+                                        GetCurrentDrawResolutionScaleY()};
   spv::Id guest_pixel[2], guest_subpixel[2];
   for (uint32_t i = 0; i < 2; ++i) {
     id_vector_temp_.clear();
@@ -1894,10 +1902,10 @@ void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
   // dividing by 40, not by 80.
   // Apply resolution scaling to tile dimensions.
   uint32_t tile_width =
-      xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX();
   spv::Id const_tile_half_width = builder_->makeUintConstant(tile_width >> 1);
   uint32_t tile_height =
-      xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
+      xenos::kEdramTileHeightSamples * GetCurrentDrawResolutionScaleY();
   spv::Id const_tile_height = builder_->makeUintConstant(tile_height);
   spv::Id tile_half_index[2], tile_half_sample_coordinates[2];
   for (uint32_t i = 0; i < 2; ++i) {
@@ -1977,6 +1985,12 @@ void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
                                     is_second_tile_half, const_uint_0_,
                                     const_tile_half_width))),
       builder_->makeUintConstant(tile_size * edram_tile_count_));
+  uint32_t edram_region_base_dwords = GetNativeRegionBaseDwords();
+  if (edram_region_base_dwords) {
+    main_fsi_address_depth_ = builder_->createBinOp(
+        spv::OpIAdd, type_uint_, main_fsi_address_depth_,
+        builder_->makeUintConstant(edram_region_base_dwords));
+  }
 
   if (current_shader().writes_color_targets()) {
     // Get the offset of the sample 0 within a 32bpp surface, with samples
@@ -2013,11 +2027,11 @@ spv::Id SpirvShaderTranslator::FSI_AddSampleOffset(spv::Id sample_0_address,
   // +2 sample columns from sample 0, 2 dwords wide each for 64bpp, and the
   // vertical sample bit is +2 sample rows, all at the guest scale.
   uint32_t tile_width =
-      xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+      xenos::kEdramTileWidthSamples * GetCurrentDrawResolutionScaleX();
   uint32_t sample_row_offset =
-      2 * draw_resolution_scale_y_ * tile_width * (sample_index >> 1);
+      2 * GetCurrentDrawResolutionScaleY() * tile_width * (sample_index >> 1);
   uint32_t sample_column_offset_32bpp =
-      2 * draw_resolution_scale_x_ * (sample_index & 1);
+      2 * GetCurrentDrawResolutionScaleX() * (sample_index & 1);
   spv::Id sample_offset;
   if ((sample_index & 1) && is_64bpp != spv::NoResult) {
     sample_offset = builder_->createTriOp(

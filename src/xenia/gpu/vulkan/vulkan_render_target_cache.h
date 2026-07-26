@@ -321,6 +321,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       EdramBufferModificationStatus::kUnmodified;
   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet edram_storage_buffer_descriptor_set_;
+  // Windowed to the native region (draw_resolution_scale_threshold).
+  VkDescriptorSet edram_native_region_descriptor_set_ = VK_NULL_HANDLE;
 
   VkPipelineLayout resolve_copy_pipeline_layout_ = VK_NULL_HANDLE;
   static const ResolveCopyShaderCode
@@ -997,6 +999,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout resolve_fsi_clear_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_fsi_clear_32bpp_pipeline_ = VK_NULL_HANDLE;
   VkPipeline resolve_fsi_clear_64bpp_pipeline_ = VK_NULL_HANDLE;
+  // Unscaled variants: for clearing native surfaces in the native region
+  // draw_resolution_scale_threshold only.
+  VkPipeline resolve_fsi_clear_native_32bpp_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline resolve_fsi_clear_native_64bpp_pipeline_ = VK_NULL_HANDLE;
+
+  // Scale class migrations between the scaled and native EDRAM regions.
+  // Compute shaders are generated like the dump ones.
+  // The key: (is_64bpp << 1) | to_native.
+  // May contain VK_NULL_HANDLE after a generation failure so it's not
+  // retried.
+  VkPipelineLayout migration_pipeline_layout_ = VK_NULL_HANDLE;
+  std::unordered_map<uint32_t, VkPipeline> migration_pipelines_;
+  VkPipeline GetOrCreateMigrationPipeline(bool is_64bpp, bool to_native);
+  void DispatchMigrations(const std::vector<Migration>& migrations);
+  std::vector<Migration> resolve_migrations_;
 };
 
 }  // namespace vulkan

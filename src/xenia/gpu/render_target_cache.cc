@@ -157,8 +157,7 @@ DEFINE_uint32(
     "Small offscreen surfaces like bloom or depth of field buffers often "
     "break when upscaled and keeping them native avoids that. The pitch "
     "is compared after alignment to 80 pixel EDRAM tiles, so prefer "
-    "conservative values, only as high as the broken effects need.\n"
-    "Host render targets only.",
+    "conservative values, only as high as the broken effects need.",
     "GPU");
 DEFINE_bool(
     gamma_render_target_as_unorm16, true,
@@ -549,27 +548,25 @@ void RenderTargetCache::InitializeCommon() {
       std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
       std::forward_as_tuple(edram_tile_count_, RenderTargetKey(),
                             RenderTargetKey(), RenderTargetKey()));
+  layout_ranges_.emplace(0, LayoutRange(edram_tile_count_, RenderTargetKey()));
 
-  if (cvars::draw_resolution_scale_threshold) {
-    if (GetPath() != Path::kHostRenderTargets) {
-      XELOGW(
-          "draw_resolution_scale_threshold is only supported by the host "
-          "render target path - ignoring");
-    } else if (!IsDrawResolutionScaled()) {
-      XELOGW(
-          "draw_resolution_scale_threshold has no effect without "
-          "draw_resolution_scale_x/y above 1 - ignoring");
-    }
+  if (cvars::draw_resolution_scale_threshold && !IsDrawResolutionScaled()) {
+    XELOGW(
+        "draw_resolution_scale_threshold has no effect without "
+        "draw_resolution_scale_x/y above 1 - ignoring");
   }
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
   ownership_ranges_.clear();
+  layout_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(
         std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
         std::forward_as_tuple(edram_tile_count_, RenderTargetKey(),
                               RenderTargetKey(), RenderTargetKey()));
+    layout_ranges_.emplace(0,
+                           LayoutRange(edram_tile_count_, RenderTargetKey()));
   }
 
   for (const auto& render_target_pair : render_targets_) {
@@ -674,11 +671,10 @@ int32_t RenderTargetCache::GetWindowOffsetTiles(
   return window_offset_tiles;
 }
 
-bool RenderTargetCache::IsScaleNativeForPitch(
-    uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples) const {
+bool RenderTargetCache::IsScaleNative(uint32_t pitch_tiles_at_32bpp,
+                                      xenos::MsaaSamples msaa_samples) const {
   uint32_t threshold = cvars::draw_resolution_scale_threshold;
-  if (!threshold || !IsDrawResolutionScaled() ||
-      GetPath() != Path::kHostRenderTargets) {
+  if (!threshold || !IsDrawResolutionScaled()) {
     return false;
   }
   // Pitch is the only guest surface dimension that's reliably known since host
@@ -701,8 +697,7 @@ bool RenderTargetCache::IsDrawScaleNative() const {
       ((rb_surface_info.surface_pitch << msaa_samples_x_log2) +
        (xenos::kEdramTileWidthSamples - 1)) /
       xenos::kEdramTileWidthSamples;
-  return IsScaleNativeForPitch(pitch_tiles_at_32bpp,
-                               rb_surface_info.msaa_samples);
+  return IsScaleNative(pitch_tiles_at_32bpp, rb_surface_info.msaa_samples);
 }
 
 bool RenderTargetCache::Update(bool is_rasterization_done,
@@ -742,7 +737,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                    (xenos::kEdramTileWidthSamples - 1)) /
                                   xenos::kEdramTileWidthSamples;
   // Scale class of all the surfaces of this draw.
-  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  bool scale_native = IsScaleNative(pitch_tiles_at_32bpp, msaa_samples);
   if (!interlock_barrier_only) {
     uint32_t pitch_pixels_tile_aligned_scaled =
         pitch_tiles_at_32bpp *
@@ -1212,6 +1207,18 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   if (interlock_barrier_only) {
     // No copying transfers or render target bindings - only needed the barrier.
+    // The layout map still has to learn who wrote what though, and where the
+    // incoming class differs from what a range holds, the backend dispatches
+    // a migration before the draw.
+    last_update_migrations_.clear();
+    if (HasNativeRegion()) {
+      for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+        RenderTargetKey rt_key = rt_keys[edram_bases_sorted[i].second];
+        AppendLayoutMigrations(rt_key, rt_starts_tiles[i], rt_lengths_tiles[i],
+                               last_update_migrations_);
+        ClaimLayoutRange(rt_key, rt_starts_tiles[i], rt_lengths_tiles[i]);
+      }
+    }
     return true;
   }
 
@@ -1458,12 +1465,42 @@ void RenderTargetCache::GetResolveCopyRectanglesToDump(
   }
 }
 
-bool RenderTargetCache::IsResolveSourceNativeOnly(uint32_t base,
-                                                  uint32_t row_length,
-                                                  uint32_t rows,
-                                                  uint32_t pitch) const {
-  if (!IsDrawResolutionScaled() || GetPath() != Path::kHostRenderTargets) {
+bool RenderTargetCache::IsResolveSourceNative(uint32_t base,
+                                              uint32_t row_length,
+                                              uint32_t rows,
+                                              uint32_t pitch) const {
+  if (!IsDrawResolutionScaled()) {
     return false;
+  }
+  if (GetPath() == Path::kPixelShaderInterlock) {
+    // The persistent map knows who last wrote each range. Ranges that are
+    // never-written hold undefined data in both regions, so they don't block
+    // any nativeness. Spans wrapping around EDRAM give up and resolve scaled.
+    bool any_native = false;
+    for (uint32_t row = 0; row < rows; ++row) {
+      uint32_t row_start = base + row * pitch;
+      uint32_t row_end = row_start + row_length;
+      if (row_end > edram_tile_count_) {
+        return false;
+      }
+      auto it = layout_ranges_.lower_bound(row_start);
+      if (it != layout_ranges_.begin()) {
+        auto it_pre = std::prev(it);
+        if (it_pre->second.end_tiles > row_start) {
+          it = it_pre;
+        }
+      }
+      for (; it != layout_ranges_.end() && it->first < row_end; ++it) {
+        if (it->second.key.IsEmpty()) {
+          continue;
+        }
+        if (!it->second.key.scale_native) {
+          return false;
+        }
+        any_native = true;
+      }
+    }
+    return any_native;
   }
   std::vector<ResolveCopyDumpRectangle> rectangles;
   GetResolveCopyRectanglesToDump(base, row_length, rows, pitch, rectangles);
@@ -1532,7 +1569,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
   uint32_t pitch_pixels =
       pitch_tiles_at_32bpp *
       (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
-  bool scale_native = IsScaleNativeForPitch(pitch_tiles_at_32bpp, msaa_samples);
+  bool scale_native = IsScaleNative(pitch_tiles_at_32bpp, msaa_samples);
   uint32_t pitch_pixels_scaled =
       pitch_pixels * (scale_native ? 1 : draw_resolution_scale_x());
   uint32_t max_render_target_width = GetMaxRenderTargetWidth();
@@ -1765,6 +1802,184 @@ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   }
   ownership_ranges_.clear();
   ownership_ranges_.emplace(0, empty_range);
+}
+
+void RenderTargetCache::ClaimResolveClear(
+    const draw_util::ResolveInfo& resolve_info, bool scale_native) {
+  assert_true(GetPath() == Path::kPixelShaderInterlock);
+  auto claim = [&](draw_util::ResolveEdramInfo edram_info, bool is_depth) {
+    if (!edram_info.pitch_tiles) {
+      return;
+    }
+    uint32_t base, row_length, rows;
+    draw_util::GetResolveEdramTileSpan(edram_info, resolve_info.coordinate_info,
+                                       resolve_info.height_div_8, base,
+                                       row_length, rows);
+    RenderTargetKey key;
+    key.base_tiles = edram_info.base_tiles;
+    key.pitch_tiles_at_32bpp =
+        edram_info.pitch_tiles >> uint32_t(edram_info.format_is_64bpp);
+    key.msaa_samples = edram_info.msaa_samples;
+    key.is_depth = uint32_t(is_depth);
+    // Same normalized formats the interlock branch of Update uses, so these
+    // keys compare equal to draw-claimed ones.
+    key.resource_format =
+        is_depth ? 0
+                 : uint32_t(edram_info.format_is_64bpp
+                                ? xenos::ColorRenderTargetFormat::k_16_16_16_16
+                                : xenos::ColorRenderTargetFormat::k_8_8_8_8);
+    key.scale_native = uint32_t(scale_native);
+    for (uint32_t row = 0; row < rows; ++row) {
+      ClaimLayoutRange(key,
+                       base - key.base_tiles + row * edram_info.pitch_tiles,
+                       row_length);
+    }
+  };
+  if (resolve_info.IsClearingDepth()) {
+    claim(resolve_info.depth_edram_info, true);
+  }
+  if (resolve_info.IsClearingColor()) {
+    claim(resolve_info.color_edram_info, false);
+  }
+}
+
+void RenderTargetCache::AppendLayoutMigrations(
+    RenderTargetKey key, uint32_t start_tiles_base_relative,
+    uint32_t length_tiles, std::vector<Migration>& migrations_out) const {
+  if (!length_tiles) {
+    return;
+  }
+  bool to_native = bool(key.scale_native);
+  auto walk_extent = [&](uint32_t extent_start, uint32_t extent_end) {
+    if (extent_start >= extent_end) {
+      return;
+    }
+    auto it = layout_ranges_.lower_bound(extent_start);
+    if (it != layout_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start) {
+        it = it_pre;
+      }
+    }
+    for (; it != layout_ranges_.end() && it->first < extent_end; ++it) {
+      const RenderTargetKey& owner = it->second.key;
+      // Never-written ranges have nothing to move. Zero-pitch keys shouldn't
+      // exist, but they'd make the shader divide by zero, so skip those too.
+      if (owner.IsEmpty() || bool(owner.scale_native) == to_native ||
+          !owner.pitch_tiles_at_32bpp) {
+        continue;
+      }
+      uint32_t sub_start = std::max(it->first, extent_start);
+      uint32_t sub_end = std::min(it->second.end_tiles, extent_end);
+      // Moving to native, the data is read with the old owner's scaled
+      // layout. Moving to scaled, it's duplicated in the incoming surface's.
+      RenderTargetKey scaled_key = to_native ? owner : key;
+      if (!migrations_out.empty()) {
+        Migration& last = migrations_out.back();
+        if (last.to_native == to_native && last.scaled_key == scaled_key &&
+            last.start_tiles + last.length_tiles == sub_start) {
+          last.length_tiles = sub_end - last.start_tiles;
+          continue;
+        }
+      }
+      migrations_out.push_back(
+          {sub_start, sub_end - sub_start, scaled_key, to_native});
+    }
+  };
+  uint32_t start_tiles =
+      (key.base_tiles + start_tiles_base_relative) & (edram_tile_count_ - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  walk_extent(start_tiles, std::min(end_tiles, edram_tile_count_));
+  if (end_tiles > edram_tile_count_) {
+    walk_extent(0, std::min(end_tiles & (edram_tile_count_ - 1), start_tiles));
+  }
+}
+
+void RenderTargetCache::GetResolveMigrations(
+    const draw_util::ResolveInfo& resolve_info,
+    std::vector<Migration>& migrations_out) {
+  migrations_out.clear();
+  if (!HasNativeRegion()) {
+    return;
+  }
+  draw_util::ResolveEdramInfo edram_info = resolve_info.IsCopyingDepth()
+                                               ? resolve_info.depth_edram_info
+                                               : resolve_info.color_edram_info;
+  if (!edram_info.pitch_tiles) {
+    return;
+  }
+  // The scaled side is keyed by the resolve surface. That's the layout the
+  // scaled copy shader reads with.
+  RenderTargetKey key;
+  key.base_tiles = edram_info.base_tiles;
+  key.pitch_tiles_at_32bpp =
+      edram_info.pitch_tiles >> uint32_t(edram_info.format_is_64bpp);
+  key.msaa_samples = edram_info.msaa_samples;
+  key.is_depth = edram_info.is_depth;
+  key.resource_format =
+      edram_info.is_depth
+          ? 0
+          : uint32_t(edram_info.format_is_64bpp
+                         ? xenos::ColorRenderTargetFormat::k_16_16_16_16
+                         : xenos::ColorRenderTargetFormat::k_8_8_8_8);
+  key.scale_native = 0;
+  uint32_t base, row_length, rows, pitch;
+  resolve_info.GetCopyEdramTileSpan(base, row_length, rows, pitch);
+  for (uint32_t row = 0; row < rows; ++row) {
+    AppendLayoutMigrations(key, base - key.base_tiles + row * pitch, row_length,
+                           migrations_out);
+  }
+  // The moved ranges hold scaled data in the resolve surface's layout now.
+  for (const Migration& migration : migrations_out) {
+    ClaimLayoutRange(
+        key, (migration.start_tiles - key.base_tiles) & (edram_tile_count_ - 1),
+        migration.length_tiles);
+  }
+}
+
+void RenderTargetCache::ClaimLayoutRange(RenderTargetKey key,
+                                         uint32_t start_tiles_base_relative,
+                                         uint32_t length_tiles) {
+  if (!length_tiles) {
+    return;
+  }
+  auto claim_extent = [this, key](uint32_t extent_start, uint32_t extent_end) {
+    if (extent_start >= extent_end) {
+      return;
+    }
+    auto it = layout_ranges_.lower_bound(extent_start);
+    if (it != layout_ranges_.begin()) {
+      auto it_pre = std::prev(it);
+      if (it_pre->second.end_tiles > extent_start &&
+          it_pre->second.key != key) {
+        // A different writer's range overlaps the start, split off the
+        // untouched head.
+        it = layout_ranges_.emplace_hint(it, extent_start, it_pre->second);
+        it_pre->second.end_tiles = extent_start;
+      }
+    }
+    while (it != layout_ranges_.end() && it->first < extent_end) {
+      if (it->second.key != key) {
+        if (it->second.end_tiles > extent_end) {
+          // Split off the tail past the claimed extent.
+          layout_ranges_.emplace_hint(std::next(it), extent_end, it->second);
+          it->second.end_tiles = extent_end;
+        }
+        it->second.key = key;
+      }
+      ++it;
+    }
+    // Not bothering to merge adjacent same-key ranges back.
+  };
+  // Same wrapping as ChangeOwnership, the range may cross the end of the
+  // EDRAM addressing period.
+  uint32_t start_tiles =
+      (key.base_tiles + start_tiles_base_relative) & (edram_tile_count_ - 1);
+  uint32_t end_tiles = start_tiles + length_tiles;
+  claim_extent(start_tiles, std::min(end_tiles, edram_tile_count_));
+  if (end_tiles > edram_tile_count_) {
+    claim_extent(0, std::min(end_tiles & (edram_tile_count_ - 1), start_tiles));
+  }
 }
 
 RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(

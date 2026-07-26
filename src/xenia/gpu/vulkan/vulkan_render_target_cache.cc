@@ -403,11 +403,17 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   // EDRAM contents reinterpretation buffer.
   // 90 MB with 9x resolution scaling - within the minimum
   // maxStorageBufferRange. The extended mode's tile count takes 4x that and
-  // goes past the minimum when scaled.
+  // goes past the minimum when scaled, and the native region of
+  // draw_resolution_scale_threshold adds one unscaled EDRAM.
+  VkDeviceSize edram_buffer_size =
+      VkDeviceSize(edram_size_bytes() *
+                   (draw_resolution_scale_x() * draw_resolution_scale_y()));
+  if (HasNativeRegion()) {
+    // Tail region for draws kept at 1x1 by draw_resolution_scale_threshold.
+    edram_buffer_size += edram_size_bytes();
+  }
   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device,
-          VkDeviceSize(edram_size_bytes() *
-                       (draw_resolution_scale_x() * draw_resolution_scale_y())),
+          vulkan_device, edram_buffer_size,
           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
           ui::vulkan::util::MemoryPurpose::kDeviceLocal, edram_buffer_,
@@ -425,16 +431,21 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   }
   edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
+  // One extra set windowed to the native region when it exists.
+  uint32_t edram_storage_buffer_descriptor_set_count =
+      HasNativeRegion() ? 2 : 1;
   VkDescriptorPoolSize edram_storage_buffer_descriptor_pool_size;
   edram_storage_buffer_descriptor_pool_size.type =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  edram_storage_buffer_descriptor_pool_size.descriptorCount = 1;
+  edram_storage_buffer_descriptor_pool_size.descriptorCount =
+      edram_storage_buffer_descriptor_set_count;
   VkDescriptorPoolCreateInfo edram_storage_buffer_descriptor_pool_create_info;
   edram_storage_buffer_descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   edram_storage_buffer_descriptor_pool_create_info.pNext = nullptr;
   edram_storage_buffer_descriptor_pool_create_info.flags = 0;
-  edram_storage_buffer_descriptor_pool_create_info.maxSets = 1;
+  edram_storage_buffer_descriptor_pool_create_info.maxSets =
+      edram_storage_buffer_descriptor_set_count;
   edram_storage_buffer_descriptor_pool_create_info.poolSizeCount = 1;
   edram_storage_buffer_descriptor_pool_create_info.pPoolSizes =
       &edram_storage_buffer_descriptor_pool_size;
@@ -486,6 +497,26 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   edram_storage_buffer_descriptor_write.pTexelBufferView = nullptr;
   dfn.vkUpdateDescriptorSets(device, 1, &edram_storage_buffer_descriptor_write,
                              0, nullptr);
+  if (HasNativeRegion()) {
+    // Same buffer, windowed to the native region, for resolve copies and
+    // clears of native surfaces.
+    if (dfn.vkAllocateDescriptorSets(
+            device, &edram_storage_buffer_descriptor_set_allocate_info,
+            &edram_native_region_descriptor_set_) != VK_SUCCESS) {
+      XELOGE(
+          "VulkanRenderTargetCache: Failed to allocate the EDRAM native "
+          "region storage buffer descriptor set");
+      Shutdown();
+      return false;
+    }
+    edram_storage_buffer_descriptor_buffer_info.offset =
+        GetNativeRegionOffsetBytes();
+    edram_storage_buffer_descriptor_buffer_info.range = edram_size_bytes();
+    edram_storage_buffer_descriptor_write.dstSet =
+        edram_native_region_descriptor_set_;
+    dfn.vkUpdateDescriptorSets(
+        device, 1, &edram_storage_buffer_descriptor_write, 0, nullptr);
+  }
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -886,6 +917,55 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
+    if (HasNativeRegion()) {
+      // Unscaled variants for clearing native surfaces in the native region.
+      resolve_fsi_clear_native_32bpp_pipeline_ =
+          ui::vulkan::util::CreateComputePipeline(
+              vulkan_device, resolve_fsi_clear_pipeline_layout_,
+              shaders::resolve_clear_32bpp_cs,
+              sizeof(shaders::resolve_clear_32bpp_cs));
+      resolve_fsi_clear_native_64bpp_pipeline_ =
+          ui::vulkan::util::CreateComputePipeline(
+              vulkan_device, resolve_fsi_clear_pipeline_layout_,
+              shaders::resolve_clear_64bpp_cs,
+              sizeof(shaders::resolve_clear_64bpp_cs));
+      if (resolve_fsi_clear_native_32bpp_pipeline_ == VK_NULL_HANDLE ||
+          resolve_fsi_clear_native_64bpp_pipeline_ == VK_NULL_HANDLE) {
+        XELOGE(
+            "VulkanRenderTargetCache: Failed to create the native-scale "
+            "resolve EDRAM buffer clear pipelines");
+        Shutdown();
+        return false;
+      }
+
+      // Scale class migration pipeline layout. The first tile of the range
+      // plus the whole EDRAM buffer, the generated shaders address both
+      // regions themselves.
+      VkPushConstantRange migration_push_constant_range;
+      migration_push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+      migration_push_constant_range.offset = 0;
+      migration_push_constant_range.size = sizeof(uint32_t);
+      VkPipelineLayoutCreateInfo migration_pipeline_layout_create_info;
+      migration_pipeline_layout_create_info.sType =
+          VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+      migration_pipeline_layout_create_info.pNext = nullptr;
+      migration_pipeline_layout_create_info.flags = 0;
+      migration_pipeline_layout_create_info.setLayoutCount = 1;
+      migration_pipeline_layout_create_info.pSetLayouts =
+          &descriptor_set_layout_storage_buffer_;
+      migration_pipeline_layout_create_info.pushConstantRangeCount = 1;
+      migration_pipeline_layout_create_info.pPushConstantRanges =
+          &migration_push_constant_range;
+      if (dfn.vkCreatePipelineLayout(
+              device, &migration_pipeline_layout_create_info, nullptr,
+              &migration_pipeline_layout_) != VK_SUCCESS) {
+        XELOGE(
+            "VulkanRenderTargetCache: Failed to create the EDRAM scale class "
+            "migration pipeline layout");
+        Shutdown();
+        return false;
+      }
+    }
 
     // Common render pass.
     VkSubpassDescription fsi_subpass = {};
@@ -998,6 +1078,19 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   retired_render_targets_.clear();
   DestroyAllRenderTargets(true);
 
+  for (const auto& migration_pipeline_pair : migration_pipelines_) {
+    // May be null to prevent recreation attempts.
+    if (migration_pipeline_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, migration_pipeline_pair.second, nullptr);
+    }
+  }
+  migration_pipelines_.clear();
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         migration_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, resolve_fsi_clear_native_64bpp_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, resolve_fsi_clear_native_32bpp_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          resolve_fsi_clear_64bpp_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -1194,12 +1287,11 @@ bool VulkanRenderTargetCache::Resolve(
   uint32_t dump_row_length_used = 0;
   uint32_t dump_rows = 0;
   uint32_t dump_pitch = 0;
-  if (resolve_info.copy_dest_extent_length &&
-      GetPath() == Path::kHostRenderTargets) {
+  if (resolve_info.copy_dest_extent_length) {
     resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
                                       dump_rows, dump_pitch);
-    copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
-                                            dump_rows, dump_pitch);
+    copy_native = IsResolveSourceNative(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
     if (copy_native) {
       // Redo the resolve info at 1x1 for the unscaled copy shader.
       if (!draw_util::GetResolveInfo(
@@ -1221,6 +1313,9 @@ bool VulkanRenderTargetCache::Resolve(
 
   // Copying.
   bool copied = false;
+  // Whether resolve_info currently holds 1x1 values (it was redone for a
+  // native copy, and the clear may need to redo it again).
+  bool resolve_info_native = copy_native;
   if (resolve_info.copy_dest_extent_length) {
     if (GetPath() == Path::kHostRenderTargets) {
       // Dump the current contents of the render targets owning the affected
@@ -1229,6 +1324,12 @@ bool VulkanRenderTargetCache::Resolve(
       // shaders for non-converting cases.
       DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                         copy_native);
+    } else if (!copy_native) {
+      // On the interlock path the data is already in the EDRAM buffer, but a
+      // mixed-class span needs its native parts duplicated into the scaled
+      // region before the scaled copy shader reads it.
+      GetResolveMigrations(resolve_info, resolve_migrations_);
+      DispatchMigrations(resolve_migrations_);
     }
     bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
@@ -1417,7 +1518,9 @@ bool VulkanRenderTargetCache::Resolve(
                           : resolve_copy_pipelines_[size_t(copy_shader)]);
           VkDescriptorSet descriptor_sets[kResolveCopyDescriptorSetCount] = {};
           descriptor_sets[kResolveCopyDescriptorSetEdram] =
-              edram_storage_buffer_descriptor_set_;
+              copy_native && GetPath() == Path::kPixelShaderInterlock
+                  ? edram_native_region_descriptor_set_
+                  : edram_storage_buffer_descriptor_set_;
           descriptor_sets[kResolveCopyDescriptorSetDest] = descriptor_set_dest;
           command_buffer.CmdVkBindDescriptorSets(
               VK_PIPELINE_BIND_POINT_COMPUTE, copy_pipeline_layout, 0,
@@ -1518,6 +1621,23 @@ bool VulkanRenderTargetCache::Resolve(
         cleared = true;
       } break;
       case Path::kPixelShaderInterlock: {
+        // The clear writes fresh data, so the classifier picks the region.
+        // That's where draws to surfaces of this class will look for it.
+        bool clear_native =
+            HasNativeRegion() &&
+            IsResolveScaleNative(clear_depth ? resolve_info.depth_edram_info
+                                             : resolve_info.color_edram_info);
+        if (clear_native != resolve_info_native) {
+          // Constants and group counts have to match the region's scale.
+          if (!draw_util::GetResolveInfo(
+                  register_file(), memory, trace_writer_,
+                  clear_native ? 1 : draw_resolution_scale_x(),
+                  clear_native ? 1 : draw_resolution_scale_y(),
+                  edram_tile_count(), IsFixedRG16TruncatedToMinus1To1(),
+                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
+            return false;
+          }
+        }
         UseEdramBuffer(EdramBufferUsage::kComputeWrite);
         // Should be safe to only commit once (if was accessed as unordered or
         // with fragment shader interlock previously - if there was nothing to
@@ -1526,14 +1646,19 @@ bool VulkanRenderTargetCache::Resolve(
         CommitEdramBufferShaderWrites();
         command_buffer.CmdVkBindDescriptorSets(
             VK_PIPELINE_BIND_POINT_COMPUTE, resolve_fsi_clear_pipeline_layout_,
-            0, 1, &edram_storage_buffer_descriptor_set_, 0, nullptr);
+            0, 1,
+            clear_native ? &edram_native_region_descriptor_set_
+                         : &edram_storage_buffer_descriptor_set_,
+            0, nullptr);
         std::pair<uint32_t, uint32_t> clear_group_count =
-            resolve_info.GetClearShaderGroupCount(draw_resolution_scale_x(),
-                                                  draw_resolution_scale_y());
+            resolve_info.GetClearShaderGroupCount(
+                clear_native ? 1 : draw_resolution_scale_x(),
+                clear_native ? 1 : draw_resolution_scale_y());
         assert_true(clear_group_count.first && clear_group_count.second);
         if (clear_depth) {
           command_processor_.BindExternalComputePipeline(
-              resolve_fsi_clear_32bpp_pipeline_);
+              clear_native ? resolve_fsi_clear_native_32bpp_pipeline_
+                           : resolve_fsi_clear_32bpp_pipeline_);
           draw_util::ResolveClearShaderConstants depth_clear_constants;
           resolve_info.GetDepthClearShaderConstants(depth_clear_constants);
           command_buffer.CmdVkPushConstants(
@@ -1546,8 +1671,10 @@ bool VulkanRenderTargetCache::Resolve(
         if (clear_color) {
           command_processor_.BindExternalComputePipeline(
               resolve_info.color_edram_info.format_is_64bpp
-                  ? resolve_fsi_clear_64bpp_pipeline_
-                  : resolve_fsi_clear_32bpp_pipeline_);
+                  ? (clear_native ? resolve_fsi_clear_native_64bpp_pipeline_
+                                  : resolve_fsi_clear_64bpp_pipeline_)
+                  : (clear_native ? resolve_fsi_clear_native_32bpp_pipeline_
+                                  : resolve_fsi_clear_32bpp_pipeline_));
           draw_util::ResolveClearShaderConstants color_clear_constants;
           resolve_info.GetColorClearShaderConstants(color_clear_constants);
           if (clear_depth) {
@@ -1567,6 +1694,7 @@ bool VulkanRenderTargetCache::Resolve(
           command_buffer.CmdVkDispatch(clear_group_count.first,
                                        clear_group_count.second, 1);
         }
+        ClaimResolveClear(resolve_info, clear_native);
         MarkEdramBufferModified();
         cleared = true;
       } break;
@@ -1695,6 +1823,9 @@ bool VulkanRenderTargetCache::Update(
     } break;
 
     case Path::kPixelShaderInterlock: {
+      // Move data between the scaled and the native regions where this draw's
+      // scale class doesn't match what the ranges physically hold.
+      DispatchMigrations(last_update_migrations());
       // For FSI, only the barrier is needed - already scheduled if required.
       // But the buffer will be used for FSI drawing now.
       UseEdramBuffer(EdramBufferUsage::kFragmentReadWrite);
@@ -2464,8 +2595,7 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
         attachment_count ? attachment_height
                          : GetRenderTargetHeight(pitch_tiles_at_32bpp,
                                                  render_pass_key.msaa_samples);
-    if (IsScaleNativeForPitch(pitch_tiles_at_32bpp,
-                              render_pass_key.msaa_samples)) {
+    if (IsScaleNative(pitch_tiles_at_32bpp, render_pass_key.msaa_samples)) {
       framebuffer_scale_x = 1;
       framebuffer_scale_y = 1;
     }
@@ -6297,6 +6427,241 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
   }
   dump_pipelines_.emplace(key, pipeline);
   return pipeline;
+}
+
+VkPipeline VulkanRenderTargetCache::GetOrCreateMigrationPipeline(
+    bool is_64bpp, bool to_native) {
+  uint32_t map_key = (uint32_t(is_64bpp) << 1) | uint32_t(to_native);
+  auto pipeline_it = migration_pipelines_.find(map_key);
+  if (pipeline_it != migration_pipelines_.end()) {
+    return pipeline_it->second;
+  }
+
+  // One thread per guest sample of the migrated tile range.
+  // Both regions use the canonical sample layout described in
+  // XeEdramOffsetBytes (see edram.xesli), where a tile is 80x16 32bpp or 40x16
+  // 64bpp guest samples, and resolution scaling only replaces each guest
+  // sample with a scale_x * scale_y block of host samples within the same
+  // tile. So the migration is a pure per-tile operation, independent of the
+  // surface pitch and MSAA - the native region is the layout at 1x1, and the
+  // scaled region is the layout at the host scale. All the tile geometry is
+  // baked, only the first tile of the range comes in through the constants.
+  uint32_t scale_x = draw_resolution_scale_x();
+  uint32_t scale_y = draw_resolution_scale_y();
+  uint32_t dwords_per_sample = is_64bpp ? 2 : 1;
+  uint32_t tile_samples_x = xenos::kEdramTileWidthSamples >> uint32_t(is_64bpp);
+  uint32_t tile_samples = tile_samples_x * xenos::kEdramTileHeightSamples;
+  uint32_t tile_dwords_native =
+      xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples;
+  uint32_t tile_row_dwords_scaled = xenos::kEdramTileWidthSamples * scale_x;
+  uint32_t tile_dwords_scaled =
+      tile_row_dwords_scaled * xenos::kEdramTileHeightSamples * scale_y;
+  // Also the dword offset of the native region.
+  uint32_t scaled_size_dwords = tile_dwords_scaled * edram_tile_count();
+  // The host samples of one guest sample are adjacent within the scaled tile,
+  // so their offsets from the (0, 0) one are compile-time literals.
+  uint32_t u_step_dwords = dwords_per_sample;
+  uint32_t v_step_dwords = tile_row_dwords_scaled;
+  uint32_t center_offset_dwords =
+      (scale_x >> 1) * u_step_dwords + (scale_y >> 1) * v_step_dwords;
+
+  std::vector<spv::Id> id_vector_temp;
+
+  SpirvBuilder builder(spv::Spv_1_0,
+                       (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1,
+                       nullptr);
+  builder.import("GLSL.std.450");
+  builder.addCapability(spv::CapabilityShader);
+  builder.setMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+  builder.setSource(spv::SourceLanguageUnknown, 0);
+
+  spv::Id type_void = builder.makeVoidType();
+  spv::Id type_int = builder.makeIntType(32);
+  spv::Id type_uint = builder.makeUintType(32);
+  spv::Id type_uint3 = builder.makeVectorType(type_uint, 3);
+
+  // The whole EDRAM buffer, both read and written.
+  id_vector_temp.clear();
+  id_vector_temp.push_back(builder.makeRuntimeArray(type_uint));
+  builder.addDecoration(id_vector_temp.back(), spv::DecorationArrayStride,
+                        sizeof(uint32_t));
+  spv::Id type_edram = builder.makeStructType(id_vector_temp, "XeEdram");
+  builder.addMemberName(type_edram, 0, "edram");
+  builder.addMemberDecoration(type_edram, 0, spv::DecorationOffset, 0);
+  builder.addDecoration(type_edram, spv::DecorationBufferBlock);
+  spv::Id edram_buffer = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassUniform, type_edram, "xe_edram");
+  builder.addDecoration(edram_buffer, spv::DecorationDescriptorSet, 0);
+  builder.addDecoration(edram_buffer, spv::DecorationBinding, 0);
+
+  // Push constants: the first tile of the range.
+  id_vector_temp.clear();
+  id_vector_temp.push_back(type_uint);
+  spv::Id type_push_constants =
+      builder.makeStructType(id_vector_temp, "XeEdramMigratePushConstants");
+  builder.addMemberName(type_push_constants, 0, "start_tile");
+  builder.addMemberDecoration(type_push_constants, 0, spv::DecorationOffset, 0);
+  builder.addDecoration(type_push_constants, spv::DecorationBlock);
+  spv::Id push_constants = builder.createVariable(
+      spv::NoPrecision, spv::StorageClassPushConstant, type_push_constants,
+      "xe_edram_migrate_push_constants");
+
+  spv::Id input_global_invocation_id =
+      builder.createVariable(spv::NoPrecision, spv::StorageClassInput,
+                             type_uint3, "gl_GlobalInvocationID");
+  builder.addDecoration(input_global_invocation_id, spv::DecorationBuiltIn,
+                        static_cast<int>(spv::BuiltIn::GlobalInvocationId));
+
+  std::vector<spv::Id> main_param_types;
+  std::vector<std::vector<spv::Decoration>> main_precisions;
+  spv::Block* main_entry;
+  spv::Function* main_function =
+      builder.makeFunctionEntry(spv::NoPrecision, type_void, "main",
+                                main_param_types, main_precisions, &main_entry);
+
+  auto pc_load = [&](uint32_t member) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(int(member)));
+    return builder.createLoad(
+        builder.createAccessChain(spv::StorageClassPushConstant, push_constants,
+                                  id_vector_temp),
+        spv::NoPrecision);
+  };
+  auto edram_access = [&](spv::Id address) {
+    id_vector_temp.clear();
+    id_vector_temp.push_back(builder.makeIntConstant(0));
+    id_vector_temp.push_back(
+        builder.createUnaryOp(spv::OpBitcast, type_int, address));
+    return builder.createAccessChain(spv::StorageClassUniform, edram_buffer,
+                                     id_vector_temp);
+  };
+  auto op = [&](spv::Op opcode, spv::Id a, spv::Id b) {
+    return builder.createBinOp(opcode, type_uint, a, b);
+  };
+  auto op_const = [&](spv::Op opcode, spv::Id a, uint32_t b) {
+    return builder.createBinOp(opcode, type_uint, a,
+                               builder.makeUintConstant(b));
+  };
+
+  spv::Id thread = builder.createCompositeExtract(
+      builder.createLoad(input_global_invocation_id, spv::NoPrecision),
+      type_uint, 0);
+  // Tile within the range and the sample within the tile. The tile sample
+  // counts (1280 and 640) are both divisible by 64, so dispatches are always
+  // exact and there's no bounds check.
+  spv::Id tile_rel = op_const(spv::OpUDiv, thread, tile_samples);
+  spv::Id tile_sample = op_const(spv::OpUMod, thread, tile_samples);
+  spv::Id sample_y = op_const(spv::OpUDiv, tile_sample, tile_samples_x);
+  spv::Id sample_x = op_const(spv::OpUMod, tile_sample, tile_samples_x);
+  // The range never crosses the end of the EDRAM, so no wrapping is needed.
+  spv::Id tile = op(spv::OpIAdd, tile_rel, pc_load(0));
+  // The native region sits right past the scaled data.
+  spv::Id native_address = op_const(
+      spv::OpIAdd,
+      op(spv::OpIAdd,
+         op(spv::OpIAdd, op_const(spv::OpIMul, tile, tile_dwords_native),
+            op_const(spv::OpIMul, sample_y, xenos::kEdramTileWidthSamples)),
+         op_const(spv::OpIMul, sample_x, dwords_per_sample)),
+      scaled_size_dwords);
+  // The (0, 0) host sample of the guest sample in the scaled region.
+  spv::Id scaled_dword =
+      op(spv::OpIAdd,
+         op(spv::OpIAdd, op_const(spv::OpIMul, tile, tile_dwords_scaled),
+            op_const(spv::OpIMul, sample_y, scale_y * tile_row_dwords_scaled)),
+         op_const(spv::OpIMul, sample_x, scale_x * dwords_per_sample));
+
+  if (to_native) {
+    // Center host sample of the scaled data, matching the resolve downscale
+    // convention, to the native region.
+    spv::Id source_address =
+        op_const(spv::OpIAdd, scaled_dword, center_offset_dwords);
+    for (uint32_t h = 0; h < dwords_per_sample; ++h) {
+      builder.createStore(
+          builder.createLoad(
+              edram_access(op_const(spv::OpIAdd, source_address, h)),
+              spv::NoPrecision),
+          edram_access(op_const(spv::OpIAdd, native_address, h)));
+    }
+  } else {
+    // Duplicate the guest sample into all its host samples.
+    spv::Id value[2];
+    for (uint32_t h = 0; h < dwords_per_sample; ++h) {
+      value[h] = builder.createLoad(
+          edram_access(op_const(spv::OpIAdd, native_address, h)),
+          spv::NoPrecision);
+    }
+    for (uint32_t v = 0; v < scale_y; ++v) {
+      for (uint32_t u = 0; u < scale_x; ++u) {
+        uint32_t duplicate_offset = u * u_step_dwords + v * v_step_dwords;
+        for (uint32_t h = 0; h < dwords_per_sample; ++h) {
+          builder.createStore(value[h],
+                              edram_access(op_const(spv::OpIAdd, scaled_dword,
+                                                    duplicate_offset + h)));
+        }
+      }
+    }
+  }
+
+  builder.leaveFunction();
+  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize, 64, 1,
+                           1);
+  spv::Instruction* entry_point = builder.addEntryPoint(
+      spv::ExecutionModelGLCompute, main_function, "main");
+  entry_point->addIdOperand(input_global_invocation_id);
+
+  std::vector<unsigned int> shader_code;
+  builder.dump(shader_code);
+
+  VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
+      command_processor_.GetVulkanDevice(), migration_pipeline_layout_,
+      reinterpret_cast<const uint32_t*>(shader_code.data()),
+      sizeof(uint32_t) * shader_code.size());
+  if (pipeline == VK_NULL_HANDLE) {
+    XELOGE(
+        "VulkanRenderTargetCache: Failed to create an EDRAM scale class "
+        "migration pipeline for {}bpp, to {}",
+        is_64bpp ? 64 : 32, to_native ? "native" : "scaled");
+  }
+  // Keep the null too so creation isn't retried every draw.
+  migration_pipelines_.emplace(map_key, pipeline);
+  return pipeline;
+}
+
+void VulkanRenderTargetCache::DispatchMigrations(
+    const std::vector<Migration>& migrations) {
+  if (migrations.empty()) {
+    return;
+  }
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  UseEdramBuffer(EdramBufferUsage::kComputeWrite);
+  // Make everything written so far, including via interlock, visible to the
+  // migration reads.
+  CommitEdramBufferShaderWrites();
+  command_buffer.CmdVkBindDescriptorSets(
+      VK_PIPELINE_BIND_POINT_COMPUTE, migration_pipeline_layout_, 0, 1,
+      &edram_storage_buffer_descriptor_set_, 0, nullptr);
+  for (const Migration& migration : migrations) {
+    bool is_64bpp = migration.scaled_key.Is64bpp();
+    VkPipeline pipeline =
+        GetOrCreateMigrationPipeline(is_64bpp, migration.to_native);
+    if (pipeline == VK_NULL_HANDLE) {
+      continue;
+    }
+    command_processor_.BindExternalComputePipeline(pipeline);
+    command_buffer.CmdVkPushConstants(
+        migration_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        sizeof(migration.start_tiles), &migration.start_tiles);
+    // Different migrations touch disjoint tile ranges, so no barriers between
+    // the dispatches. 1280 and 640 samples per tile, both divide by the group
+    // size of 64.
+    uint32_t samples = migration.length_tiles *
+                       ((xenos::kEdramTileWidthSamples >> uint32_t(is_64bpp)) *
+                        xenos::kEdramTileHeightSamples);
+    command_processor_.SubmitBarriers(true);
+    command_buffer.CmdVkDispatch(samples / 64, 1, 1);
+  }
+  MarkEdramBufferModified();
 }
 
 void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,

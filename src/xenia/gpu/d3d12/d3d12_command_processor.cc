@@ -4207,7 +4207,7 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
   uint32_t vgt_min_vtx_indx = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
 
   // Resolution scale of this draw.
-  // 1x1 with draw_resolution_scale_threshold (RTV only)
+  // 1x1 with draw_resolution_scale_threshold.
   uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
   uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 

@@ -33,6 +33,7 @@ DECLARE_string(edram_tile_count);
 DECLARE_bool(depth_transfer_not_equal_test);
 DECLARE_bool(depth_float24_round);
 DECLARE_bool(depth_float24_convert_in_pixel_shader);
+DECLARE_uint32(draw_resolution_scale_threshold);
 DECLARE_bool(draw_resolution_scaled_texture_offsets);
 DECLARE_bool(gamma_render_target_as_unorm16);
 DECLARE_bool(native_stencil_value_output);
@@ -207,8 +208,8 @@ class RenderTargetCache {
 
   // Whether surfaces with this pitch render native per the scale threshold.
   // Compares the tile-aligned width, so it's a pure function of key fields.
-  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
-                             xenos::MsaaSamples msaa_samples) const;
+  bool IsScaleNative(uint32_t pitch_tiles_at_32bpp,
+                     xenos::MsaaSamples msaa_samples) const;
   // Same for RB_SURFACE_INFO
   bool IsDrawScaleNative() const;
   // Scale of the current draw, the global scale or 1x1 under the threshold.
@@ -220,6 +221,19 @@ class RenderTargetCache {
   }
   uint32_t GetDrawScaleY() const {
     return IsDrawScaleNative() ? 1 : draw_resolution_scale_y();
+  }
+
+  // The EDRAM buffer gets a 10 MB region appended after the scaled one, and
+  // native draws address that region (the base is baked into their shader
+  // variant after wrapping).
+  bool HasNativeRegion() const {
+    return GetPath() == Path::kPixelShaderInterlock &&
+           IsDrawResolutionScaled() &&
+           cvars::draw_resolution_scale_threshold != 0;
+  }
+  uint32_t GetNativeRegionOffsetBytes() const {
+    return edram_size_bytes() *
+           (draw_resolution_scale_x() * draw_resolution_scale_y());
   }
 
   // Virtual (both the common code and the implementation may do something
@@ -651,8 +665,15 @@ class RenderTargetCache {
   // duplicating pixels into the scaled layout (which ruins linear filtering).
   // Decided from actual ownership rather than resolve dimensions since one
   // range can span both classes.
-  bool IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length,
-                                 uint32_t rows, uint32_t pitch) const;
+  bool IsResolveSourceNative(uint32_t base, uint32_t row_length, uint32_t rows,
+                             uint32_t pitch) const;
+
+  // Scale class of the surface a resolve reads or clears.
+  bool IsResolveScaleNative(draw_util::ResolveEdramInfo edram_info) const {
+    return IsScaleNative(
+        edram_info.pitch_tiles >> uint32_t(edram_info.format_is_64bpp),
+        edram_info.msaa_samples);
+  }
 
   // Sets up the needed render targets and transfers to perform a clear in a
   // resolve operation via a host render target clear. resolve_info is expected
@@ -685,6 +706,50 @@ class RenderTargetCache {
   // To be called by the implementation when interlocked writes to all of the
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
+
+  // Last writer of each EDRAM tile range for interlock. Not the same thing as
+  // ownership_ranges_, that's about write hazards and gets wiped on every full
+  // barrier, while this describes where the data physically is, so only
+  // DestroyAllRenderTargets resets it. The full key is kept since migrations
+  // need the writer's bpp, the sample layout being per 32bpp or 64bpp tile.
+  struct LayoutRange {
+    uint32_t end_tiles;
+    RenderTargetKey key;
+    LayoutRange(uint32_t end_tiles, RenderTargetKey key)
+        : end_tiles(end_tiles), key(key) {}
+  };
+  const std::map<uint32_t, LayoutRange>& layout_ranges() const {
+    return layout_ranges_;
+  }
+
+  // One tile range whose data has to physically move between the scaled and
+  // native regions before the next use.
+  // scaled_key describes the scaled side layout. The old owner when moving to
+  // native, the incoming surface when moving to scaled. The native region is
+  // just the guest layout at 1x1, no key needed there.
+  struct Migration {
+    uint32_t start_tiles;
+    uint32_t length_tiles;
+    RenderTargetKey scaled_key;
+    bool to_native;
+  };
+  // Class crossings found by the last Update, for the backend to dispatch
+  // before the draw.
+  const std::vector<Migration>& last_update_migrations() const {
+    return last_update_migrations_;
+  }
+  // When a resolve copy source span is mixed, the native parts have to be
+  // duplicated into the scaled region before the scaled copy shader reads it.
+  // Fills migrations_out, all with to_native false and keyed by the resolve
+  // surface, and claims the moved ranges in the layout map. Only call this
+  // when the migrations will actually be dispatched.
+  void GetResolveMigrations(const draw_util::ResolveInfo& resolve_info,
+                            std::vector<Migration>& migrations_out);
+
+  // Remember which class the cleared ranges hold after a resolve clear. The
+  // data is being overwritten, so nothing migrates.
+  void ClaimResolveClear(const draw_util::ResolveInfo& resolve_info,
+                         bool scale_native);
 
  private:
   const RegisterFile& register_file_;
@@ -831,6 +896,18 @@ class RenderTargetCache {
     uint64_t frame;
   };
   std::vector<WindowOffsetKeptInViewport> window_offsets_kept_in_viewport_;
+
+  // See layout_ranges().
+  std::map<uint32_t, LayoutRange> layout_ranges_;
+  void ClaimLayoutRange(RenderTargetKey key, uint32_t start_tiles_base_relative,
+                        uint32_t length_tiles);
+  // Collects ranges under the key's extent whose data is in the other region
+  // than the key's class wants.
+  void AppendLayoutMigrations(RenderTargetKey key,
+                              uint32_t start_tiles_base_relative,
+                              uint32_t length_tiles,
+                              std::vector<Migration>& migrations_out) const;
+  std::vector<Migration> last_update_migrations_;
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

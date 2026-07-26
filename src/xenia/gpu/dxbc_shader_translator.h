@@ -567,11 +567,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Creates a special pixel shader without color outputs - this resets the
   // state of the translator.
+  // resolution_scale_native picks the variant addressing the native EDRAM
+  // region at 1x1 (draw_resolution_scale_threshold).
   std::vector<uint8_t> CreateDepthOnlyPixelShader(
       bool zpd_total = false,
       Modification::DepthStencilMode depth_stencil_mode =
           Modification::DepthStencilMode::kNoModifiers,
-      bool viz_survey = false);
+      bool viz_survey = false, bool resolution_scale_native = false);
 
   // Common functions useful not only for the translator, but also for render
   // target reinterpretation.
@@ -1095,6 +1097,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
                    GetDxbcShaderModification().pixel.resolution_scale_native
                ? 1
                : draw_resolution_scale_y_;
+  }
+  // Where in the EDRAM buffer the shader's ROV writes go, in dwords.
+  // Native draws use the plain 10 MB region appended after the scaled one, so
+  // the base is the scaled region's size, and everything else starts at 0.
+  // Added after the wrap so wrapping stays inside the region.
+  uint32_t GetNativeRegionBaseDwords() const {
+    if (!is_pixel_shader() ||
+        !GetDxbcShaderModification().pixel.resolution_scale_native) {
+      return 0;
+    }
+    return xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
+           edram_tile_count_ * draw_resolution_scale_x_ *
+           draw_resolution_scale_y_;
   }
 
   // Is currently writing the empty depth-only pixel shader, for

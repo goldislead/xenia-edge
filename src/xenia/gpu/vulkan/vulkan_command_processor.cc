@@ -5086,7 +5086,7 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
   // Resolution scale of this draw.
-  // 1x1 with draw_resolution_scale_threshold (FSI only).
+  // 1x1 with draw_resolution_scale_threshold.
   uint32_t draw_resolution_scale_x = render_target_cache_->GetDrawScaleX();
   uint32_t draw_resolution_scale_y = render_target_cache_->GetDrawScaleY();
 

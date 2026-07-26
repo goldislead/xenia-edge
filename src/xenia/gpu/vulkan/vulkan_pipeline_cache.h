@@ -260,6 +260,10 @@ class VulkanPipelineCache {
     // Survey draw for conditional rendering (FSI + occlusion_query_viz).
     // Selects the depth-only fragment shader. Surveys don't have a guest PS.
     uint32_t viz_survey : 1;  // 11
+    // Whether the draw is at 1x1 per draw_resolution_scale_threshold. Picks
+    // the depth-only fragment shader variant on the interlock path, where
+    // nothing else in the description would tell the two apart.
+    uint32_t resolution_scale_native : 1;  // 12
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
@@ -284,7 +288,7 @@ class VulkanPipelineCache {
       }
     };
 
-    static constexpr uint32_t kVersion = 0x20260920;
+    static constexpr uint32_t kVersion = 0x20261026;
   });
 
   // Pipeline storage constants.
@@ -451,6 +455,8 @@ class VulkanPipelineCache {
   // shader interlock when no Xenos pixel shader provided, and for keeping FBO
   // draws that write nothing rasterized for occlusion queries.
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
+  // 1x1 variant for draw_resolution_scale_threshold.
+  VkShaderModule depth_only_fragment_shader_native_ = VK_NULL_HANDLE;
 
   // Substitute depth-only pixel shaders that perform float24 conversion of the
   // rasterizer's depth, bound for guest depth-only draws when in-PS float24
@@ -463,6 +469,8 @@ class VulkanPipelineCache {
   VkShaderModule zpd_total_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule zpd_total_float24_round_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule viz_survey_depth_only_fragment_shader_ = VK_NULL_HANDLE;
+  // 1x1 variant for draw_resolution_scale_threshold.
+  VkShaderModule viz_survey_depth_only_fragment_shader_native_ = VK_NULL_HANDLE;
 
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
   // Outputs transparent black while the real shader compiles in background.

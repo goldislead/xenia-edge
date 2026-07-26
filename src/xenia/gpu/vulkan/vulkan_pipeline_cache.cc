@@ -137,6 +137,30 @@ bool VulkanPipelineCache::Initialize() {
     }
   }
 
+  if (edram_fragment_shader_interlock &&
+      render_target_cache_.HasNativeRegion()) {
+    // Variants for draws kept at 1x1 by draw_resolution_scale_threshold.
+    using DepthStencilMode =
+        SpirvShaderTranslator::Modification::DepthStencilMode;
+    auto build = [&](bool viz_survey, VkShaderModule& out) -> bool {
+      std::vector<uint8_t> code =
+          shader_translator_->CreateDepthOnlyFragmentShader(
+              DepthStencilMode::kNoModifiers, false, viz_survey, true);
+      out = ui::vulkan::util::CreateShaderModule(
+          vulkan_device, reinterpret_cast<const uint32_t*>(code.data()),
+          code.size());
+      return out != VK_NULL_HANDLE;
+    };
+    if (!build(false, depth_only_fragment_shader_native_) ||
+        !build(true, viz_survey_depth_only_fragment_shader_native_)) {
+      XELOGE(
+          "VulkanPipelineCache: Failed to create the native-scale "
+          "depth/stencil-only fragment shaders for the fragment shader "
+          "interlock render backend implementation");
+      return false;
+    }
+  }
+
   if (zpd_hybrid_supported_) {
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
@@ -373,6 +397,11 @@ void VulkanPipelineCache::Shutdown() {
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         depth_only_fragment_shader_native_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyShaderModule, device,
+      viz_survey_depth_only_fragment_shader_native_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          depth_only_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          zpd_total_depth_only_fragment_shader_);
@@ -542,12 +571,12 @@ VulkanPipelineCache::GetCurrentPixelShaderModification(
     modification.pixel.param_gen_point = 0;
   }
 
+  // Whether this draw is native res due to a scale threshold.
+  modification.pixel.resolution_scale_native =
+      uint32_t(render_target_cache_.IsDrawScaleNative());
+
   if (render_target_cache_.GetPath() ==
       RenderTargetCache::Path::kHostRenderTargets) {
-    // Whether this draw is native res due to a scale threshold. (FBO only)
-    modification.pixel.resolution_scale_native =
-        uint32_t(render_target_cache_.IsDrawScaleNative());
-
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
     if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
@@ -1493,6 +1522,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           (normalized_color_mask >> (color_rt_index * 4)) & 0b1111,
           description_out.render_targets[color_rt_index]);
     }
+  } else {
+    // Picks the depth-only fragment shader variant. The host render target
+    // path doesn't need this bit, everything scale-dependent there is dynamic
+    // or in the shader modifications.
+    description_out.resolution_scale_native =
+        uint32_t(render_target_cache_.IsDrawScaleNative());
   }
 
   return true;
@@ -2847,10 +2882,23 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
                 : zpd_total_float24_truncate_fragment_shader_;
       }
     } else if (edram_fragment_shader_interlock) {
-      // VIZ surveys only use the ZPass counter.
-      shader_stage_fragment.module =
-          description.viz_survey ? viz_survey_depth_only_fragment_shader_
-                                 : depth_only_fragment_shader_;
+      // VIZ surveys only use the ZPass counter. Stored pipelines from
+      // configurations where the native variant isn't created fall back to
+      // the scaled one, no draw can use them then.
+      if (description.viz_survey) {
+        shader_stage_fragment.module =
+            description.resolution_scale_native &&
+                    viz_survey_depth_only_fragment_shader_native_ !=
+                        VK_NULL_HANDLE
+                ? viz_survey_depth_only_fragment_shader_native_
+                : viz_survey_depth_only_fragment_shader_;
+      } else {
+        shader_stage_fragment.module =
+            description.resolution_scale_native &&
+                    depth_only_fragment_shader_native_ != VK_NULL_HANDLE
+                ? depth_only_fragment_shader_native_
+                : depth_only_fragment_shader_;
+      }
     } else if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
                (description.depth_write_enable ||
                 description.depth_compare_op !=

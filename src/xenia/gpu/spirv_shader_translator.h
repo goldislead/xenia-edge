@@ -485,10 +485,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // shader reads gl_FragCoord.z, converts to float24, and writes the result to
   // gl_FragDepth - matching the substitute pixel shader the DXBC backend uses
   // when a guest draw has no pixel shader.
+  // resolution_scale_native picks the variant addressing the native EDRAM
+  // region at 1x1 (draw_resolution_scale_threshold).
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
       Modification::DepthStencilMode depth_stencil_mode =
           Modification::DepthStencilMode::kNoModifiers,
-      bool zpd_total = false, bool viz_survey = false);
+      bool zpd_total = false, bool viz_survey = false,
+      bool resolution_scale_native = false);
 
   // Common functions useful not only for the translator, but also for EDRAM
   // emulation via conventional render targets.
@@ -909,6 +912,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
                    GetSpirvShaderModification().pixel.resolution_scale_native
                ? 1
                : draw_resolution_scale_y_;
+  }
+  // Where in the EDRAM buffer the shader's FSI writes go, in dwords. Native
+  // draws use the plain 10 MB region appended after the scaled one so the
+  // base is the scaled region's size, and everything else starts at 0. Added
+  // after the wrap so wrapping stays inside the region.
+  uint32_t GetNativeRegionBaseDwords() const {
+    if (!is_pixel_shader() ||
+        !GetSpirvShaderModification().pixel.resolution_scale_native) {
+      return 0;
+    }
+    return xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
+           edram_tile_count_ * draw_resolution_scale_x_ *
+           draw_resolution_scale_y_;
   }
 
   // For safety with different drivers (even though fragment shader interlock in

@@ -257,6 +257,10 @@ bool D3D12RenderTargetCache::Initialize() {
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size = edram_size_bytes() * (draw_resolution_scale_x() *
                                                      draw_resolution_scale_y());
+  if (HasNativeRegion()) {
+    // Tail region for draws kept at 1x1 by draw_resolution_scale_threshold.
+    edram_buffer_size += edram_size_bytes();
+  }
   D3D12_RESOURCE_DESC edram_buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(
       edram_buffer_desc, edram_buffer_size,
@@ -1110,6 +1114,66 @@ bool D3D12RenderTargetCache::Initialize() {
       return false;
     }
     resolve_rov_clear_64bpp_pipeline_->SetName(L"Resolve Clear 64bpp");
+    if (HasNativeRegion()) {
+      // Unscaled variants for clearing native surfaces in the native region.
+      resolve_rov_clear_native_32bpp_pipeline_ =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::resolve_clear_32bpp_cs,
+              sizeof(shaders::resolve_clear_32bpp_cs),
+              resolve_rov_clear_root_signature_);
+      resolve_rov_clear_native_64bpp_pipeline_ =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::resolve_clear_64bpp_cs,
+              sizeof(shaders::resolve_clear_64bpp_cs),
+              resolve_rov_clear_root_signature_);
+      if (resolve_rov_clear_native_32bpp_pipeline_ == nullptr ||
+          resolve_rov_clear_native_64bpp_pipeline_ == nullptr) {
+        XELOGE(
+            "D3D12RenderTargetCache: Failed to create the native-scale "
+            "resolve EDRAM buffer clear pipelines");
+        Shutdown();
+        return false;
+      }
+      resolve_rov_clear_native_32bpp_pipeline_->SetName(
+          L"Resolve Clear 32bpp Native");
+      resolve_rov_clear_native_64bpp_pipeline_->SetName(
+          L"Resolve Clear 64bpp Native");
+
+      // Scale class migration root signature. The first tile of the range
+      // plus the whole EDRAM buffer as a raw UAV, the generated shaders
+      // address both regions themselves.
+      std::array<D3D12_ROOT_PARAMETER, 2> migration_root_parameters;
+      migration_root_parameters[0].ParameterType =
+          D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      migration_root_parameters[0].Constants.ShaderRegister = 0;
+      migration_root_parameters[0].Constants.RegisterSpace = 0;
+      migration_root_parameters[0].Constants.Num32BitValues = 4;
+      migration_root_parameters[0].ShaderVisibility =
+          D3D12_SHADER_VISIBILITY_ALL;
+      migration_root_parameters[1].ParameterType =
+          D3D12_ROOT_PARAMETER_TYPE_UAV;
+      migration_root_parameters[1].Descriptor.ShaderRegister = 0;
+      migration_root_parameters[1].Descriptor.RegisterSpace = 0;
+      migration_root_parameters[1].ShaderVisibility =
+          D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_ROOT_SIGNATURE_DESC migration_root_signature_desc;
+      migration_root_signature_desc.NumParameters =
+          UINT(migration_root_parameters.size());
+      migration_root_signature_desc.pParameters =
+          migration_root_parameters.data();
+      migration_root_signature_desc.NumStaticSamplers = 0;
+      migration_root_signature_desc.pStaticSamplers = nullptr;
+      migration_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+      migration_root_signature_ = ui::d3d12::util::CreateRootSignature(
+          provider, migration_root_signature_desc);
+      if (migration_root_signature_ == nullptr) {
+        XELOGE(
+            "D3D12RenderTargetCache: Failed to create the EDRAM scale class "
+            "migration root signature");
+        Shutdown();
+        return false;
+      }
+    }
   } else {
     assert_unhandled_case(path_);
     Shutdown();
@@ -1123,6 +1187,15 @@ bool D3D12RenderTargetCache::Initialize() {
 
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   retired_render_targets_.clear();
+  for (const auto& migration_pipeline_pair : migration_pipelines_) {
+    if (migration_pipeline_pair.second) {
+      migration_pipeline_pair.second->Release();
+    }
+  }
+  migration_pipelines_.clear();
+  ui::d3d12::util::ReleaseAndNull(migration_root_signature_);
+  ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_native_64bpp_pipeline_);
+  ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_native_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1245,6 +1318,9 @@ bool D3D12RenderTargetCache::Update(
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {
+      // Move data between the scaled and the native regions where this draw's
+      // scale class doesn't match what the ranges physically hold.
+      DispatchMigrations(last_update_migrations());
       // For ROV, only the barrier is needed - already scheduled if required.
       // But the buffer will be used for ROV drawing now.
       TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1389,12 +1465,11 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
   uint32_t dump_row_length_used = 0;
   uint32_t dump_rows = 0;
   uint32_t dump_pitch = 0;
-  if (resolve_info.copy_dest_extent_length &&
-      GetPath() == Path::kHostRenderTargets) {
+  if (resolve_info.copy_dest_extent_length) {
     resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
                                       dump_rows, dump_pitch);
-    copy_native = IsResolveSourceNativeOnly(dump_base, dump_row_length_used,
-                                            dump_rows, dump_pitch);
+    copy_native = IsResolveSourceNative(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
     if (copy_native) {
       // Redo the resolve info at 1x1 for the unscaled copy shader.
       if (!draw_util::GetResolveInfo(
@@ -1416,6 +1491,9 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
 
   // Copying.
   bool copied = false;
+  // Whether resolve_info currently holds 1x1 values (it was redone for a
+  // native copy, and the clear may need to redo it again).
+  bool resolve_info_native = copy_native;
   if (resolve_info.copy_dest_extent_length) {
     if (GetPath() == Path::kHostRenderTargets) {
       // Dump the current contents of the render targets owning the affected
@@ -1424,6 +1502,12 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
       // shaders for non-converting cases.
       DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                         copy_native);
+    } else if (!copy_native) {
+      // On the interlock path the data is already in the EDRAM buffer, but a
+      // mixed-class span needs its native parts duplicated into the scaled
+      // region before the scaled copy shader reads it.
+      GetResolveMigrations(resolve_info, resolve_migrations_);
+      DispatchMigrations(resolve_migrations_);
     }
     bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
@@ -1465,7 +1549,10 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         // Source.
         TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         command_list.D3DSetComputeRootShaderResourceView(
-            2, edram_buffer_gpu_address_);
+            2, edram_buffer_gpu_address_ +
+                   (copy_native && GetPath() == Path::kPixelShaderInterlock
+                        ? GetNativeRegionOffsetBytes()
+                        : 0));
 
         // Destination and constants.
         if (copy_dest_scaled) {
@@ -1553,6 +1640,23 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         cleared = true;
       } break;
       case Path::kPixelShaderInterlock: {
+        // The clear writes fresh data, so the classifier picks the region.
+        // That's where draws to surfaces of this class will look for it.
+        bool clear_native =
+            HasNativeRegion() &&
+            IsResolveScaleNative(clear_depth ? resolve_info.depth_edram_info
+                                             : resolve_info.color_edram_info);
+        if (clear_native != resolve_info_native) {
+          // Constants and group counts have to match the region's scale.
+          if (!draw_util::GetResolveInfo(
+                  register_file(), memory, trace_writer_,
+                  clear_native ? 1 : draw_resolution_scale_x(),
+                  clear_native ? 1 : draw_resolution_scale_y(),
+                  edram_tile_count(), fixed_16_truncated_to_minus_1_to_1,
+                  fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+            return false;
+          }
+        }
         TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         // Should be safe to only commit once (if was UAV / ROV previously - if
         // there was nothing to copy, only to clear, for some reason, for
@@ -1562,10 +1666,12 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         command_list.D3DSetComputeRootSignature(
             resolve_rov_clear_root_signature_);
         command_list.D3DSetComputeRootUnorderedAccessView(
-            1, edram_buffer_gpu_address_);
+            1, edram_buffer_gpu_address_ +
+                   (clear_native ? GetNativeRegionOffsetBytes() : 0));
         std::pair<uint32_t, uint32_t> clear_group_count =
-            resolve_info.GetClearShaderGroupCount(draw_resolution_scale_x(),
-                                                  draw_resolution_scale_y());
+            resolve_info.GetClearShaderGroupCount(
+                clear_native ? 1 : draw_resolution_scale_x(),
+                clear_native ? 1 : draw_resolution_scale_y());
         assert_true(clear_group_count.first && clear_group_count.second);
         if (clear_depth) {
           draw_util::ResolveClearShaderConstants depth_clear_constants;
@@ -1574,7 +1680,8 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
               0, sizeof(depth_clear_constants) / sizeof(uint32_t),
               &depth_clear_constants, 0);
           command_processor_.SetExternalPipeline(
-              resolve_rov_clear_32bpp_pipeline_);
+              clear_native ? resolve_rov_clear_native_32bpp_pipeline_
+                           : resolve_rov_clear_32bpp_pipeline_);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(clear_group_count.first,
                                    clear_group_count.second, 1);
@@ -1596,12 +1703,15 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
           }
           command_processor_.SetExternalPipeline(
               resolve_info.color_edram_info.format_is_64bpp
-                  ? resolve_rov_clear_64bpp_pipeline_
-                  : resolve_rov_clear_32bpp_pipeline_);
+                  ? (clear_native ? resolve_rov_clear_native_64bpp_pipeline_
+                                  : resolve_rov_clear_64bpp_pipeline_)
+                  : (clear_native ? resolve_rov_clear_native_32bpp_pipeline_
+                                  : resolve_rov_clear_32bpp_pipeline_));
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(clear_group_count.first,
                                    clear_group_count.second, 1);
         }
+        ClaimResolveClear(resolve_info, clear_native);
         MarkEdramBufferModified();
         cleared = true;
       } break;
@@ -6515,6 +6625,445 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(
   // again.
   dump_pipelines_.emplace(key, pipeline);
   return pipeline;
+}
+
+ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateMigrationPipeline(
+    bool is_64bpp, bool to_native) {
+  uint32_t map_key = (uint32_t(is_64bpp) << 1) | uint32_t(to_native);
+  auto pipeline_it = migration_pipelines_.find(map_key);
+  if (pipeline_it != migration_pipelines_.end()) {
+    return pipeline_it->second;
+  }
+
+  // One thread per guest sample of the migrated tile range.
+  // Both regions use the canonical sample layout described in
+  // XeEdramOffsetBytes (see edram.xesli), where a tile is 80x16 32bpp or 40x16
+  // 64bpp guest samples, and resolution scaling only replaces each guest
+  // sample with a scale_x * scale_y block of host samples within the same
+  // tile. So the migration is a pure per-tile operation, independent of the
+  // surface pitch and MSAA - the native region is the layout at 1x1, and the
+  // scaled region is the layout at the host scale. All the tile geometry is
+  // baked, only the first tile of the range comes in through the constants.
+  uint32_t scale_x = draw_resolution_scale_x();
+  uint32_t scale_y = draw_resolution_scale_y();
+  uint32_t dwords_per_sample = is_64bpp ? 2 : 1;
+  uint32_t tile_samples_x = xenos::kEdramTileWidthSamples >> uint32_t(is_64bpp);
+  uint32_t tile_samples = tile_samples_x * xenos::kEdramTileHeightSamples;
+  uint32_t tile_dwords_native =
+      xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples;
+  uint32_t tile_row_dwords_scaled = xenos::kEdramTileWidthSamples * scale_x;
+  uint32_t tile_dwords_scaled =
+      tile_row_dwords_scaled * xenos::kEdramTileHeightSamples * scale_y;
+  // Also the dword offset of the native region.
+  uint32_t scaled_size_dwords = tile_dwords_scaled * edram_tile_count();
+  // The host samples of one guest sample are adjacent within the scaled tile,
+  // so their offsets from the (0, 0) one are compile-time literals.
+  uint32_t u_step_dwords = dwords_per_sample;
+  uint32_t v_step_dwords = tile_row_dwords_scaled;
+  uint32_t center_offset_bytes =
+      ((scale_x >> 1) * u_step_dwords + (scale_y >> 1) * v_step_dwords) *
+      sizeof(uint32_t);
+
+  built_shader_.clear();
+
+  // RDEF, ISGN, OSGN, SHEX, STAT.
+  constexpr uint32_t kBlobCount = 5;
+
+  built_shader_.resize(sizeof(dxbc::ContainerHeader) / sizeof(uint32_t) +
+                       kBlobCount);
+  uint32_t blob_offset_position_dwords =
+      sizeof(dxbc::ContainerHeader) / sizeof(uint32_t);
+  uint32_t blob_position_dwords = uint32_t(built_shader_.size());
+  constexpr uint32_t kBlobHeaderSizeDwords =
+      sizeof(dxbc::BlobHeader) / sizeof(uint32_t);
+
+  // ***************************************************************************
+  // Resource definition
+  // ***************************************************************************
+
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
+  uint32_t rdef_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
+  built_shader_.resize(rdef_position_dwords +
+                       sizeof(dxbc::RdefHeader) / sizeof(uint32_t));
+  dxbc::AppendAlignedString(built_shader_, "Xenia");
+
+  // Types.
+  uint32_t rdef_uint4_name_ptr = uint32_t(
+      (built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  dxbc::AppendAlignedString(built_shader_, "uint4");
+  uint32_t rdef_type_uint4_position_dwords = uint32_t(built_shader_.size());
+  uint32_t rdef_type_uint4_ptr =
+      uint32_t((rdef_type_uint4_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
+  built_shader_.resize(rdef_type_uint4_position_dwords +
+                       sizeof(dxbc::RdefType) / sizeof(uint32_t));
+  {
+    auto& rdef_type_uint4 = *reinterpret_cast<dxbc::RdefType*>(
+        built_shader_.data() + rdef_type_uint4_position_dwords);
+    rdef_type_uint4.variable_class = dxbc::RdefVariableClass::kVector;
+    rdef_type_uint4.variable_type = dxbc::RdefVariableType::kUInt;
+    rdef_type_uint4.row_count = 1;
+    rdef_type_uint4.column_count = 4;
+    rdef_type_uint4.name_ptr = rdef_uint4_name_ptr;
+  }
+
+  // One constant, and the cbuffer containing it, sharing the name.
+  uint32_t rdef_info_name_ptr = uint32_t(
+      (built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  dxbc::AppendAlignedString(built_shader_, "xe_edram_migrate_info");
+  uint32_t rdef_constant_position_dwords = uint32_t(built_shader_.size());
+  uint32_t rdef_constant_ptr =
+      uint32_t((rdef_constant_position_dwords - rdef_position_dwords) *
+               sizeof(uint32_t));
+  built_shader_.resize(rdef_constant_position_dwords +
+                       sizeof(dxbc::RdefVariable) / sizeof(uint32_t));
+  {
+    auto& rdef_constant = *reinterpret_cast<dxbc::RdefVariable*>(
+        built_shader_.data() + rdef_constant_position_dwords);
+    rdef_constant.name_ptr = rdef_info_name_ptr;
+    rdef_constant.size_bytes = sizeof(uint32_t) * 4;
+    rdef_constant.flags = dxbc::kRdefVariableFlagUsed;
+    rdef_constant.type_ptr = rdef_type_uint4_ptr;
+    rdef_constant.start_texture = UINT32_MAX;
+    rdef_constant.start_sampler = UINT32_MAX;
+  }
+  uint32_t rdef_cbuffer_position_dwords = uint32_t(built_shader_.size());
+  built_shader_.resize(rdef_cbuffer_position_dwords +
+                       sizeof(dxbc::RdefCbuffer) / sizeof(uint32_t));
+  {
+    auto& rdef_cbuffer = *reinterpret_cast<dxbc::RdefCbuffer*>(
+        built_shader_.data() + rdef_cbuffer_position_dwords);
+    rdef_cbuffer.name_ptr = rdef_info_name_ptr;
+    rdef_cbuffer.variable_count = 1;
+    rdef_cbuffer.variables_ptr = rdef_constant_ptr;
+    rdef_cbuffer.size_vector_aligned_bytes = sizeof(uint32_t) * 4;
+  }
+
+  // Bindings.
+  uint32_t rdef_xe_edram_name_ptr = uint32_t(
+      (built_shader_.size() - rdef_position_dwords) * sizeof(uint32_t));
+  dxbc::AppendAlignedString(built_shader_, "xe_edram");
+  uint32_t rdef_binding_position_dwords = uint32_t(built_shader_.size());
+  built_shader_.resize(rdef_binding_position_dwords +
+                       sizeof(dxbc::RdefInputBind) / sizeof(uint32_t) * 2);
+  {
+    auto rdef_bindings = reinterpret_cast<dxbc::RdefInputBind*>(
+        built_shader_.data() + rdef_binding_position_dwords);
+    dxbc::RdefInputBind& rdef_binding_edram = rdef_bindings[0];
+    rdef_binding_edram.name_ptr = rdef_xe_edram_name_ptr;
+    rdef_binding_edram.type = dxbc::RdefInputType::kUAVRWByteAddress;
+    rdef_binding_edram.return_type = dxbc::ResourceReturnType::kMixed;
+    rdef_binding_edram.dimension = dxbc::RdefDimension::kUAVBuffer;
+    rdef_binding_edram.bind_count = 1;
+    dxbc::RdefInputBind& rdef_binding_info = rdef_bindings[1];
+    rdef_binding_info.name_ptr = rdef_info_name_ptr;
+    rdef_binding_info.type = dxbc::RdefInputType::kCbuffer;
+    rdef_binding_info.bind_point = 0;
+    rdef_binding_info.bind_count = 1;
+    rdef_binding_info.flags = dxbc::kRdefInputFlagUserPacked;
+  }
+
+  {
+    auto& rdef_header = *reinterpret_cast<dxbc::RdefHeader*>(
+        built_shader_.data() + rdef_position_dwords);
+    rdef_header.cbuffer_count = 1;
+    rdef_header.cbuffers_ptr =
+        uint32_t((rdef_cbuffer_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
+    rdef_header.input_bind_count = 2;
+    rdef_header.input_binds_ptr =
+        uint32_t((rdef_binding_position_dwords - rdef_position_dwords) *
+                 sizeof(uint32_t));
+    rdef_header.shader_model = dxbc::RdefShaderModel::kComputeShader5_1;
+    rdef_header.compile_flags =
+        dxbc::kCompileFlagNoPreshader | dxbc::kCompileFlagPreferFlowControl |
+        dxbc::kCompileFlagIeeeStrictness | dxbc::kCompileFlagAllResourcesBound;
+    rdef_header.generator_name_ptr = sizeof(dxbc::RdefHeader);
+    rdef_header.fourcc = dxbc::RdefHeader::FourCC::k5_1;
+    rdef_header.InitializeSizes();
+  }
+
+  {
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
+    blob_header.fourcc = dxbc::BlobHeader::FourCC::kResourceDefinition;
+    blob_position_dwords = uint32_t(built_shader_.size());
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
+  }
+
+  // ***************************************************************************
+  // Input and output signatures (empty)
+  // ***************************************************************************
+
+  for (uint32_t i = 0; i < 2; ++i) {
+    built_shader_[blob_offset_position_dwords] =
+        uint32_t(blob_position_dwords * sizeof(uint32_t));
+    uint32_t signature_position_dwords =
+        blob_position_dwords + kBlobHeaderSizeDwords;
+    built_shader_.resize(signature_position_dwords +
+                         sizeof(dxbc::Signature) / sizeof(uint32_t));
+    {
+      auto& signature = *reinterpret_cast<dxbc::Signature*>(
+          built_shader_.data() + signature_position_dwords);
+      signature.parameter_info_ptr = sizeof(dxbc::Signature);
+    }
+    {
+      auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+          built_shader_.data() + blob_position_dwords);
+      blob_header.fourcc = i ? dxbc::BlobHeader::FourCC::kOutputSignature
+                             : dxbc::BlobHeader::FourCC::kInputSignature;
+      blob_position_dwords = uint32_t(built_shader_.size());
+      blob_header.size_bytes =
+          (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+          built_shader_[blob_offset_position_dwords++];
+    }
+  }
+
+  // ***************************************************************************
+  // Shader program
+  // ***************************************************************************
+
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
+  uint32_t shex_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
+  built_shader_.resize(shex_position_dwords);
+
+  built_shader_.push_back(
+      dxbc::VersionToken(dxbc::ProgramType::kComputeShader, 5, 1));
+  // Reserve space for the length token.
+  built_shader_.push_back(0);
+
+  dxbc::Statistics stat;
+  std::memset(&stat, 0, sizeof(dxbc::Statistics));
+  dxbc::Assembler a(built_shader_, stat);
+
+  a.OpDclGlobalFlags(dxbc::kGlobalFlagAllResourcesBound);
+  a.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, 0, 0, 0), 1);
+  a.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, 0, 0, 0));
+  a.OpDclInput(dxbc::Dest::VThreadID(0b0001));
+  // r0 and r1.z - addressing scratch
+  // r1.x - native byte address, r1.y - scaled byte address once assembled
+  // r2 - the value being moved
+  stat.temp_register_count = 3;
+  a.OpDclTemps(stat.temp_register_count);
+  // The tile sample counts (1280 and 640) are both divisible by 64, so
+  // dispatches are always exact and there's no bounds check.
+  a.OpDclThreadGroup(64, 1, 1);
+
+  dxbc::Src cb_start_tile(dxbc::Src::CB(0, 0, 0, dxbc::Src::kXXXX));
+
+  // Split the thread index into the tile and the sample within it.
+  // r0.x = tile index within the migrated range
+  // r0.y = sample index within the tile
+  a.OpUDiv(dxbc::Dest::R(0, 0b0001), dxbc::Dest::R(0, 0b0010),
+           dxbc::Src::VThreadID(dxbc::Src::kXXXX), dxbc::Src::LU(tile_samples));
+  // r0.x = tile index within the migrated range
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  a.OpUDiv(dxbc::Dest::R(0, 0b0100), dxbc::Dest::R(0, 0b1000),
+           dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(tile_samples_x));
+  // The range never crosses the end of the EDRAM, so no wrapping is needed.
+  // r0.x = tile index in the EDRAM
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  a.OpIAdd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
+           cb_start_tile);
+  // r0.x = tile index in the EDRAM
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  // r1.x = native region relative dword address of the tile
+  a.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(1, 0b0001),
+           dxbc::Src::R(0, dxbc::Src::kXXXX),
+           dxbc::Src::LU(tile_dwords_native));
+  // r0.x = tile index in the EDRAM
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  // r1.x = native region relative dword address of the sample row
+  a.OpUMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+           dxbc::Src::LU(xenos::kEdramTileWidthSamples),
+           dxbc::Src::R(1, dxbc::Src::kXXXX));
+  // r0.x = tile index in the EDRAM
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  // r1.x = native region relative dword address of the sample
+  a.OpUMAd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kWWWW),
+           dxbc::Src::LU(dwords_per_sample), dxbc::Src::R(1, dxbc::Src::kXXXX));
+  // r0.z = sample Y within the tile
+  // r0.w = sample X within the tile
+  // r1.x = native region relative dword address of the sample
+  // r1.y = scaled dword address of the tile
+  a.OpUMul(dxbc::Dest::Null(), dxbc::Dest::R(1, 0b0010),
+           dxbc::Src::R(0, dxbc::Src::kXXXX),
+           dxbc::Src::LU(tile_dwords_scaled));
+  // r0.w = sample X within the tile
+  // r1.x = native region relative dword address of the sample
+  // r1.y = scaled dword address of the first host row of the sample row
+  a.OpUMAd(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+           dxbc::Src::LU(scale_y * tile_row_dwords_scaled),
+           dxbc::Src::R(1, dxbc::Src::kYYYY));
+  // r1.x = native region relative dword address of the sample
+  // r1.y = scaled dword address of the (0, 0) host sample of the sample
+  a.OpUMAd(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kWWWW),
+           dxbc::Src::LU(scale_x * dwords_per_sample),
+           dxbc::Src::R(1, dxbc::Src::kYYYY));
+  // The native region sits right past the scaled one in the EDRAM buffer.
+  // r1.x = dword address of the sample in the EDRAM buffer
+  // r1.y = scaled dword address of the (0, 0) host sample
+  a.OpIAdd(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+           dxbc::Src::LU(scaled_size_dwords));
+  // r1.x = native byte address
+  // r1.y = scaled dword address of the (0, 0) host sample
+  a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX),
+           dxbc::Src::LU(2));
+  // r1.x = native byte address
+  // r1.y = scaled byte address of the (0, 0) host sample
+  a.OpIShL(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY),
+           dxbc::Src::LU(2));
+
+  uint32_t value_mask = is_64bpp ? 0b0011 : 0b0001;
+  if (to_native) {
+    // Center host sample of the scaled data, matching the resolve downscale
+    // convention, to the native region.
+    // r0.x = scaled byte address of the center host sample
+    // r1.x = native byte address
+    a.OpIAdd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kYYYY),
+             dxbc::Src::LU(center_offset_bytes));
+    // r2 = the value
+    a.OpLdRaw(dxbc::Dest::R(2, value_mask), dxbc::Src::R(0, dxbc::Src::kXXXX),
+              dxbc::Src::U(0, 0));
+    a.OpStoreRaw(dxbc::Dest::U(0, 0, value_mask),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(2));
+  } else {
+    // Duplicate the guest sample into all its host samples.
+    // r2 = the value
+    a.OpLdRaw(dxbc::Dest::R(2, value_mask), dxbc::Src::R(1, dxbc::Src::kXXXX),
+              dxbc::Src::U(0, 0));
+    for (uint32_t v = 0; v < scale_y; ++v) {
+      for (uint32_t u = 0; u < scale_x; ++u) {
+        // r0.x = scaled byte address of the (u, v) host sample
+        a.OpIAdd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(1, dxbc::Src::kYYYY),
+                 dxbc::Src::LU((u * u_step_dwords + v * v_step_dwords) *
+                               uint32_t(sizeof(uint32_t))));
+        a.OpStoreRaw(dxbc::Dest::U(0, 0, value_mask),
+                     dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::R(2));
+      }
+    }
+  }
+
+  a.OpRet();
+
+  built_shader_[shex_position_dwords + 1] =
+      uint32_t(built_shader_.size()) - shex_position_dwords;
+
+  {
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
+    blob_header.fourcc = dxbc::BlobHeader::FourCC::kShaderEx;
+    blob_position_dwords = uint32_t(built_shader_.size());
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
+  }
+
+  // ***************************************************************************
+  // Statistics
+  // ***************************************************************************
+
+  built_shader_[blob_offset_position_dwords] =
+      uint32_t(blob_position_dwords * sizeof(uint32_t));
+  uint32_t stat_position_dwords = blob_position_dwords + kBlobHeaderSizeDwords;
+  built_shader_.resize(stat_position_dwords +
+                       sizeof(dxbc::Statistics) / sizeof(uint32_t));
+  std::memcpy(built_shader_.data() + stat_position_dwords, &stat,
+              sizeof(dxbc::Statistics));
+  {
+    auto& blob_header = *reinterpret_cast<dxbc::BlobHeader*>(
+        built_shader_.data() + blob_position_dwords);
+    blob_header.fourcc = dxbc::BlobHeader::FourCC::kStatistics;
+    blob_position_dwords = uint32_t(built_shader_.size());
+    blob_header.size_bytes =
+        (blob_position_dwords - kBlobHeaderSizeDwords) * sizeof(uint32_t) -
+        built_shader_[blob_offset_position_dwords++];
+  }
+
+  // ***************************************************************************
+  // Container header
+  // ***************************************************************************
+
+  uint32_t built_shader_size_bytes =
+      uint32_t(built_shader_.size() * sizeof(uint32_t));
+  {
+    auto& container_header =
+        *reinterpret_cast<dxbc::ContainerHeader*>(built_shader_.data());
+    container_header.InitializeIdentification();
+    container_header.size_bytes = built_shader_size_bytes;
+    container_header.blob_count = kBlobCount;
+    CalculateDXBCChecksum(
+        reinterpret_cast<unsigned char*>(built_shader_.data()),
+        static_cast<unsigned int>(built_shader_size_bytes),
+        reinterpret_cast<unsigned int*>(&container_header.hash));
+  }
+
+  // ***************************************************************************
+  // Pipeline
+  // ***************************************************************************
+
+  ID3D12PipelineState* pipeline = ui::d3d12::util::CreateComputePipeline(
+      command_processor_.GetD3D12Provider().GetDevice(), built_shader_.data(),
+      built_shader_size_bytes, migration_root_signature_);
+  if (pipeline) {
+    std::u16string pipeline_name = xe::to_utf16(
+        fmt::format("EDRAM Migrate {} {}bpp",
+                    to_native ? "To Native" : "To Scaled", is_64bpp ? 64 : 32));
+    pipeline->SetName(reinterpret_cast<LPCWSTR>(pipeline_name.c_str()));
+  } else {
+    XELOGE(
+        "D3D12RenderTargetCache: Failed to create an EDRAM scale class "
+        "migration pipeline for {}bpp, to {}",
+        is_64bpp ? 64 : 32, to_native ? "native" : "scaled");
+  }
+  // Keep the null too so creation isn't retried every draw.
+  migration_pipelines_.emplace(map_key, pipeline);
+  return pipeline;
+}
+
+void D3D12RenderTargetCache::DispatchMigrations(
+    const std::vector<Migration>& migrations) {
+  if (migrations.empty()) {
+    return;
+  }
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  // Make everything written so far, including via ROV, visible to the
+  // migration reads.
+  CommitEdramBufferUAVWrites();
+  command_list.D3DSetComputeRootSignature(migration_root_signature_);
+  command_list.D3DSetComputeRootUnorderedAccessView(1,
+                                                    edram_buffer_gpu_address_);
+  for (const Migration& migration : migrations) {
+    bool is_64bpp = migration.scaled_key.Is64bpp();
+    ID3D12PipelineState* pipeline =
+        GetOrCreateMigrationPipeline(is_64bpp, migration.to_native);
+    if (!pipeline) {
+      continue;
+    }
+    command_processor_.SetExternalPipeline(pipeline);
+    uint32_t constants[4] = {migration.start_tiles, 0, 0, 0};
+    command_list.D3DSetComputeRoot32BitConstants(0, 4, constants, 0);
+    // Different migrations touch disjoint tile ranges, so no barriers between
+    // the dispatches. 1280 and 640 samples per tile, both divide by the group
+    // size of 64.
+    uint32_t samples = migration.length_tiles *
+                       ((xenos::kEdramTileWidthSamples >> uint32_t(is_64bpp)) *
+                        xenos::kEdramTileHeightSamples);
+    command_processor_.SubmitBarriers();
+    command_list.D3DDispatch(samples / 64, 1, 1);
+  }
+  MarkEdramBufferModified(EdramBufferModificationStatus::kAsUAV);
 }
 
 void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
