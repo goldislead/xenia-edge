@@ -210,10 +210,14 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // window_offset_edram_base_bias_tiles is the
+  // draw_util::GetWindowOffsetEdramBaseBiasTiles bias in 32bpp tiles, 0 when
+  // the offset stays in the geometry.
   virtual bool Update(bool is_rasterization_done,
                       reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask,
-                      const Shader& vertex_shader);
+                      const Shader& vertex_shader,
+                      int32_t window_offset_edram_base_bias_tiles);
 
   // Returns bits where 0 is whether a depth render target is currently bound on
   // the host and 1... are whether the same applies to color render targets, and
