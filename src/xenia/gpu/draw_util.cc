@@ -43,6 +43,13 @@ DEFINE_bool(
     "end of EDRAM instead of declining the relocation for the draw.",
     "GPU");
 
+DEFINE_bool(
+    resolve_dest_point_from_window_offset, true,
+    "Under tiling, take the resolve destination point's phase below the tiled "
+    "address period out of the pre-advanced destination base and into the "
+    "copy coordinates.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 namespace draw_util {
@@ -1337,14 +1344,68 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
         (UINT32_C(1) << xenos::GetTextureTiledYBaseGranularityLog2(
              bool(rb_copy_dest_info.copy_dest_array), bpp_log2)) -
         1;
+    // Direct3D 9 advances the destination base by whole 32x32 macro tiles for
+    // the destination point, X-major, but a base is a tiled origin only at
+    // the address function's period, 128 pixels at 8bpp, 64 at 16bpp, 32
+    // from 32bpp up. 534307D5 resolves its middle strip to x 480 of a
+    // 1280x720 5_6_5 texture, and the 32 pixels of phase left in the base put
+    // every other macro column in the wrong half of its period. Move the
+    // phase into the copy coordinates and take its bytes out of the base.
+    // The point is only known under tiling, where it's the tile origin, the
+    // rect origin before the window offset. An ordinary resolve to some other
+    // point could match the low base bits by coincidence.
+    uint32_t dest_addressing_base = rb_copy_dest_base;
+    uint32_t dest_addr_x0 = uint32_t(x0);
+    uint32_t dest_addr_y0 = uint32_t(y0);
+    if (cvars::resolve_dest_point_from_window_offset &&
+        !rb_copy_dest_info.copy_dest_array &&
+        regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
+        pa_sc_window_offset.window_x_offset <= 0 &&
+        pa_sc_window_offset.window_y_offset <= 0 &&
+        (pa_sc_window_offset.window_x_offset |
+         pa_sc_window_offset.window_y_offset) != 0) {
+      int32_t dest_point_x = x0 - pa_sc_window_offset.window_x_offset;
+      int32_t dest_point_y = y0 - pa_sc_window_offset.window_y_offset;
+      if ((dest_point_x | dest_point_y) >= 0 &&
+          !((dest_point_x | dest_point_y) &
+            int32_t(xenos::kTextureTileWidthHeight - 1))) {
+        uint32_t dest_phase_x =
+            uint32_t(dest_point_x) & dest_base_relative_x_mask;
+        uint32_t dest_phase_y =
+            uint32_t(dest_point_y) & dest_base_relative_y_mask;
+        if (dest_phase_x | dest_phase_y) {
+          uint32_t dest_phase_macro_bytes =
+              ((dest_phase_y >> xenos::kTextureTileWidthHeightLog2) *
+                   (copy_dest_pitch_aligned >>
+                    xenos::kTextureTileWidthHeightLog2) +
+               (dest_phase_x >> xenos::kTextureTileWidthHeightLog2))
+              << (2 * xenos::kTextureTileWidthHeightLog2 + bpp_log2);
+          // Subresources are 4 KB aligned, so the advance has to be in the
+          // low bits of the base. Otherwise the base starts the texture and
+          // the local addressing stands.
+          if (dest_phase_macro_bytes <= rb_copy_dest_base &&
+              (rb_copy_dest_base &
+               (xenos::kTextureSubresourceAlignmentBytes - 1)) ==
+                  (dest_phase_macro_bytes &
+                   (xenos::kTextureSubresourceAlignmentBytes - 1))) {
+            dest_addressing_base = rb_copy_dest_base - dest_phase_macro_bytes;
+            dest_addr_x0 = dest_phase_x;
+            dest_addr_y0 = dest_phase_y;
+          }
+        }
+      }
+    }
+    uint32_t dest_addr_x1 = dest_addr_x0 + uint32_t(x1 - x0);
+    uint32_t dest_addr_y1 = dest_addr_y0 + uint32_t(y1 - y0);
+    copy_dest_base_adjusted = dest_addressing_base;
     info_out.copy_dest_coordinate_info.offset_x_div_8 =
-        (uint32_t(x0) & dest_base_relative_x_mask) >>
+        (dest_addr_x0 & dest_base_relative_x_mask) >>
         xenos::kResolveAlignmentPixelsLog2;
     info_out.copy_dest_coordinate_info.offset_y_div_8 =
-        (uint32_t(y0) & dest_base_relative_y_mask) >>
+        (dest_addr_y0 & dest_base_relative_y_mask) >>
         xenos::kResolveAlignmentPixelsLog2;
-    uint32_t dest_base_x = uint32_t(x0) & ~dest_base_relative_x_mask;
-    uint32_t dest_base_y = uint32_t(y0) & ~dest_base_relative_y_mask;
+    uint32_t dest_base_x = dest_addr_x0 & ~dest_base_relative_x_mask;
+    uint32_t dest_base_y = dest_addr_y0 & ~dest_base_relative_y_mask;
     if (rb_copy_dest_info.copy_dest_array) {
       // The base pointer is already adjusted to the Z / 8 (copy_dest_slice is
       // 3-bit).
@@ -1352,27 +1413,27 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
           int32_t(dest_base_x), int32_t(dest_base_y), 0,
           copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
       copy_dest_extent_start =
-          rb_copy_dest_base +
+          dest_addressing_base +
           uint32_t(texture_util::GetTiledAddressLowerBound3D(
-              uint32_t(x0), uint32_t(y0), rb_copy_dest_info.copy_dest_slice,
+              dest_addr_x0, dest_addr_y0, rb_copy_dest_info.copy_dest_slice,
               copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
       copy_dest_extent_end =
-          rb_copy_dest_base +
+          dest_addressing_base +
           uint32_t(texture_util::GetTiledAddressUpperBound3D(
-              uint32_t(x1), uint32_t(y1), rb_copy_dest_info.copy_dest_slice + 1,
+              dest_addr_x1, dest_addr_y1, rb_copy_dest_info.copy_dest_slice + 1,
               copy_dest_pitch_aligned, copy_dest_height_aligned, bpp_log2));
     } else {
       copy_dest_base_adjusted +=
           texture_address::Tiled2D(int32_t(dest_base_x), int32_t(dest_base_y),
                                    copy_dest_pitch_aligned, bpp_log2);
       copy_dest_extent_start =
-          rb_copy_dest_base +
+          dest_addressing_base +
           texture_util::GetTiledAddressLowerBound2D(
-              uint32_t(x0), uint32_t(y0), copy_dest_pitch_aligned, bpp_log2);
+              dest_addr_x0, dest_addr_y0, copy_dest_pitch_aligned, bpp_log2);
       copy_dest_extent_end =
-          rb_copy_dest_base +
+          dest_addressing_base +
           texture_util::GetTiledAddressUpperBound2D(
-              uint32_t(x1), uint32_t(y1), copy_dest_pitch_aligned, bpp_log2);
+              dest_addr_x1, dest_addr_y1, copy_dest_pitch_aligned, bpp_log2);
     }
   } else {
     XELOGE("Tried to resolve to format {}, which is not a ColorFormat",
