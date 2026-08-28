@@ -609,11 +609,17 @@ void GetHostViewportInfo(GetViewportInfoArgs* XE_RESTRICT args,
 }
 template <bool clamp_to_surface_pitch>
 static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
-                                  Scissor& XE_RESTRICT scissor_out) {
+                                  Scissor& XE_RESTRICT scissor_out,
+                                  bool window_offset_in_edram_bases) {
 #if XE_ARCH_AMD64 == 1
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (window_offset_in_edram_bases) {
+    // The offset is in the EDRAM bases, the scissor stays unoffset like the
+    // geometry.
+    pa_sc_window_offset.value = 0;
+  }
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
@@ -700,6 +706,9 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (window_offset_in_edram_bases) {
+    pa_sc_window_offset.value = 0;
+  }
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
@@ -776,12 +785,116 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
 }
 
 void GetScissor(const RegisterFile& XE_RESTRICT regs,
-                Scissor& XE_RESTRICT scissor_out, bool clamp_to_surface_pitch) {
+                Scissor& XE_RESTRICT scissor_out, bool clamp_to_surface_pitch,
+                bool window_offset_in_edram_bases) {
   if (clamp_to_surface_pitch) {
-    return GetScissorTmpl<true>(regs, scissor_out);
+    return GetScissorTmpl<true>(regs, scissor_out,
+                                window_offset_in_edram_bases);
   } else {
-    return GetScissorTmpl<false>(regs, scissor_out);
+    return GetScissorTmpl<false>(regs, scissor_out,
+                                 window_offset_in_edram_bases);
   }
+}
+
+int32_t GetWindowOffsetEdramBaseBiasTiles(
+    const RegisterFile& XE_RESTRICT regs,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, bool pixel_shader_reads_position) {
+  // PsParamGen would report the unoffset position.
+  if (pixel_shader_reads_position) {
+    return 0;
+  }
+  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode != xenos::EdramMode::kColorDepth &&
+      edram_mode != xenos::EdramMode::kDepthOnly) {
+    return 0;
+  }
+  bool depth_used = normalized_depth_control.z_enable ||
+                    normalized_depth_control.stencil_enable;
+  if (!depth_used && !normalized_color_mask) {
+    return 0;
+  }
+  if (!regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    return 0;
+  }
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  int32_t window_y_offset = pa_sc_window_offset.window_y_offset;
+  // Only negative Y offsets relocate. Base + row * pitch + column matches the
+  // hardware only while the unoffset columns stay within the pitch, and in
+  // column tiling (534307D5, three 480-wide columns) the pitch is the tile
+  // width. Tiling replay into an allocation ahead of the bases is always
+  // negative.
+  if (pa_sc_window_offset.window_x_offset != 0 || window_y_offset >= 0) {
+    return 0;
+  }
+  // A window scissor with window_offset_disable set can't follow the
+  // geometry, and the screen scissor is never offset by the hardware, so it
+  // has to contain both the offset and the unoffset window scissor. Direct3D
+  // 9 leaves it at 0...8192.
+  auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  if (pa_sc_window_scissor_tl.window_offset_disable) {
+    return 0;
+  }
+  auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+  auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+  if (int32_t(pa_sc_screen_scissor_tl.tl_x) >
+          int32_t(pa_sc_window_scissor_tl.tl_x) ||
+      int32_t(pa_sc_screen_scissor_tl.tl_y) >
+          int32_t(pa_sc_window_scissor_tl.tl_y) + window_y_offset ||
+      int32_t(pa_sc_screen_scissor_br.br_x) <
+          int32_t(pa_sc_window_scissor_br.br_x) ||
+      int32_t(pa_sc_screen_scissor_br.br_y) <
+          int32_t(pa_sc_window_scissor_br.br_y)) {
+    return 0;
+  }
+  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  uint32_t pitch_pixels = rb_surface_info.surface_pitch;
+  if (!pitch_pixels) {
+    return 0;
+  }
+  uint32_t msaa_samples_x_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  uint32_t msaa_samples_y_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k2X);
+  int32_t tile_height_pixels =
+      int32_t(xenos::kEdramTileHeightSamples >> msaa_samples_y_log2);
+  if (window_y_offset % tile_height_pixels) {
+    return 0;
+  }
+  uint32_t pitch_tiles_at_32bpp = ((pitch_pixels << msaa_samples_x_log2) +
+                                   (xenos::kEdramTileWidthSamples - 1)) /
+                                  xenos::kEdramTileWidthSamples;
+  int32_t bias_tiles_at_32bpp =
+      (window_y_offset / tile_height_pixels) * int32_t(pitch_tiles_at_32bpp);
+  // Every surface of the draw must stay within the addressing period. A base
+  // that would go negative (per-tile "fast" depth restore into base 0, for
+  // one) means the pass is tile-local rather than addressing a persistent
+  // allocation - the geometric offset is the correct representation for it,
+  // and such passes are self-consistent since their depth and color draws all
+  // use the tile's own offset.
+  if (depth_used) {
+    if (int32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base) +
+            bias_tiles_at_32bpp <
+        0) {
+      return 0;
+    }
+  }
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
+      continue;
+    }
+    auto color_info = regs.Get<reg::RB_COLOR_INFO>(
+        reg::RB_COLOR_INFO::rt_register_indices[i]);
+    int32_t color_bias_tiles =
+        bias_tiles_at_32bpp *
+        (xenos::IsColorRenderTargetFormat64bpp(color_info.color_format) ? 2
+                                                                        : 1);
+    if (int32_t(color_info.color_base) + color_bias_tiles < 0) {
+      return 0;
+    }
+  }
+  return bias_tiles_at_32bpp;
 }
 
 uint32_t GetNormalizedColorMask(const RegisterFile& regs,

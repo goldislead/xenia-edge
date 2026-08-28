@@ -386,7 +386,8 @@ struct GetViewportInfoArgs {
     pixel_shader_writes_depth = _pixel_shader_writes_depth;
   }
 
-  void SetupRegisterValues(const RegisterFile& regs) {
+  void SetupRegisterValues(const RegisterFile& regs,
+                           bool window_offset_in_edram_bases) {
     pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
     pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
     pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
@@ -398,6 +399,12 @@ struct GetViewportInfoArgs {
     PA_CL_VPORT_YOFFSET = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
     PA_CL_VPORT_ZOFFSET = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
     pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    if (window_offset_in_edram_bases) {
+      // The offset is in the EDRAM bases, the geometry goes through the same
+      // transform as an offset-0 draw. Storing the effective offset keys the
+      // viewport cache on what's applied.
+      pa_sc_window_offset.value = 0;
+    }
     depth_format = regs.Get<reg::RB_DEPTH_INFO>().depth_format;
   }
   XE_FORCEINLINE
@@ -459,9 +466,26 @@ struct alignas(16) Scissor {
   uint32_t extent[2];
 };
 
+// window_offset_in_edram_bases skips the PA_SC_WINDOW_OFFSET addition, the
+// scissor selects the unoffset region the geometry is rasterized in.
 void GetScissor(const RegisterFile& XE_RESTRICT regs,
                 Scissor& XE_RESTRICT scissor_out,
-                bool clamp_to_surface_pitch = true);
+                bool clamp_to_surface_pitch = true,
+                bool window_offset_in_edram_bases = false);
+
+// Returns the bias to add to the EDRAM base tiles of the draw's surfaces
+// (zero or negative, in 32bpp tiles, double it for 64bpp color) to carry
+// PA_SC_WINDOW_OFFSET in the bases instead of the geometry and the scissor,
+// or 0 to keep it in the geometry. The Xenos adds the window offset to the
+// fixed-point vertex positions, so a depth pre-pass at offset 0 and a tile's
+// color pass at a negative offset rasterize identically, which EQUAL /
+// LESSEQUAL replay relies on. On hosts the offset goes through the float
+// viewport math and replayed depth wobbles by ULPs, carrying it in the bases
+// sends both passes through the same transform.
+int32_t GetWindowOffsetEdramBaseBiasTiles(
+    const RegisterFile& XE_RESTRICT regs,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask, bool pixel_shader_reads_position);
 
 // Returns the color component write mask for the draw command taking into
 // account which color targets are written to by the pixel shader, as well as

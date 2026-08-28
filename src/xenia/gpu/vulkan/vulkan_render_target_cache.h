@@ -130,8 +130,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done,
               reg::RB_DEPTHCONTROL normalized_depth_control,
-              uint32_t normalized_color_mask,
-              const Shader& vertex_shader) override;
+              uint32_t normalized_color_mask, const Shader& vertex_shader,
+              int32_t window_offset_edram_base_bias_tiles) override;
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const {
     return last_update_render_pass_key_;

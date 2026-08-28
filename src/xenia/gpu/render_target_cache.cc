@@ -620,7 +620,8 @@ bool RenderTargetCache::IsDrawScaleNative() const {
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask,
-                               const Shader& vertex_shader) {
+                               const Shader& vertex_shader,
+                               int32_t window_offset_edram_base_bias_tiles) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
 
@@ -688,7 +689,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         normalized_depth_control.stencil_enable) {
       depth_and_color_rts_used_bits |= 1;
       auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      edram_bases[0] = rb_depth_info.depth_base;
+      // GetWindowOffsetEdramBaseBiasTiles only returns a nonzero relocation
+      // when every surface of the draw stays non-negative after it.
+      int32_t depth_base_tiles = int32_t(rb_depth_info.depth_base) +
+                                 window_offset_edram_base_bias_tiles;
+      assert_true(depth_base_tiles >= 0);
+      edram_bases[0] = uint32_t(std::max(depth_base_tiles, int32_t(0)));
       // With pixel shader interlock, always the same addressing disregarding
       // the format.
       resource_formats[0] =
@@ -702,12 +708,15 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           reg::RB_COLOR_INFO::rt_register_indices[i]);
       uint32_t rt_bit_index = 1 + i;
       depth_and_color_rts_used_bits |= uint32_t(1) << rt_bit_index;
-      edram_bases[rt_bit_index] = color_info.color_base;
-      xenos::ColorRenderTargetFormat color_format =
-          regs.Get<reg::RB_COLOR_INFO>(
-                  reg::RB_COLOR_INFO::rt_register_indices[i])
-              .color_format;
+      xenos::ColorRenderTargetFormat color_format = color_info.color_format;
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
+      // Two tiles per 80x16 footprint at 64bpp, so twice the bias.
+      int32_t color_base_tiles =
+          int32_t(color_info.color_base) +
+          window_offset_edram_base_bias_tiles * (is_64bpp ? 2 : 1);
+      assert_true(color_base_tiles >= 0);
+      edram_bases[rt_bit_index] =
+          uint32_t(std::max(color_base_tiles, int32_t(0)));
       if (is_64bpp) {
         rts_are_64bpp |= uint32_t(1) << rt_bit_index;
       }
@@ -808,7 +817,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           interlock_barrier_only
               ? cvars::execute_unclipped_draw_vs_on_cpu_for_psi_render_backend
               : true,
-          vertex_shader));
+          vertex_shader, window_offset_edram_base_bias_tiles != 0));
 
   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
   // treat render targets placed closer to the end of the EDRAM as truncating
@@ -839,7 +848,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // tiles, and a 64bpp color buffer at 675 requiring 1350 tiles, but the
   // smallest distance between two render target bases is 675 tiles).
   uint32_t rt_max_distance_tiles_at_64bpp = xenos::kEdramTileCount * 2;
-  if (cvars::mrt_edram_used_range_clamp_to_min &&
+  if (!window_offset_edram_base_bias_tiles &&
+      cvars::mrt_edram_used_range_clamp_to_min &&
       edram_bases_sorted_count >= 2) {
     for (uint32_t i = 1; i < edram_bases_sorted_count; ++i) {
       const std::pair<uint32_t, uint32_t>& rt_base_prev =
@@ -865,10 +875,24 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   RenderTargetKey rt_keys[1 + xenos::kMaxColorRenderTargets];
   RenderTarget* rts[1 + xenos::kMaxColorRenderTargets];
   uint32_t rt_lengths_tiles[1 + xenos::kMaxColorRenderTargets];
+  uint32_t rt_starts_tiles[1 + xenos::kMaxColorRenderTargets];
   uint32_t length_used_tiles_at_32bpp =
       ((height_used << uint32_t(msaa_samples >= xenos::MsaaSamples::k2X)) +
        (xenos::kEdramTileHeightSamples - 1)) /
       xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  // With the offset in the bases the draw doesn't touch anything between a
+  // base and the scissor top, that belongs to the persistent allocation the
+  // base points into. Claims start at the scissor and aren't clamped between
+  // the bases.
+  uint32_t start_used_tiles_at_32bpp = 0;
+  if (window_offset_edram_base_bias_tiles) {
+    draw_util::Scissor scissor;
+    draw_util::GetScissor(regs, scissor, true, true);
+    start_used_tiles_at_32bpp =
+        (scissor.offset[1] << uint32_t(msaa_samples >=
+                                       xenos::MsaaSamples::k2X)) /
+        xenos::kEdramTileHeightSamples * pitch_tiles_at_32bpp;
+  }
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_base = rt_base_index.first;
@@ -888,16 +912,27 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       rts[rt_bit_index] = render_target;
     }
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
-    // The last render target can occupy the EDRAM until the base of the first
-    // render target (itself in case of 1 render target) with EDRAM addressing
-    // wrapping.
-    rt_lengths_tiles[i] = std::min(
-        std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
-                 rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
-        ((i + 1 < edram_bases_sorted_count)
-             ? edram_bases_sorted[i + 1].first
-             : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
-            rt_base);
+    if (window_offset_edram_base_bias_tiles) {
+      // Not clamped at the end of EDRAM - the claim may cross it, and
+      // ChangeOwnership wraps circular ranges itself, like the unbiased path
+      // lets the last render target wrap around to the first base.
+      rt_lengths_tiles[i] = std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
+                                     xenos::kEdramTileCount);
+      rt_starts_tiles[i] = std::min(start_used_tiles_at_32bpp << rt_is_64bpp,
+                                    rt_lengths_tiles[i]);
+    } else {
+      rt_starts_tiles[i] = 0;
+      // The last render target can occupy the EDRAM until the base of the
+      // first render target (itself in case of 1 render target) with EDRAM
+      // addressing wrapping.
+      rt_lengths_tiles[i] = std::min(
+          std::min(length_used_tiles_at_32bpp << rt_is_64bpp,
+                   rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
+          ((i + 1 < edram_bases_sorted_count)
+               ? edram_bases_sorted[i + 1].first
+               : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
+              rt_base);
+    }
   }
 
   if (interlock_barrier_only) {
@@ -910,8 +945,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
       const std::pair<uint32_t, uint32_t>& rt_base_index =
           edram_bases_sorted[i];
-      if (WouldOwnershipChangeRequireTransfers(rt_keys[rt_base_index.second], 0,
-                                               rt_lengths_tiles[i])) {
+      if (WouldOwnershipChangeRequireTransfers(
+              rt_keys[rt_base_index.second], rt_starts_tiles[i],
+              rt_lengths_tiles[i] - rt_starts_tiles[i])) {
         interlock_barrier_needed = true;
         break;
       }
@@ -929,7 +965,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
     uint32_t rt_bit_index = rt_base_index.second;
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+    ChangeOwnership(rt_keys[rt_bit_index], rt_starts_tiles[i],
+                    rt_lengths_tiles[i] - rt_starts_tiles[i],
                     interlock_barrier_only
                         ? nullptr
                         : &last_update_transfers_[rt_bit_index]);

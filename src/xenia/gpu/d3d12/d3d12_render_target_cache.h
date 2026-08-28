@@ -65,8 +65,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool Update(bool is_rasterization_done,
               reg::RB_DEPTHCONTROL normalized_depth_control,
-              uint32_t normalized_color_mask,
-              const Shader& vertex_shader) override;
+              uint32_t normalized_color_mask, const Shader& vertex_shader,
+              int32_t window_offset_edram_base_bias_tiles) override;
 
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
