@@ -689,12 +689,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         normalized_depth_control.stencil_enable) {
       depth_and_color_rts_used_bits |= 1;
       auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-      // GetWindowOffsetEdramBaseBiasTiles only returns a nonzero relocation
-      // when every surface of the draw stays non-negative after it.
+      // Negative under the relocation wraps into the previous EDRAM period
+      // like ownership claims and transfers.
       int32_t depth_base_tiles = int32_t(rb_depth_info.depth_base) +
                                  window_offset_edram_base_bias_tiles;
-      assert_true(depth_base_tiles >= 0);
-      edram_bases[0] = uint32_t(std::max(depth_base_tiles, int32_t(0)));
+      edram_bases[0] =
+          uint32_t(depth_base_tiles) & (xenos::kEdramTileCount - 1);
       // With pixel shader interlock, always the same addressing disregarding
       // the format.
       resource_formats[0] =
@@ -710,13 +710,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       depth_and_color_rts_used_bits |= uint32_t(1) << rt_bit_index;
       xenos::ColorRenderTargetFormat color_format = color_info.color_format;
       bool is_64bpp = xenos::IsColorRenderTargetFormat64bpp(color_format);
-      // Two tiles per 80x16 footprint at 64bpp, so twice the bias.
+      // Two tiles per 80x16 footprint at 64bpp, so twice the bias. Wraps like
+      // depth.
       int32_t color_base_tiles =
           int32_t(color_info.color_base) +
           window_offset_edram_base_bias_tiles * (is_64bpp ? 2 : 1);
-      assert_true(color_base_tiles >= 0);
       edram_bases[rt_bit_index] =
-          uint32_t(std::max(color_base_tiles, int32_t(0)));
+          uint32_t(color_base_tiles) & (xenos::kEdramTileCount - 1);
       if (is_64bpp) {
         rts_are_64bpp |= uint32_t(1) << rt_bit_index;
       }

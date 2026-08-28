@@ -6625,7 +6625,14 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         rectangle.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      uint32_t dispatch_first_tile = dump_base + dispatch.offset;
+      if (dispatch_first_tile < rt_key.base_tiles) {
+        // These tiles are in the tail of a render target wrapped around the
+        // end of EDRAM. Keep the index in the next period so subtracting the
+        // base stays non-negative, the shader wraps the address.
+        dispatch_first_tile += xenos::kEdramTileCount;
+      }
+      offsets.dispatch_first_tile = dispatch_first_tile;
       if (last_offsets != offsets) {
         last_offsets = offsets;
         root_parameters_set &= ~kDumpRootParameterOffsetsBit;
