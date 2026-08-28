@@ -37,6 +37,12 @@ DEFINE_bool(
     "be minimal if only a small portion of the scene is affected.",
     "GPU");
 
+DEFINE_bool(
+    window_offset_relocation_wrap, false,
+    "Wrap bases going negative under the window offset relocation around the "
+    "end of EDRAM instead of declining the relocation for the draw.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 namespace draw_util {
@@ -867,31 +873,34 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
                                   xenos::kEdramTileWidthSamples;
   int32_t bias_tiles_at_32bpp =
       (window_y_offset / tile_height_pixels) * int32_t(pitch_tiles_at_32bpp);
-  // Every surface of the draw must stay within the addressing period. A base
-  // that would go negative (per-tile "fast" depth restore into base 0, for
-  // one) means the pass is tile-local rather than addressing a persistent
-  // allocation - the geometric offset is the correct representation for it,
-  // and such passes are self-consistent since their depth and color draws all
-  // use the tile's own offset.
-  if (depth_used) {
-    if (int32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base) +
-            bias_tiles_at_32bpp <
-        0) {
-      return 0;
+  // A base going negative (tile-local depth rebuilt at base 0 while the offset
+  // points into a taller allocation) wraps into the previous EDRAM period,
+  // ownership, transfers, dumps, and interlock addressing all wrap the same
+  // way. Without window_offset_relocation_wrap such draws decline.
+  if (!cvars::window_offset_relocation_wrap) {
+    if (depth_used) {
+      int32_t depth_base_tiles =
+          int32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base) +
+          bias_tiles_at_32bpp;
+      if (depth_base_tiles < 0) {
+        return 0;
+      }
     }
-  }
-  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-    if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
-      continue;
-    }
-    auto color_info = regs.Get<reg::RB_COLOR_INFO>(
-        reg::RB_COLOR_INFO::rt_register_indices[i]);
-    int32_t color_bias_tiles =
-        bias_tiles_at_32bpp *
-        (xenos::IsColorRenderTargetFormat64bpp(color_info.color_format) ? 2
-                                                                        : 1);
-    if (int32_t(color_info.color_base) + color_bias_tiles < 0) {
-      return 0;
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
+        continue;
+      }
+      auto color_info = regs.Get<reg::RB_COLOR_INFO>(
+          reg::RB_COLOR_INFO::rt_register_indices[i]);
+      int32_t color_base_tiles =
+          int32_t(color_info.color_base) +
+          bias_tiles_at_32bpp *
+              (xenos::IsColorRenderTargetFormat64bpp(color_info.color_format)
+                   ? 2
+                   : 1);
+      if (color_base_tiles < 0) {
+        return 0;
+      }
     }
   }
   return bias_tiles_at_32bpp;

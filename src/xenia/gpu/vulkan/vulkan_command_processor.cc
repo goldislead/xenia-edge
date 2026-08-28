@@ -5231,15 +5231,17 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
       if (rt_keep_masks[i][0] != UINT32_MAX ||
           rt_keep_masks[i][1] != UINT32_MAX) {
-        // Two tiles per 80x16 footprint at 64bpp, so twice the bias.
-        uint32_t rt_base_tiles = uint32_t(std::max(
-            int32_t(color_info.color_base) +
-                window_offset_edram_base_bias_tiles *
-                    (xenos::IsColorRenderTargetFormat64bpp(
-                         color_info.color_format)
-                         ? 2
-                         : 1),
-            int32_t(0)));
+        // Two tiles per 80x16 footprint at 64bpp, so twice the bias. Negative
+        // results wrap into the previous EDRAM period like the interlock
+        // addressing.
+        uint32_t rt_base_tiles =
+            uint32_t(int32_t(color_info.color_base) +
+                     window_offset_edram_base_bias_tiles *
+                         (xenos::IsColorRenderTargetFormat64bpp(
+                              color_info.color_format)
+                              ? 2
+                              : 1)) &
+            (xenos::kEdramTileCount - 1);
         uint32_t rt_base_dwords_scaled =
             rt_base_tiles * edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] !=
@@ -5290,10 +5292,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 
   if (edram_fragment_shader_interlock) {
-    uint32_t depth_base_tiles =
-        uint32_t(std::max(int32_t(rb_depth_info.depth_base) +
-                              window_offset_edram_base_bias_tiles,
-                          int32_t(0)));
+    // Negative under the relocation wraps into the previous EDRAM period like
+    // the interlock addressing.
+    uint32_t depth_base_tiles = uint32_t(int32_t(rb_depth_info.depth_base) +
+                                         window_offset_edram_base_bias_tiles) &
+                                (xenos::kEdramTileCount - 1);
     uint32_t depth_base_dwords_scaled =
         depth_base_tiles * edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled !=
