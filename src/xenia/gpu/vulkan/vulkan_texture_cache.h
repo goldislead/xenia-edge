@@ -498,6 +498,7 @@ class VulkanTextureCache final : public TextureCache {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t layers = 0;
+    // UNDEFINED until the first upload, GENERAL for the rest of its life.
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     // Size of an allocation that already failed, so it is not retried on every
     // upload. Zero if none has.

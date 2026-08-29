@@ -1879,18 +1879,25 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
           scratch_buffer_acquisition.SetAccessMask(VK_ACCESS_SHADER_READ_BIT),
           VK_ACCESS_SHADER_READ_BIT);
-      // A freshly created staging image is UNDEFINED, a reused one was left
-      // as the source of the previous copy.
-      bool staging_was_read =
-          blit_staging.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      // The staging image stays in GENERAL for life. vkCmdCopyImage reads
+      // that layout and STORAGE usage rules out compression anyway, so a
+      // TRANSFER_SRC round trip would only cost a transition of the whole
+      // image, which is grown to the largest upload of its size class.
+      bool staging_initialized = blit_staging.layout == VK_IMAGE_LAYOUT_GENERAL;
       command_processor_.PushImageMemoryBarrier(
-          staging_image, ui::vulkan::util::InitializeSubresourceRange(),
-          staging_was_read ? VK_PIPELINE_STAGE_TRANSFER_BIT
-                           : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+          staging_image,
+          // Only the initialising transition needs every layer.
+          staging_initialized
+              ? ui::vulkan::util::InitializeSubresourceRange(
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, array_size)
+              : ui::vulkan::util::InitializeSubresourceRange(),
+          staging_initialized ? VK_PIPELINE_STAGE_TRANSFER_BIT
+                              : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-          staging_was_read ? VK_ACCESS_TRANSFER_READ_BIT : 0,
+          staging_initialized ? VK_ACCESS_TRANSFER_READ_BIT : 0,
           VK_ACCESS_SHADER_WRITE_BIT, blit_staging.layout,
           VK_IMAGE_LAYOUT_GENERAL);
+      blit_staging.layout = VK_IMAGE_LAYOUT_GENERAL;
       command_processor_.SubmitBarriers(true);
 
       command_processor_.BindExternalComputePipeline(
@@ -1918,11 +1925,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       }
 
       command_processor_.PushImageMemoryBarrier(
-          staging_image, ui::vulkan::util::InitializeSubresourceRange(),
+          staging_image,
+          ui::vulkan::util::InitializeSubresourceRange(
+              VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, array_size),
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-      blit_staging.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
       blit_staging_image = staging_image;
     }
   }
@@ -1996,10 +2004,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       blit_copy_region.extent.height = blit_level.size_blocks_y;
       blit_copy_region.extent.depth = 1;
     }
-    command_buffer.CmdVkCopyImage(
-        blit_staging_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        blit_level_count, blit_copy_regions.data());
+    command_buffer.CmdVkCopyImage(blit_staging_image, VK_IMAGE_LAYOUT_GENERAL,
+                                  vulkan_texture.image(),
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  blit_level_count, blit_copy_regions.data());
   }
   if (copy_level_first <= level_last) {
     VkBufferImageCopy* copy_regions =
