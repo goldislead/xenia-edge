@@ -3960,6 +3960,9 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     uint32_t normalized_color_mask,
     const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
     bool interpreter_placeholder) {
+#if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  SCOPE_profile_cpu_f("gpu");
+#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   const RegisterFile& regs = *register_file_;
 

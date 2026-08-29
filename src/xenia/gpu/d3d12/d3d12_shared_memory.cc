@@ -15,6 +15,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/profiling.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -527,6 +528,7 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(
 bool D3D12SharedMemory::UploadRanges(
     const std::pair<uint32_t, uint32_t>* upload_page_ranges,
     uint32_t num_upload_page_ranges) {
+  SCOPE_profile_cpu_f("gpu");
   if (!num_upload_page_ranges) {
     return true;
   }

@@ -903,6 +903,7 @@ void D3D12TextureCache::PrefetchSamplerParameters(
 }
 D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     const SpirvShader::SamplerBinding& binding) const {
+  SCOPE_profile_cpu_f("gpu");
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch =
       regs.GetTextureFetch(binding.fetch_constant);
@@ -1576,6 +1577,7 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                               bool load_base,
                                                               bool load_mips) {
+  SCOPE_profile_cpu_f("gpu");
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
 

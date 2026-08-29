@@ -19,6 +19,7 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
+#include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
 #include "xenia/gpu/d3d12/d3d12_texture_cache.h"
@@ -1053,6 +1054,7 @@ void D3D12RenderTargetCache::BeginSubmission() {
 bool D3D12RenderTargetCache::Update(
     bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, const Shader& vertex_shader) {
+  SCOPE_profile_cpu_f("gpu");
   if (!RenderTargetCache::Update(is_rasterization_done,
                                  normalized_depth_control,
                                  normalized_color_mask, vertex_shader)) {
@@ -1172,6 +1174,7 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
                                      uint32_t& written_length_out,
                                      reg::RB_COPY_DEST_INFO* copy_dest_info_out,
                                      bool* written_scaled_out) {
+  SCOPE_profile_cpu_f("gpu");
   written_address_out = 0;
   written_length_out = 0;
   if (written_scaled_out) {
@@ -2278,6 +2281,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
     const Transfer::Rectangle* resolve_clear_rectangle) {
+  SCOPE_profile_cpu_f("gpu");
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   bool resolve_clear_needed =
@@ -3776,6 +3780,7 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                uint32_t dump_rows,
                                                uint32_t dump_pitch,
                                                bool native_layout) {
+  SCOPE_profile_cpu_f("gpu");
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
