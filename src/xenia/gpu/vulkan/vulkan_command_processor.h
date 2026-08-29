@@ -63,6 +63,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBuffer,
+    // Scratch buffer plus the destination image of a texture load, for the
+    // compute blit that replaces vkCmdCopyBufferToImage.
+    kStorageBufferAndStorageImage,
     kCount,
   };
 
@@ -249,6 +252,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
     return descriptor_set_layouts_single_transient_[size_t(
         transient_descriptor_layout)];
   }
+  // Queues an image, its view and its memory for destruction once the
+  // submission using them now has completed. Any of them may be null.
+  void DestroyScratchImageWhenIdle(VkImage image, VkImageView image_view,
+                                   VkDeviceMemory memory);
+
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
       SingleTransientDescriptorLayout transient_descriptor_layout);
@@ -696,11 +704,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
   static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBufferAndImage[2];
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator
+      transient_descriptor_allocator_storage_buffer_and_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>,
              size_t(SingleTransientDescriptorLayout::kCount)>

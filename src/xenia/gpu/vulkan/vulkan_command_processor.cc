@@ -72,6 +72,11 @@ constexpr VkDescriptorPoolSize
     VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kLinkedTypeDescriptorPoolSetCount};
 
+constexpr VkDescriptorPoolSize
+    VulkanCommandProcessor::kDescriptorPoolSizeStorageBufferAndImage[2] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kLinkedTypeDescriptorPoolSetCount},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLinkedTypeDescriptorPoolSetCount}};
+
 // 2x descriptors for texture images because of unsigned and signed bindings.
 constexpr VkDescriptorPoolSize
     VulkanCommandProcessor::kDescriptorPoolSizeTextures[2] = {
@@ -99,6 +104,12 @@ VulkanCommandProcessor::VulkanCommandProcessor(
               graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1,
+          kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_buffer_and_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(
+              graphics_system->provider())
+              ->vulkan_device(),
+          kDescriptorPoolSizeStorageBufferAndImage, 2,
           kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(
@@ -344,6 +355,37 @@ bool VulkanCommandProcessor::SetupContext() {
       VK_SUCCESS) {
     XELOGE(
         "Failed to create a Vulkan descriptor set layout for a storage buffer");
+    return false;
+  }
+  // Transient: the texture load scratch buffer plus the image the compute blit
+  // writes, replacing vkCmdCopyBufferToImage.
+  VkDescriptorSetLayoutBinding
+      descriptor_set_layout_bindings_storage_buffer_and_image[2] = {};
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].binding = 0;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].descriptorType =
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].descriptorCount =
+      1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].binding = 1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].descriptorType =
+      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].descriptorCount =
+      1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT;
+  descriptor_set_layout_create_info.bindingCount = 2;
+  descriptor_set_layout_create_info.pBindings =
+      descriptor_set_layout_bindings_storage_buffer_and_image;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::
+                  kStorageBufferAndStorageImage)]) != VK_SUCCESS) {
+    XELOGE(
+        "Failed to create a Vulkan descriptor set layout for a storage buffer "
+        "and a storage image");
     return false;
   }
 
@@ -2826,6 +2868,21 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
+void VulkanCommandProcessor::DestroyScratchImageWhenIdle(
+    VkImage image, VkImageView image_view, VkDeviceMemory memory) {
+  // GetCurrentSubmission() only grows, so the deques stay sorted by it.
+  uint64_t submission_current = GetCurrentSubmission();
+  if (image_view != VK_NULL_HANDLE) {
+    destroy_image_views_.emplace_back(submission_current, image_view);
+  }
+  if (image != VK_NULL_HANDLE) {
+    destroy_images_.emplace_back(submission_current, image);
+  }
+  if (memory != VK_NULL_HANDLE) {
+    destroy_memory_.emplace_back(submission_current, memory);
+  }
+}
+
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     SingleTransientDescriptorLayout transient_descriptor_layout) {
   assert_true(frame_open_);
@@ -2839,20 +2896,36 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
-    bool is_storage_buffer = transient_descriptor_layout ==
-                             SingleTransientDescriptorLayout::kStorageBuffer;
-    ui::vulkan::LinkedTypeDescriptorSetAllocator&
+    ui::vulkan::LinkedTypeDescriptorSetAllocator*
+        transient_descriptor_allocator;
+    VkDescriptorPoolSize descriptor_counts[2];
+    uint32_t descriptor_count_count = 1;
+    switch (transient_descriptor_layout) {
+      case SingleTransientDescriptorLayout::kStorageBuffer:
         transient_descriptor_allocator =
-            is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                              : transient_descriptor_allocator_uniform_buffer_;
-    VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type = is_storage_buffer
-                                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    descriptor_count.descriptorCount = 1;
-    descriptor_set = transient_descriptor_allocator.Allocate(
+            &transient_descriptor_allocator_storage_buffer_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        break;
+      case SingleTransientDescriptorLayout::kStorageBufferAndStorageImage:
+        transient_descriptor_allocator =
+            &transient_descriptor_allocator_storage_buffer_and_image_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        descriptor_counts[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        descriptor_counts[1].descriptorCount = 1;
+        descriptor_count_count = 2;
+        break;
+      default:
+        transient_descriptor_allocator =
+            &transient_descriptor_allocator_uniform_buffer_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        break;
+    }
+    descriptor_set = transient_descriptor_allocator->Allocate(
         GetSingleTransientDescriptorLayout(transient_descriptor_layout),
-        &descriptor_count, 1);
+        descriptor_counts, descriptor_count_count);
     if (descriptor_set == VK_NULL_HANDLE) {
       return VK_NULL_HANDLE;
     }
@@ -5623,6 +5696,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   }
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
+  transient_descriptor_allocator_storage_buffer_and_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
 }
 

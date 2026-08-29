@@ -455,6 +455,60 @@ class VulkanTextureCache final : public TextureCache {
   static const HostFormatPair kHostFormatBGRGUnaligned;
   HostFormatPair host_formats_[64];
 
+  // Compute blit moving loaded levels out of the scratch buffer into the
+  // image, in place of vkCmdCopyBufferToImage - NVIDIA runs that copy at about
+  // an eighth of the rate a shader writing the same bytes reaches. Covers host
+  // blocks of 4, 8 or 16 bytes, colour or block-compressed. 3D and depth keep
+  // the copy. See texture_blit_scratch_*.cs.glsl.
+  enum ScratchBlitShaderIndex {
+    kScratchBlitShaderIndex32bpb,
+    kScratchBlitShaderIndex64bpb,
+    kScratchBlitShaderIndex128bpb,
+    kScratchBlitShaderIndexCount,
+  };
+  struct ScratchBlitConstants {
+    // Offset of the level within the scratch buffer, in host blocks.
+    uint32_t offset_blocks;
+    // Host blocks per row in the scratch buffer.
+    uint32_t pitch_blocks;
+    // Host blocks per array slice in the scratch buffer.
+    uint32_t slice_blocks;
+    // Row of the staging image this level starts at - levels are stacked so a
+    // whole chain dispatches without barriers between them.
+    uint32_t dest_offset_y;
+    // Extent of this level in host blocks.
+    uint32_t size_blocks[2];
+  };
+  // The shader writes an unsigned-integer staging image which is then copied
+  // into the destination, so the destination stays a plain sampled image and
+  // keeps its compression. Returns the staging format, or VK_FORMAT_UNDEFINED
+  // if this texture has to use vkCmdCopyBufferToImage.
+  VkFormat GetScratchBlitStagingFormat(const TextureKey& key) const;
+  static uint32_t GetScratchBlitShaderIndex(uint32_t bytes_per_host_block);
+  void InitializeScratchBlit();
+  // Grown as needed and reused, like the command processor's scratch buffer.
+  bool AcquireScratchBlitStagingImage(uint32_t shader_index, VkFormat format,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t layers, VkImage& image_out,
+                                      VkImageView& view_out);
+  struct ScratchBlitStagingImage {
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t layers = 0;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // Size of an allocation that already failed, so it is not retried on every
+    // upload. Zero if none has.
+    VkDeviceSize failed_bytes = 0;
+  };
+  std::array<ScratchBlitStagingImage, kScratchBlitShaderIndexCount>
+      scratch_blit_staging_;
+  VkPipelineLayout scratch_blit_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kScratchBlitShaderIndexCount>
+      scratch_blit_pipelines_{};
+
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
