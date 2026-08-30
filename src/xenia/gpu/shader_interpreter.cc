@@ -1037,11 +1037,15 @@ void ShaderInterpreter::ExecuteVertexFetchInstruction(
       uint32_t dword_address_dwords = dword_0_address_dwords + i;
       if (dword_address_dwords >= fetch_constant.address &&
           dword_address_dwords < buffer_end_dwords) {
+        // Mask to physical like the shader - the guest may use a mirror
+        // window, and memory_dwords only covers 512 MB.
+        uint32_t dword_address_physical =
+            xenos::CpuToGpu(dword_address_dwords << 2) >> 2;
         if (trace_writer_) {
           trace_writer_->WriteMemoryRead(
-              sizeof(uint32_t) * dword_address_dwords, sizeof(uint32_t));
+              sizeof(uint32_t) * dword_address_physical, sizeof(uint32_t));
         }
-        dword_value = xenos::GpuSwap(memory_dwords[dword_address_dwords],
+        dword_value = xenos::GpuSwap(memory_dwords[dword_address_physical],
                                      fetch_constant.endian);
       }
       data[i] = dword_value;
