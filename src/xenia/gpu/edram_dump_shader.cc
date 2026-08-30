@@ -634,28 +634,62 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     spv::Id source_pixel_x = source_sample_x, source_pixel_y = source_sample_y;
     spv::Id source_sample_id = spv::NoResult;
     if (source_is_multisampled) {
+      // source_sample_x/y hold the canonical sample coordinates within the
+      // EDRAM layout. Convert them into the pixel and the sample of the
+      // multisampled view using the canonical layout formulas, at guest pixel
+      // granularity when the layout is scaled.
+      bool layout_scaled = layout_scale_x > 1 || layout_scale_y > 1;
       spv::Id const_uint_1 = builder.makeUintConstant(1);
-      source_pixel_y = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                           source_sample_y, const_uint_1);
+      spv::Id const_uint_2 = builder.makeUintConstant(2);
+      spv::Id canonical_u = source_sample_x;
+      spv::Id canonical_v = source_sample_y;
+      spv::Id subpixel_x = spv::NoResult, subpixel_y = spv::NoResult;
+      spv::Id const_layout_scale_x = spv::NoResult;
+      spv::Id const_layout_scale_y = spv::NoResult;
+      if (layout_scaled) {
+        const_layout_scale_x = builder.makeUintConstant(layout_scale_x);
+        const_layout_scale_y = builder.makeUintConstant(layout_scale_y);
+        canonical_u = builder.createBinOp(
+            spv::OpUDiv, type_uint, source_sample_x, const_layout_scale_x);
+        subpixel_x = builder.createBinOp(spv::OpUMod, type_uint,
+                                         source_sample_x, const_layout_scale_x);
+        canonical_v = builder.createBinOp(
+            spv::OpUDiv, type_uint, source_sample_y, const_layout_scale_y);
+        subpixel_y = builder.createBinOp(spv::OpUMod, type_uint,
+                                         source_sample_y, const_layout_scale_y);
+      }
       if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-        source_pixel_x = builder.createBinOp(
-            spv::OpShiftRightLogical, type_uint, source_sample_x, const_uint_1);
-        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1 for
-        // vertical.
+        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1
+        // for vertical, same as the canonical layout.
+        // sample = ((u >> 1) & 1) | (((v >> 1) & 1) << 1)
         source_sample_id = builder.createQuadOp(
             spv::OpBitFieldInsert, type_uint,
-            builder.createBinOp(spv::OpBitwiseAnd, type_uint, source_sample_x,
-                                const_uint_1),
-            source_sample_y, const_uint_1, const_uint_1);
+            builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_u,
+                                const_uint_1, const_uint_1),
+            builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_v,
+                                const_uint_1, const_uint_1),
+            const_uint_1, const_uint_1);
+        // Guest pixel per axis = ((c >> 2) << 1) | (c & 1).
+        source_pixel_x = builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, canonical_u,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                canonical_u, const_uint_2),
+            const_uint_1, builder.makeUintConstant(31));
+        source_pixel_y = builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, canonical_v,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                canonical_v, const_uint_2),
+            const_uint_1, builder.makeUintConstant(31));
       } else {
-        // 2x MSAA source texture sample index - convert from the guest to
-        // the Vulkan standard sample locations.
+        // At 2x the guest sample sits in canonical U bit 1 and one guest pixel
+        // X bit sits in canonical V bit 1. Convert the guest sample index to
+        // the Vulkan standard sample order.
         source_sample_id = builder.createTriOp(
             spv::OpSelect, type_uint,
             builder.createBinOp(
-                spv::OpINotEqual, builder.makeBoolType(),
-                builder.createBinOp(spv::OpBitwiseAnd, type_uint,
-                                    source_sample_y, const_uint_1),
+                spv::OpINotEqual, type_bool,
+                builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_u,
+                                    const_uint_2),
                 const_uint_0),
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
@@ -663,12 +697,43 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
                     0, options.msaa_2x_attachments_supported)));
+        // Guest pixel X = (u & ~2) | (v & 2).
+        source_pixel_x = builder.createBinOp(
+            spv::OpBitwiseOr, type_uint,
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_u,
+                                builder.makeUintConstant(~uint32_t(2))),
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                const_uint_2));
+        // Guest pixel Y = ((v & ~3) >> 1) | (v & 1).
+        source_pixel_y = builder.createBinOp(
+            spv::OpBitwiseOr, type_uint,
+            builder.createBinOp(
+                spv::OpShiftRightLogical, type_uint,
+                builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                    builder.makeUintConstant(~uint32_t(3))),
+                const_uint_1),
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                const_uint_1));
       }
-    }
-    if (key.source_scale_native && dest_scaled) {
-      // Native source dumped to the scaled EDRAM layout. Duplicate each pixel
-      // into all the scaled sample slots covering it. Done after the sample
-      // index is extracted since MSAA isn't affected by scale.
+      if (!key.source_scale_native && layout_scaled) {
+        // Scaled source in the scaled layout. Restore the subpixel position.
+        source_pixel_x = builder.createBinOp(
+            spv::OpIAdd, type_uint,
+            builder.createBinOp(spv::OpIMul, type_uint, source_pixel_x,
+                                const_layout_scale_x),
+            subpixel_x);
+        source_pixel_y = builder.createBinOp(
+            spv::OpIAdd, type_uint,
+            builder.createBinOp(spv::OpIMul, type_uint, source_pixel_y,
+                                const_layout_scale_y),
+            subpixel_y);
+      }
+      // With a native source and a scaled layout, the guest pixel position
+      // comes directly from the source texture position, and all the scaled
+      // sample slots covering one guest sample receive its value.
+    } else if (key.source_scale_native && dest_scaled) {
+      // Native single sampled source dumped to the scaled EDRAM layout.
+      // Duplicate each pixel into all the scaled sample slots covering it.
       source_pixel_x = builder.createBinOp(
           spv::OpUDiv, type_uint, source_pixel_x,
           builder.makeUintConstant(options.resolution_scale_x));
@@ -838,17 +903,11 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
       }
     }
 
-    // The sample this pixel resolves from, following XeEdramOffsetBytes: the
-    // pixel scaled by the MSAA dimensions, plus bit 1 of the sample index on X
-    // and bit 0 on Y. Eligibility guarantees a single selected sample, so
-    // XeResolveFirstSampleIndex is the raw field.
+    // The sample this pixel resolves from. Eligibility guarantees a single
+    // selected sample, so XeResolveFirstSampleIndex is the raw field.
     spv::Id sample_select =
         extract(resolve_dest_coordinate_info,
                 kResolveDestCoordinateInfoSampleSelectShift, 3);
-    spv::Id tile_sample_x = add(shift_left(pixel_in_tile_x, msaa_x_log2),
-                                bitwise_and(shift_right(sample_select, 1), 1));
-    spv::Id tile_sample_y = add(shift_left(pixel_in_tile_y, msaa_y_log2),
-                                bitwise_and(sample_select, 1));
     spv::Id edram_tile_index =
         add(add(extract(resolve_edram_info, kResolveEdramInfoBaseTilesShift,
                         xenos::kEdramBaseTilesBits),
@@ -868,22 +927,21 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     spv::Id source_pitch_tiles = builder.createTriOp(
         spv::OpBitFieldUExtract, type_uint, pitches_constant,
         const_edram_pitch_tiles_bits, const_edram_pitch_tiles_bits);
-    spv::Id source_sample_x = add(
-        multiply(const_tile_width,
+
+    // The canonical sample rearrangement of XeEdramOffsetBytes only permutes
+    // the samples within a tile, so the source pixel is the source tile's
+    // origin plus the position within the tile, and the selected sample is the
+    // same for every pixel of the run.
+    spv::Id source_pixel_x = add(
+        multiply(builder.makeUintConstant(tile_pixels_x),
                  builder.createBinOp(spv::OpUMod, type_uint, source_tile_index,
                                      source_pitch_tiles)),
-        tile_sample_x);
-    spv::Id source_sample_y = add(
-        multiply(const_tile_height,
+        pixel_in_tile_x);
+    spv::Id source_pixel_y = add(
+        multiply(builder.makeUintConstant(tile_pixels_y),
                  builder.createBinOp(spv::OpUDiv, type_uint, source_tile_index,
                                      source_pitch_tiles)),
-        tile_sample_y);
-
-    // The sample index is uniform across the run - the MSAA shift puts the
-    // selected sample's bits below the pixel, and the run only advances the
-    // pixel.
-    spv::Id source_pixel_x = shift_right(source_sample_x, msaa_x_log2);
-    spv::Id source_pixel_y = shift_right(source_sample_y, msaa_y_log2);
+        pixel_in_tile_y);
     if (fill_bias_y != spv::NoResult) {
       source_pixel_y = add(source_pixel_y, fill_bias_y);
     }
@@ -896,20 +954,17 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     }
     spv::Id source_sample_id = spv::NoResult;
     if (source_is_multisampled) {
-      spv::Id const_uint_1 = builder.makeUintConstant(1);
       if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1
-        // for vertical.
-        source_sample_id = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint, bitwise_and(source_sample_x, 1),
-            source_sample_y, const_uint_1, const_uint_1);
+        // The guest 4x sample numbering matches the host one, bit 0 horizontal
+        // and bit 1 vertical, so the selected sample passes through.
+        source_sample_id = bitwise_and(sample_select, 3);
       } else {
         // 2x MSAA source texture sample index - convert from the guest to the
         // Vulkan standard sample locations.
         source_sample_id = builder.createTriOp(
             spv::OpSelect, type_uint,
             builder.createBinOp(spv::OpINotEqual, type_bool,
-                                bitwise_and(source_sample_y, 1), const_uint_0),
+                                bitwise_and(sample_select, 1), const_uint_0),
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
                     1, options.msaa_2x_attachments_supported)),
