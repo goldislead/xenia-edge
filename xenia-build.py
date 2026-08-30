@@ -574,15 +574,60 @@ def get_cc(cc=None):
         return (cc, cc + "++")
     return (os.environ.get("CC", "clang"), os.environ.get("CXX", "clang++"))
 
+def resolve_python_launcher(binary):
+    """Maps a pip console-script .exe to the native binary it wraps.
+
+    These launchers restart Python on every call, which dominates the runtime
+    of per-file loops. Returns None when binary is not such a launcher or the
+    wheel ships no native binary.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        # Real toolchain binaries are megabytes, the launcher stub is ~100 KB.
+        if os.path.getsize(binary) > 512 * 1024:
+            return None
+        with zipfile.ZipFile(binary) as launcher:
+            entry = launcher.read("__main__.py").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    module = None
+    for line in entry.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "from" and parts[2] == "import":
+            module = parts[1]
+            break
+    # A dotted import means a Python entry point, so there is nothing to skip to.
+    if not module or "." in module:
+        return None
+    # Wheels carrying a binary place it in <module>/data/bin.
+    scripts_dir = os.path.dirname(os.path.abspath(binary))
+    for site_dir in ("site-packages", os.path.join("Lib", "site-packages")):
+        native = os.path.join(os.path.dirname(scripts_dir), site_dir, module,
+                              "data", "bin", os.path.basename(binary))
+        if os.path.isfile(native):
+            return native
+    return None
+
+
 def get_clang_format_binary():
     # Use pre-vsvars PATH so VS's bundled Llvm clang-format doesn't shadow the user's.
     binary = shutil_which("clang-format", path=_user_path) or "clang-format"
     try:
         out = subprocess.check_output([binary, "--version"], text=True)
-        print(out)
     except (subprocess.CalledProcessError, OSError):
         print_error("clang-format is not on PATH")
         sys.exit(1)
+    native = resolve_python_launcher(binary)
+    if native:
+        try:
+            # Only skip the launcher if it really fronts this binary.
+            if subprocess.check_output([native, "--version"], text=True) == out:
+                binary = native
+                print(f"- skipping Python launcher, using {native}")
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    print(out)
     return binary
 
 
