@@ -16,7 +16,7 @@
 #if XE_PLATFORM_WIN32
 #include "platform_win.h"
 #endif
-#if XE_PLATFORM_APPLE
+#if XE_PLATFORM_MAC
 #include <os/lock.h>  // os_unfair_lock
 #endif
 #include "memory.h"
@@ -156,7 +156,7 @@ class xe_unlikely_mutex {
 };
 
 using xe_mutex = xe_fast_mutex;
-#elif XE_PLATFORM_APPLE == 1 && XE_ENABLE_FAST_APPLE_MUTEX == 1
+#elif XE_PLATFORM_MAC == 1 && XE_ENABLE_FAST_APPLE_MUTEX == 1
 // Apple (macOS / iOS): os_unfair_lock (<os/lock.h>) is the documented
 // OSSpinLock replacement -- a lightweight lock that "allows waiters to block
 // efficiently on contention" and "contain[s] thread ownership information that
@@ -179,6 +179,7 @@ class alignas(4096) xe_global_mutex {
   void lock();
   void unlock();
   bool try_lock();
+  bool is_held_by_current_thread() const;
 };
 using global_mutex_type = xe_global_mutex;
 
