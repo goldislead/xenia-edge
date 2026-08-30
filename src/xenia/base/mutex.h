@@ -15,8 +15,6 @@
 #include "platform.h"
 #if XE_PLATFORM_WIN32
 #include "platform_win.h"
-#else
-#include <sys/types.h>
 #endif
 #if XE_PLATFORM_APPLE
 #include <os/lock.h>  // os_unfair_lock
@@ -93,7 +91,7 @@ using xe_mutex = xe_fast_mutex;
 // Mimics Windows CRITICAL_SECTION behavior: spin before blocking
 class alignas(4096) xe_global_mutex {
   std::atomic<uint32_t> state_{0};  // 0 = unlocked, 1 = locked, 2 = contended
-  std::atomic<pid_t> owner_{0};
+  std::atomic<uint64_t> owner_{0};  // pthread_self() of owner, 0 = unowned
   uint32_t recursion_count_{0};
 
   void lock_slow();
