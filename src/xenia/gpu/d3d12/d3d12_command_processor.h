@@ -219,6 +219,15 @@ class D3D12CommandProcessor final : public CommandProcessor {
   void SetStencilReference(uint32_t stencil_ref);
   void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY primitive_topology);
 
+  // Places the host samples paired with the guest samples at the Xenos
+  // positions, following the ForcedSampleCount with ROV and the sample count
+  // of the targets otherwise. Depth transitions may evaluate plane equations
+  // at the programmed positions, so the render target cache also requests
+  // the pattern around depth clears, transfers and transitions, and pending
+  // barriers are submitted before it changes. No-op when unsupported or off.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples,
+                             bool host_render_targets);
+
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
 
@@ -458,11 +467,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
       uint32_t bound_depth_and_color_render_target_bits);
-
-  // Places the host samples paired with the guest samples at the Xenos
-  // positions for a draw with the given guest MSAA mode. No-op when
-  // unsupported or off.
-  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
 
   template <bool primitive_polygonal, bool edram_rov_used>
   XE_NOINLINE void UpdateSystemConstantValues_Impl(
@@ -893,9 +897,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
 
-  // The guest MSAA mode currently programmed on the command list, k1X for
-  // the default pattern a reset command list starts with.
-  xenos::MsaaSamples current_sample_positions_;
+  // The guest MSAA mode and the path currently programmed on the command
+  // list, 0 for the default pattern a reset command list starts with.
+  uint32_t current_sample_positions_key_;
 
   draw_util::GetViewportInfoArgs previous_viewport_info_args_;
   draw_util::ViewportInfo previous_viewport_info_;
