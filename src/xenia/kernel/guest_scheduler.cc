@@ -56,6 +56,14 @@ static int ClampPriority(int32_t priority) {
   return priority < 0 ? 0 : (priority > 31 ? 31 : priority);
 }
 
+// Consumes the head-requeue request left by a preemption or a re-poll wake.
+static bool TakeHeadRequeue(XThread::SchedulerLinks& links) {
+  bool at_head = links.preempted || links.repoll_preempt;
+  links.preempted = false;
+  links.repoll_preempt = false;
+  return at_head;
+}
+
 // Safepoints that may decline to preempt before one is forced through anyway.
 // A guest spinning at DISPATCH_LEVEL passes safepoints at roughly the loop
 // rate, so this is a short wait in wall-clock terms, and the alternative is an
@@ -343,9 +351,7 @@ void GuestScheduler::EnqueueReady(XThread* thread, int cpu_index,
     }
     links.queued = true;
     links.cpu = cpu_index;
-    bool at_head = links.preempted;
-    links.preempted = false;
-    LinkReadyLocked(cpus_[cpu_index], thread, at_head);
+    LinkReadyLocked(cpus_[cpu_index], thread, TakeHeadRequeue(links));
     if (yield_to_other) {
       cpus_[cpu_index].yield_to_other = thread;
     }
@@ -784,13 +790,13 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower) {
   ExitIfTerminated();
   XThread* self = XThread::GetCurrentThread();
   auto& links = self->scheduler_links();
-  // A slice cut short by a higher-priority thread is not a quantum end, that
-  // thread re-runs at the head instead.
-  if (quantum_end && !links.preempted) {
+  // Neither a preemption nor a re-poll wake is a quantum end, so both resume at
+  // the head with the rest of the slice and no decay.
+  bool keep_slice = links.preempted || links.repoll_preempt;
+  if (quantum_end && !keep_slice) {
     self->OnQuantumEnd();
   }
-  // Only a preemption keeps the remaining slice, anything else consumed it.
-  if (!links.preempted) {
+  if (!keep_slice) {
     links.quantum_deadline_tick = 0;
   }
   int cpu_index = t_current_cpu;
@@ -944,9 +950,10 @@ void GuestScheduler::WakeAll() {
   if (!any_blocked) {
     return;
   }
-  // Ask each CPU with a blocked waiter to re-poll, preempting its runner only
-  // when a waiter outranks it. An equal-priority preempt would head-requeue
-  // the runner past ready threads on every signal and starve them.
+  // Ask each CPU with a blocked waiter to re-poll, bumping its runner only when
+  // a waiter outranks it - an equal-priority bump would head-requeue it past
+  // ready threads on every signal. The waiter may not re-poll ready, so this is
+  // repoll_preempt and not links.preempted.
   {
     std::lock_guard<std::mutex> lock(lock_);
     for (int i = 0; i < kMaxCpus; ++i) {
@@ -958,7 +965,7 @@ void GuestScheduler::WakeAll() {
       XThread* running = cpu.current_thread;
       if (running &&
           cpu.max_blocked_prio > ClampPriority(running->priority())) {
-        running->scheduler_links().preempted = true;
+        running->scheduler_links().repoll_preempt = true;
         running->thread_state()->context()->preempt_requested = 1;
       }
     }
@@ -1021,8 +1028,9 @@ void GuestScheduler::WakeForSignal(const XObject* object) {
       }
       cpu.repoll_now.store(true, std::memory_order_relaxed);
       XThread* running = cpu.current_thread;
+      // Speculative like WakeAll's, so a re-poll wake rather than a preemption.
       if (running && watcher_prio > ClampPriority(running->priority())) {
-        running->scheduler_links().preempted = true;
+        running->scheduler_links().repoll_preempt = true;
         running->thread_state()->context()->preempt_requested = 1;
       }
       wake[i] = true;
@@ -1112,6 +1120,7 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     // Park self (running, in no list) on this CPU's blocked list.
     links.blocked = true;
     links.preempted = false;
+    links.repoll_preempt = false;
     links.cpu = cpu_index;
     links.ready_next = nullptr;
     links.wait_gated = gated;
@@ -1213,9 +1222,7 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       // KeSetAffinityThread may have moved it while blocked.
       int target = CpuOf(t);
       links.cpu = target;
-      bool at_head = links.preempted;
-      links.preempted = false;
-      LinkReadyLocked(cpus_[target], t, at_head);
+      LinkReadyLocked(cpus_[target], t, TakeHeadRequeue(links));
       if (target != cpu_index) {
         wake_mask |= uint32_t(1) << target;
       }
@@ -1271,9 +1278,7 @@ void GuestScheduler::RunLoop(int cpu_index) {
           links.running = false;
           links.queued = true;
           links.cpu = home;
-          bool at_head = links.preempted;
-          links.preempted = false;
-          LinkReadyLocked(cpus_[home], next, at_head);
+          LinkReadyLocked(cpus_[home], next, TakeHeadRequeue(links));
         }
         if (cpus_[home].parked.load() && cpus_[home].ready_event) {
           cpus_[home].ready_event->Set();

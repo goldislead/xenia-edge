@@ -591,8 +591,15 @@ class XThread : public XObject, public cpu::Thread {
     bool blocked = false;    // parked in the blocked (waiting) list
     bool suspended = false;  // parked with a nonzero suspend count
     bool running = false;    // executing on a dispatch thread
-    bool preempted = false;  // slice cut short by a higher-priority thread
-    bool has_run = false;    // diagnostic: dispatched at least once
+    // Slice cut short by a ready higher-priority thread that took the CPU,
+    // matching X_KTHREAD::was_preempted. Not set speculatively - see
+    // repoll_preempt.
+    bool preempted = false;
+    // Bumped to a safepoint so its CPU can re-poll for a blocked waiter that
+    // outranks it. That waiter may not wake, so nothing has displaced this
+    // thread and no quantum is charged.
+    bool repoll_preempt = false;
+    bool has_run = false;  // diagnostic: dispatched at least once
     bool forced_preempt_logged =
         false;  // one forced-preempt warning per thread
     // Set by an external Terminate, exits the fiber at its next
