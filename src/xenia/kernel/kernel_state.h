@@ -139,6 +139,10 @@ struct KernelGuestGlobals {
 
   // if LLE emulating Xam, this is needed or you get an immediate freeze
   X_KEVENT UsbdBootEnumerationDoneEvent;
+  // CPUs that take a background-scheduling window, read by
+  // KeQueryBackgroundProcessors and written by KeSetBackgroundProcessors.
+  // 0x3C (CPUs 2-5) is the console's boot value.
+  xe::be<uint32_t> background_processors;
 };
 struct DPCImpersonationScope {
   uint8_t previous_irql_;
@@ -320,6 +324,11 @@ class KernelState {
 
   uint32_t notification_position_ = 2;
   XDeploymentType deployment_type_ = XDeploymentType::kOther;
+
+  // CPUs that take a background-scheduling window. Boots to 0x3C like the
+  // console, and KeSetBackgroundProcessors moves it.
+  uint32_t GetBackgroundProcessors();
+  void SetBackgroundProcessors(uint32_t processors);
 
   uint32_t GetKeTimestampBundle();
 

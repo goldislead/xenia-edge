@@ -404,6 +404,16 @@ dword_result_t KeQueryBasePriorityThread_entry(
 }
 DECLARE_XBOXKRNL_EXPORT1(KeQueryBasePriorityThread, kThreading, kImplemented);
 
+dword_result_t KeQueryBackgroundProcessors_entry() {
+  return kernel_state()->GetBackgroundProcessors();
+}
+DECLARE_XBOXKRNL_EXPORT1(KeQueryBackgroundProcessors, kThreading, kImplemented);
+
+void KeSetBackgroundProcessors_entry(dword_t value) {
+  kernel_state()->SetBackgroundProcessors(value);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetBackgroundProcessors, kThreading, kImplemented);
+
 dword_result_t KeSetBasePriorityThread_entry(pointer_t<X_KTHREAD> thread_ptr,
                                              dword_t increment) {
   int32_t prev_priority = 0;
