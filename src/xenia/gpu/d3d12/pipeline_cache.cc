@@ -3070,9 +3070,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
                                << uint32_t(description.host_msaa_samples);
   if (edram_rov_used) {
     // Only 1, 4, 8 and (not on all GPUs) 16 are allowed, using sample 0 as 0
-    // and 3 as 1 for 2x instead (not exactly the same sample positions, but
-    // still top-left and bottom-right - however, this can be adjusted with
-    // programmable sample positions).
+    // and 3 as 1 for 2x instead (the command processor programs the true
+    // Xenos positions onto the host samples the translated shaders pair with
+    // the guest samples where programmable sample positions are supported).
     assert_true(msaa_sample_count == 1 || msaa_sample_count == 4);
     if (msaa_sample_count != 1 && msaa_sample_count != 4) {
       return nullptr;

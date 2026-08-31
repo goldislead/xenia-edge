@@ -459,6 +459,11 @@ class D3D12CommandProcessor final : public CommandProcessor {
       uint32_t normalized_color_mask,
       uint32_t bound_depth_and_color_render_target_bits);
 
+  // Places the host samples paired with the guest samples at the Xenos
+  // positions for a draw with the given guest MSAA mode. No-op when
+  // unsupported or off.
+  void UpdateSamplePositions(xenos::MsaaSamples msaa_samples);
+
   template <bool primitive_polygonal, bool edram_rov_used>
   XE_NOINLINE void UpdateSystemConstantValues_Impl(
       bool shared_memory_is_uav, uint32_t line_loop_closing_index,
@@ -594,6 +599,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // bindful - mainly because of CopyDescriptorsSimple, which takes the majority
   // of UpdateBindings time, and that's outside the emulator's control even).
   bool bindless_resources_used_ = false;
+
+  // SetSamplePositions without tier 1 support (or without
+  // ID3D12GraphicsCommandList1) is device removal.
+  bool guest_sample_positions_used_ = false;
 
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
@@ -883,6 +892,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;
+
+  // The guest MSAA mode currently programmed on the command list, k1X for
+  // the default pattern a reset command list starts with.
+  xenos::MsaaSamples current_sample_positions_;
 
   draw_util::GetViewportInfoArgs previous_viewport_info_args_;
   draw_util::ViewportInfo previous_viewport_info_;

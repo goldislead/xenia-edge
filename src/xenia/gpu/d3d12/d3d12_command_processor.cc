@@ -39,6 +39,11 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
             "possible to submit immediately to try to reduce frame latency.",
             "D3D12");
 
+DEFINE_bool(d3d12_xenos_sample_positions, true,
+            "Rasterize 2x and 4x MSAA at the Xenos sample positions if the "
+            "GPU and driver supports it.",
+            "D3D12");
+
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
 
@@ -829,6 +834,12 @@ bool D3D12CommandProcessor::SetupContext() {
   bindless_resources_used_ =
       cvars::d3d12_bindless &&
       provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
+
+  guest_sample_positions_used_ =
+      cvars::d3d12_xenos_sample_positions &&
+      command_list_1_ != nullptr &&
+      provider.GetProgrammableSamplePositionsTier() !=
+          D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER_NOT_SUPPORTED;
 
   // Get the draw resolution scale for the render target cache and the texture
   // cache.
@@ -2844,6 +2855,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                            normalized_depth_control, normalized_color_mask,
                            bound_depth_and_color_render_target_bits);
 
+  if (!host_render_targets_used) {
+    // Nothing is bound through the output-merger with ROV, the sample pattern
+    // is command list state following the ForcedSampleCount.
+    UpdateSamplePositions(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  }
+
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
   UpdateSystemConstantValues(
@@ -3654,6 +3671,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       sampler_bindful_heap_current_ = nullptr;
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    current_sample_positions_ = xenos::MsaaSamples::k1X;
 
     render_target_cache_->BeginSubmission();
 
@@ -3910,6 +3928,42 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
     command_allocator_writable_first_ = next;
   }
   command_allocator_writable_last_ = nullptr;
+}
+
+void D3D12CommandProcessor::UpdateSamplePositions(
+    xenos::MsaaSamples msaa_samples) {
+  if (!guest_sample_positions_used_ ||
+      current_sample_positions_ == msaa_samples) {
+    return;
+  }
+  D3D12_SAMPLE_POSITION positions[4] = {};
+  if (msaa_samples == xenos::MsaaSamples::k1X) {
+    // Pipelines with ForcedSampleCount 1 must be drawn with the default
+    // sample pattern state.
+    deferred_command_list_.D3DSetSamplePositions(0, 0, positions);
+  } else {
+    // The StartPixelShader_LoadROVParameters pairing: 0, 3, 2, 1 at 4x, 2 and
+    // 1 at 2x-as-4x with the unused samples duplicating them.
+    static constexpr uint32_t kGuestSampleForHostSample2x[4] = {0, 1, 0, 1};
+    static constexpr uint32_t kGuestSampleForHostSample4x[4] = {0, 3, 2, 1};
+    const int8_t(*xenos_sample_positions)[2];
+    const uint32_t* guest_sample_for_host_sample;
+    if (msaa_samples >= xenos::MsaaSamples::k4X) {
+      xenos_sample_positions = draw_util::kXenosSamplePositions4x;
+      guest_sample_for_host_sample = kGuestSampleForHostSample4x;
+    } else {
+      xenos_sample_positions = draw_util::kXenosSamplePositions2x;
+      guest_sample_for_host_sample = kGuestSampleForHostSample2x;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      const int8_t* sample_position =
+          xenos_sample_positions[guest_sample_for_host_sample[i]];
+      positions[i].X = sample_position[0];
+      positions[i].Y = sample_position[1];
+    }
+    deferred_command_list_.D3DSetSamplePositions(4, 1, positions);
+  }
+  current_sample_positions_ = msaa_samples;
 }
 
 void D3D12CommandProcessor::UpdateFixedFunctionState(
