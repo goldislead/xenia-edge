@@ -1732,15 +1732,14 @@ std::vector<uint32_t> BuildEdramTransferShaderSpirv(
           switch (dest_color_format) {
             case xenos::ColorRenderTargetFormat::k_8_8_8_8:
             case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-              // Same-base 7e3 source -> decode the 7e3 floats to [0, 1] instead
-              // of bit-reinterpreting. See IsTransferValueConverted7e3And8888
-              // and the D3D12 TransferConvert7e3To8888.
+              // Same-base 7e3 source, decode to [0, 1] rather than
+              // bit-reinterpret. Never a gamma dest, which has no encode here.
+              // See IsTransferValueConverted7e3And8888.
               if (key.value_convert && source_is_color &&
-                  (source_color_format ==
-                       xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
-                   source_color_format ==
-                       xenos::ColorRenderTargetFormat::
-                           k_2_10_10_10_FLOAT_AS_16_16_16_16)) {
+                  dest_color_format ==
+                      xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+                  xenos::GetStorageColorFormat(source_color_format) ==
+                      xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
                 id_vector_temp.clear();
                 for (uint32_t i = 0; i < 3; ++i) {
                   id_vector_temp.push_back(builder.createTriBuiltinCall(
@@ -1821,30 +1820,6 @@ std::vector<uint32_t> BuildEdramTransferShaderSpirv(
             case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
             case xenos::ColorRenderTargetFormat::
                 k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-              if (key.value_convert && source_is_color &&
-                  source_color_format ==
-                      xenos::ColorRenderTargetFormat::k_8_8_8_8) {
-                // Reverse: 8_8_8_8 source -> unpack the unorm bytes to [0, 1].
-                // Matches the D3D12 TransferConvert8888To7e3.
-                spv::Id component_width = builder.makeUintConstant(8);
-                spv::Id unorm_scale = builder.makeFloatConstant(1.0f / 255.0f);
-                id_vector_temp.clear();
-                for (uint32_t i = 0; i < 4; ++i) {
-                  id_vector_temp.push_back(builder.createBinOp(
-                      spv::OpFMul, type_float,
-                      builder.createUnaryOp(
-                          spv::OpConvertUToF, type_float,
-                          builder.createTriOp(spv::OpBitFieldUExtract,
-                                              type_uint, packed,
-                                              builder.makeUintConstant(8 * i),
-                                              component_width)),
-                      unorm_scale));
-                }
-                builder.createStore(builder.createCompositeConstruct(
-                                        type_fragment_data, id_vector_temp),
-                                    output_fragment_data);
-                break;
-              }
               id_vector_temp.clear();
               // Color.
               spv::Id width_rgb = builder.makeUintConstant(10);
