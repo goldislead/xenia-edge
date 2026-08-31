@@ -4490,6 +4490,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
       assert_false(dest_rt_key.scale_native);
       if (!host_depth_store_set_up) {
+        // The destination leaves the depth-stencil state here, under the
+        // pattern its contents were rendered with.
+        command_processor_.UpdateSamplePositions(dest_rt_key.msaa_samples,
+                                                 true);
         // Source descriptor.
         ui::d3d12::util::DescriptorCpuGpuHandlePair
             host_depth_store_descriptor_source;
@@ -4600,6 +4604,14 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (!source_previously_used_as_dest) {
         auto& source_d3d12_rt =
             *static_cast<D3D12RenderTarget*>(transfer.source);
+        RenderTargetKey source_rt_key = source_d3d12_rt.key();
+        if (source_rt_key.is_depth &&
+            source_rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+          // Sources leave the depth-stencil state under the pattern their
+          // contents were rendered with.
+          command_processor_.UpdateSamplePositions(source_rt_key.msaa_samples,
+                                                   true);
+        }
         command_processor_.PushTransitionBarrier(
             source_d3d12_rt.resource(),
             source_d3d12_rt.SetResourceState(
@@ -4612,6 +4624,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           !host_depth_source_previously_used_as_dest) {
         auto& host_depth_source_d3d12_rt =
             *static_cast<D3D12RenderTarget*>(transfer.host_depth_source);
+        if (host_depth_source_d3d12_rt.key().msaa_samples !=
+            xenos::MsaaSamples::k1X) {
+          command_processor_.UpdateSamplePositions(
+              host_depth_source_d3d12_rt.key().msaa_samples, true);
+        }
         command_processor_.PushTransitionBarrier(
             host_depth_source_d3d12_rt.resource(),
             host_depth_source_d3d12_rt.SetResourceState(
@@ -4770,6 +4787,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         dest_state);
 
     if (!current_transfers.empty()) {
+      // The pattern has to match the transfer pipeline's sample count, which
+      // is the destination's.
+      command_processor_.UpdateSamplePositions(dest_rt_key.msaa_samples, true);
       are_current_command_list_render_targets_valid_ = false;
       if (dest_rt_key.is_depth) {
         auto handle = dest_d3d12_rt.descriptor_draw().GetHandle();
@@ -5327,6 +5347,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
             break;
         }
+        // Depth clears take the pattern of the future rendering.
+        command_processor_.UpdateSamplePositions(dest_rt_key.msaa_samples,
+                                                 true);
         command_processor_.PushTransitionBarrier(
             dest_d3d12_rt.resource(),
             dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
@@ -6471,6 +6494,13 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
+    if (d3d12_rt.key().is_depth &&
+        d3d12_rt.key().msaa_samples != xenos::MsaaSamples::k1X) {
+      // Leaving the depth-stencil state under the pattern the contents were
+      // rendered with.
+      command_processor_.UpdateSamplePositions(d3d12_rt.key().msaa_samples,
+                                               true);
+    }
     command_processor_.PushTransitionBarrier(
         d3d12_rt.resource(),
         d3d12_rt.SetResourceState(

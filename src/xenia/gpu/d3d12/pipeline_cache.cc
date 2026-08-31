@@ -3092,9 +3092,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       return nullptr;
     }
     if (msaa_sample_count == 2 && !render_target_cache_.msaa_2x_supported()) {
-      // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
-      // sample positions, but still top-left and bottom-right - however, this
-      // can be adjusted with programmable sample positions).
+      // Using sample 0 as 0 and 3 as 1 for 2x instead (the command processor
+      // programs the true Xenos positions onto host samples 0 and 3 where
+      // programmable sample positions are supported).
       state_desc.SampleMask = 0b1001;
       state_desc.SampleDesc.Count = 4;
     } else {
