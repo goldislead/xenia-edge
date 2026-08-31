@@ -122,6 +122,16 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs,
 extern const int8_t kD3D10StandardSamplePositions2x[2][2];
 extern const int8_t kD3D10StandardSamplePositions4x[4][2];
 
+// Xenos sample positions in 1/16 of a pixel from the center, Y down, indexed
+// by the guest sample. Neither matches the Direct3D 10.1 pattern, at 2x even
+// the diagonal is the opposite. 4D5307D5 aligns fragment 0 with the pixel
+// center by offsetting the viewport by (-0.25, +0.25) at 2x and (-0.125,
+// -0.125) at 4x, which confirms sample 0 and corroborates the positions in
+// the AMD R600/R700 register reference guide.
+constexpr int8_t kXenosSamplePositions2x[2][2] = {{-4, 4}, {4, -4}};
+constexpr int8_t kXenosSamplePositions4x[4][2] = {
+    {-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
+
 reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs);
 
 // Direct3D 9 and Xenos constant polygon offset is an absolute floating-point
