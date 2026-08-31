@@ -332,11 +332,17 @@ class GuestScheduler {
   // blocking calls queue behind the single I/O worker. Reported by
   // ReportStatsIfDue when guest_scheduler_stats is set.
   struct Stats {
-    std::atomic<uint64_t> repolls{0};             // RereadyBlocked passes
-    std::atomic<uint64_t> rereadied{0};           // waiters actually re-readied
-    std::atomic<uint64_t> idle_wakes{0};          // timed wakes of a parked CPU
-    std::atomic<uint64_t> switches{0};            // fiber dispatches
-    std::atomic<uint64_t> forced_preempts{0};     // IRQL defers escaped
+    std::atomic<uint64_t> repolls{0};          // RereadyBlocked passes
+    std::atomic<uint64_t> rereadied{0};        // waiters actually re-readied
+    std::atomic<uint64_t> idle_wakes{0};       // timed wakes of a parked CPU
+    std::atomic<uint64_t> switches{0};         // fiber dispatches
+    std::atomic<uint64_t> forced_preempts{0};  // IRQL defers escaped
+    std::atomic<uint64_t> yield_downs{0};      // yields that ran a lower prio
+    // Ready-list wait before dispatch, the direct measure of priority
+    // inversion. Only accumulated while guest_scheduler_stats is set.
+    std::atomic<uint64_t> ready_wait_ticks{0};
+    std::atomic<uint64_t> ready_wait_count{0};
+    std::atomic<uint64_t> ready_wait_max_ticks{0};
     std::atomic<uint64_t> background_windows{0};  // vblanks that opened one
     std::atomic<uint64_t> background_picks{0};    // dispatches the mask steered
     std::atomic<uint64_t> io_calls{0};

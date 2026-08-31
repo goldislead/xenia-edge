@@ -600,6 +600,9 @@ class XThread : public XObject, public cpu::Thread {
     // thread and no quantum is charged.
     bool repoll_preempt = false;
     bool has_run = false;  // diagnostic: dispatched at least once
+    // Raw host ticks when this thread was linked into a ready list, so a
+    // dispatch can measure how long it waited behind higher priorities.
+    uint64_t ready_since_tick = 0;
     bool forced_preempt_logged =
         false;  // one forced-preempt warning per thread
     // Set by an external Terminate, exits the fiber at its next
