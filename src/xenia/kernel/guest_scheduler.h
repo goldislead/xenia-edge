@@ -270,6 +270,11 @@ class GuestScheduler {
   void LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head);
   // Out-of-line so the yield fast path stays a single relaxed bool load.
   void ReportGlobalLockHazard();
+  // Counts and reports one starvation promotion on |cpu_index|.
+  void NoteStarvation(int cpu_index, XThread* runner, XThread* victim,
+                      uint32_t spun);
+  // Microseconds |thread| has spent in a ready list, 0 if never stamped.
+  uint64_t ready_wait_us(XThread* thread) const;
 
   KernelState* kernel_state_;
 
@@ -338,13 +343,15 @@ class GuestScheduler {
     std::atomic<uint64_t> switches{0};         // fiber dispatches
     std::atomic<uint64_t> forced_preempts{0};  // IRQL defers escaped
     std::atomic<uint64_t> yield_downs{0};      // yields that ran a lower prio
+    // Of those, the ones the starvation escape hatch forced.
+    std::atomic<uint64_t> starvation_yields{0};
+    std::atomic<uint64_t> background_windows{0};  // vblanks that opened one
+    std::atomic<uint64_t> background_picks{0};    // dispatches the mask steered
     // Ready-list wait before dispatch, the direct measure of priority
     // inversion. Only accumulated while guest_scheduler_stats is set.
     std::atomic<uint64_t> ready_wait_ticks{0};
     std::atomic<uint64_t> ready_wait_count{0};
     std::atomic<uint64_t> ready_wait_max_ticks{0};
-    std::atomic<uint64_t> background_windows{0};  // vblanks that opened one
-    std::atomic<uint64_t> background_picks{0};    // dispatches the mask steered
     std::atomic<uint64_t> io_calls{0};
     std::atomic<uint64_t> io_queue_ns{0};  // time queued before the worker ran
     std::atomic<uint64_t> io_run_ns{0};    // time inside the blocking call

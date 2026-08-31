@@ -603,8 +603,13 @@ class XThread : public XObject, public cpu::Thread {
     // Raw host ticks when this thread was linked into a ready list, so a
     // dispatch can measure how long it waited behind higher priorities.
     uint64_t ready_since_tick = 0;
+    // Consecutive involuntary preemptions with no wait or voluntary yield in
+    // between. A spinning fiber has no other exit, so this separates one from
+    // a thread that is merely running long.
+    uint32_t unyielded_quanta = 0;
     bool forced_preempt_logged =
-        false;  // one forced-preempt warning per thread
+        false;                        // one forced-preempt warning per thread
+    bool starved_out_logged = false;  // one starvation warning per thread
     // Set by an external Terminate, exits the fiber at its next
     // ExitIfTerminated check.
     std::atomic<bool> terminate_pending{false};
