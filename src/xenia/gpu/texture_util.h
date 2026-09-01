@@ -146,7 +146,7 @@ struct TextureGuestLayout {
     uint32_t z_slice_stride_block_rows;
     // Distance between each array slice within the level in bytes, aligned to
     // kTextureSubresourceAlignmentBytes. The distance to the next level is this
-    // multiplied by the array slice count.
+    // multiplied by the stored array slice count.
     uint32_t array_slice_stride_bytes;
 
     // The exclusive upper bound of blocks needed at this level (this level for
