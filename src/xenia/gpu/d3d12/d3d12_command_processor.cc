@@ -2892,7 +2892,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
             return false;
         }
         vfetch_addresses[vfetch_current_queued] =
-            vfetch_constant.address & 0x07FFFFFF;
+            xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
     }

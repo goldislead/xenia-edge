@@ -99,7 +99,7 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
             builder_->createBinOp(spv::OpShiftRightLogical, type_uint_,
                                   fetch_constant_word_0,
                                   builder_->makeUintConstant(2)),
-            builder_->makeUintConstant(0x07FFFFFF)));
+            builder_->makeUintConstant(0x1FFFFFFF >> 2)));
     // address is the base now. The exclusive end is base + size (size in words
     // in bits 2:25 of the second word). Store it for the subsequent
     // vfetch_mini, which reuses this fetch constant.

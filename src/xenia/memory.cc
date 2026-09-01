@@ -241,13 +241,14 @@ bool Memory::Initialize() {
                              kMemoryAllocationReserve, kMemoryProtectNoAccess);
 
   // GPU writeback & XPS.
-  // 0xC... is physical, 0x7F... is virtual. Overlaid.
-  heaps_.vC0000000.AllocFixed(
-      0xC0000000, 0x01000000, 32,
-      kMemoryAllocationReserve | kMemoryAllocationCommit,
-      kMemoryProtectRead | kMemoryProtectWrite);
+  // 0xC... is physical, 0x7F... is virtual. Overlaid, so both reserve the same
+  // parent range - the wider one goes last to leave one consistent region.
   heaps_.v7F000000.AllocFixed(
       0x7F000000, 0x00C80000, 32,
+      kMemoryAllocationReserve | kMemoryAllocationCommit,
+      kMemoryProtectRead | kMemoryProtectWrite);
+  heaps_.vC0000000.AllocFixed(
+      0xC0000000, 0x01000000, 32,
       kMemoryAllocationReserve | kMemoryAllocationCommit,
       kMemoryProtectRead | kMemoryProtectWrite);
 

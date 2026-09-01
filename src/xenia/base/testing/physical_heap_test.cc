@@ -46,6 +46,17 @@ TEST_CASE("PhysicalHeap::GetPhysicalAddress", "[memory]") {
     REQUIRE(heap.GetPhysicalAddress(0xE0001000) == 0x2000);
     REQUIRE(heap.GetPhysicalAddress(0xE0010000) == 0x11000);
   }
+
+  SECTION("0x7F000000 XPS heap overlays the start of physical memory") {
+    PhysicalHeap heap;
+    heap.Initialize(nullptr, nullptr, HeapType::kGuestPhysical, 0x7F000000,
+                    0x00C80000, 4096, &parent);
+
+    REQUIRE(heap.host_address_offset() == 0);
+    REQUIRE(heap.GetPhysicalAddress(0x7F000000) == 0);
+    REQUIRE(heap.GetPhysicalAddress(0x7F001000) == 0x1000);
+    REQUIRE(heap.GetPhysicalAddress(0x7FC7F000) == 0xC7F000);
+  }
 }
 
 TEST_CASE("PhysicalHeap::Alloc alignment", "[memory]") {
