@@ -454,10 +454,11 @@ const char* TextureCache::TextureKey::GetLogDimensionName(
 
 void TextureCache::TextureKey::LogAction(const char* action) const {
   XELOGGPU(
-      "{} {} {}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
+      "{} {} {}{}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
       "base at 0x{:08X} (pitch {}), mips at 0x{:08X}",
       action, tiled ? "tiled" : "linear", scaled_resolve ? "scaled " : "",
-      GetWidth(), GetHeight(), GetDepthOrArraySize(), GetLogDimensionName(),
+      border_size ? "bordered " : "", GetWidth(), GetHeight(),
+      GetDepthOrArraySize(), GetLogDimensionName(),
       FormatInfo::GetName(format), mip_max_level + 1, packed_mips ? "" : "un",
       mip_max_level != 0 ? "s" : "", base_page << 12, pitch << 5,
       mip_page << 12);
@@ -465,11 +466,12 @@ void TextureCache::TextureKey::LogAction(const char* action) const {
 
 void TextureCache::Texture::LogAction(const char* action) const {
   XELOGGPU(
-      "{} {} {}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
+      "{} {} {}{}{}x{}x{} {} {} texture with {} {}packed mip level{}, "
       "base at 0x{:08X} (pitch {}, size 0x{:08X}), mips at 0x{:08X} (size "
       "0x{:08X})",
       action, key_.tiled ? "tiled" : "linear",
-      key_.scaled_resolve ? "scaled " : "", key_.GetWidth(), key_.GetHeight(),
+      key_.scaled_resolve ? "scaled " : "",
+      key_.border_size ? "bordered " : "", key_.GetWidth(), key_.GetHeight(),
       key_.GetDepthOrArraySize(), key_.GetLogDimensionName(),
       FormatInfo::GetName(key_.format), key_.mip_max_level + 1,
       key_.packed_mips ? "" : "un", key_.mip_max_level != 0 ? "s" : "",
@@ -1066,6 +1068,7 @@ void TextureCache::BindingInfoFromFetchConstant(
   key_out.mip_max_level = mip_max_level;
   key_out.tiled = fetch.tiled;
   key_out.packed_mips = fetch.packed_mips;
+  key_out.border_size = fetch.border_size;
   key_out.format = format;
   key_out.endianness = fetch.endianness;
 

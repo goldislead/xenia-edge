@@ -1295,12 +1295,15 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format,
-                                              uint32_t width,
-                                              uint32_t height) const {
+                                              uint32_t width, uint32_t height,
+                                              bool has_border) const {
   DXGI_FORMAT dxgi_format_uncompressed =
       host_formats_[uint32_t(format)].dxgi_format_uncompressed;
   if (dxgi_format_uncompressed == DXGI_FORMAT_UNKNOWN) {
     return false;
+  }
+  if (has_border) {
+    return true;
   }
   const FormatInfo* format_info = FormatInfo::Get(format);
   if (!(width & (format_info->block_width - 1)) &&
@@ -1323,7 +1326,8 @@ TextureCache::LoadShaderIndex D3D12TextureCache::GetLoadShaderIndex(
   if (key.signed_separate) {
     return host_format.load_shader_signed;
   }
-  if (IsDecompressionNeeded(key.format, key.GetWidth(), key.GetHeight())) {
+  if (IsDecompressionNeeded(key.format, key.GetWidth(), key.GetHeight(),
+                            key.border_size)) {
     return host_format.load_shader_decompress;
   }
   return host_format.load_shader;
@@ -1480,6 +1484,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       texture_resolution_scaled ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y =
       texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+  bool has_border_y =
+      texture_key.border_size && dimension != xenos::DataDimension::k1D;
+  bool has_border_z = texture_key.border_size && is_3d;
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
@@ -1503,7 +1510,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // Get the host layout and the buffer.
   bool host_block_compressed =
       host_formats_[uint32_t(guest_format)].is_block_compressed &&
-      !IsDecompressionNeeded(guest_format, width, height);
+      !IsDecompressionNeeded(guest_format, width, height,
+                             texture_key.border_size);
   uint32_t host_block_width = host_block_compressed ? block_width : 1;
   uint32_t host_block_height = host_block_compressed ? block_height : 1;
   uint32_t host_x_blocks_per_thread =
@@ -1527,8 +1535,7 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // GetCopyableFootprints aligns row offsets, but not the total size) are
   // properly padded to the number of blocks copied in an invocation without
   // implicit assumptions about D3D12_TEXTURE_DATA_PITCH_ALIGNMENT.
-  DXGI_FORMAT host_copy_format =
-      GetDXGIResourceFormat(guest_format, width, height);
+  DXGI_FORMAT host_copy_format = GetDXGIResourceFormat(texture_key);
   for (uint32_t loop_level = loop_level_first; loop_level <= loop_level_last;
        ++loop_level) {
     bool is_base = loop_level == 0;
@@ -1549,11 +1556,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       level_host_slice_layout.Footprint.Depth = guest_layout_packed.z_extent;
     } else {
       level_host_slice_layout.Footprint.Width =
-          std::max(width >> level, uint32_t(1));
+          std::max(width >> level, uint32_t(1)) +
+          uint32_t(texture_key.border_size) * 2;
       level_host_slice_layout.Footprint.Height =
-          std::max(height >> level, uint32_t(1));
+          std::max(height >> level, uint32_t(1)) + uint32_t(has_border_y) * 2;
       level_host_slice_layout.Footprint.Depth =
-          std::max(depth >> level, uint32_t(1));
+          std::max(depth >> level, uint32_t(1)) + uint32_t(has_border_z) * 2;
     }
     level_host_slice_layout.Footprint.Width = xe::round_up(
         level_host_slice_layout.Footprint.Width * texture_resolution_scale_x,
@@ -1676,9 +1684,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       level_height = level_guest_layout.y_extent_blocks * block_height;
       level_depth = level_guest_layout.z_extent;
     } else {
-      level_width = std::max(width >> level, uint32_t(1));
-      level_height = std::max(height >> level, uint32_t(1));
-      level_depth = std::max(depth >> level, uint32_t(1));
+      level_width = std::max(width >> level, uint32_t(1)) +
+                    uint32_t(texture_key.border_size) * 2;
+      level_height =
+          std::max(height >> level, uint32_t(1)) + uint32_t(has_border_y) * 2;
+      level_depth =
+          std::max(depth >> level, uint32_t(1)) + uint32_t(has_border_z) * 2;
     }
     load_constants.size_blocks[0] = (level_width + (block_width - 1)) /
                                     block_width * texture_resolution_scale_x;
@@ -1757,16 +1768,24 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level ? host_slice_sizes_mips[guest_level] : host_slice_size_base;
     D3D12_BOX source_box;
     const D3D12_BOX* source_box_ptr;
-    if (level >= level_packed) {
-      uint32_t level_offset_blocks_x, level_offset_blocks_y, level_offset_z;
-      texture_util::GetPackedMipOffset(width, height, depth, guest_format,
-                                       level, level_offset_blocks_x,
-                                       level_offset_blocks_y, level_offset_z);
-      source_box.left =
-          level_offset_blocks_x * block_width * texture_resolution_scale_x;
+    // A host mip chain can't keep the encoded border at every level.
+    if (level >= level_packed || texture_key.border_size) {
+      uint32_t level_offset_blocks_x = 0;
+      uint32_t level_offset_blocks_y = 0;
+      uint32_t level_offset_z = 0;
+      if (level >= level_packed) {
+        texture_util::GetPackedMipOffset(width, height, depth, guest_format,
+                                         level, texture_key.border_size, is_3d,
+                                         level_offset_blocks_x,
+                                         level_offset_blocks_y, level_offset_z);
+      }
+      source_box.left = (level_offset_blocks_x * block_width +
+                         uint32_t(texture_key.border_size)) *
+                        texture_resolution_scale_x;
       source_box.top =
-          level_offset_blocks_y * block_height * texture_resolution_scale_y;
-      source_box.front = level_offset_z;
+          (level_offset_blocks_y * block_height + uint32_t(has_border_y)) *
+          texture_resolution_scale_y;
+      source_box.front = level_offset_z + uint32_t(has_border_z);
       source_box.right =
           source_box.left +
           xe::align(std::max((width * texture_resolution_scale_x) >> level,

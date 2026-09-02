@@ -713,28 +713,31 @@ class D3D12TextureCache final : public TextureCache {
   bool Initialize();
 
   // Whether decompression is needed on the host (Direct3D only allows creation
-  // of block-compressed textures with 4x4-aligned dimensions on PC).
+  // of block-compressed textures with 4x4-aligned dimensions on PC, and a
+  // one-texel border can't be cropped in blocks).
   bool IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
-                             uint32_t height) const;
+                             uint32_t height, bool has_border) const;
   DXGI_FORMAT GetDXGIResourceFormat(xenos::TextureFormat format, uint32_t width,
-                                    uint32_t height) const {
+                                    uint32_t height, bool has_border) const {
     const HostFormat& host_format = host_formats_[uint32_t(format)];
-    return IsDecompressionNeeded(format, width, height)
+    return IsDecompressionNeeded(format, width, height, has_border)
                ? host_format.dxgi_format_uncompressed
                : host_format.dxgi_format_resource;
   }
   DXGI_FORMAT GetDXGIResourceFormat(TextureKey key) const {
-    return GetDXGIResourceFormat(key.format, key.GetWidth(), key.GetHeight());
+    return GetDXGIResourceFormat(key.format, key.GetWidth(), key.GetHeight(),
+                                 key.border_size);
   }
   DXGI_FORMAT GetDXGIUnormFormat(xenos::TextureFormat format, uint32_t width,
-                                 uint32_t height) const {
+                                 uint32_t height, bool has_border) const {
     const HostFormat& host_format = host_formats_[uint32_t(format)];
-    return IsDecompressionNeeded(format, width, height)
+    return IsDecompressionNeeded(format, width, height, has_border)
                ? host_format.dxgi_format_uncompressed
                : host_format.dxgi_format_unsigned;
   }
   DXGI_FORMAT GetDXGIUnormFormat(TextureKey key) const {
-    return GetDXGIUnormFormat(key.format, key.GetWidth(), key.GetHeight());
+    return GetDXGIUnormFormat(key.format, key.GetWidth(), key.GetHeight(),
+                              key.border_size);
   }
 
   LoadShaderIndex GetLoadShaderIndex(TextureKey key) const;

@@ -443,6 +443,11 @@ class VulkanTextureCache final : public TextureCache {
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;
   static const HostFormatPair kHostFormatBGRGUnaligned;
+  static const HostFormatPair kHostFormatDXT1Decompressed;
+  static const HostFormatPair kHostFormatDXT2_3Decompressed;
+  static const HostFormatPair kHostFormatDXT4_5Decompressed;
+  static const HostFormatPair kHostFormatDXNDecompressed;
+  static const HostFormatPair kHostFormatDXT5ADecompressed;
   HostFormatPair host_formats_[64];
 
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;

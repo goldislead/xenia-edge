@@ -427,6 +427,33 @@ constexpr VulkanTextureCache::HostFormatPair
         xenos::XE_GPU_TEXTURE_SWIZZLE_RGBB,
         true};
 
+// A one-texel border can't be cropped from block-compressed host textures.
+constexpr VulkanTextureCache::HostFormatPair
+    VulkanTextureCache::kHostFormatDXT1Decompressed = {
+        {kLoadShaderIndexDXT1ToRGBA8, VK_FORMAT_R8G8B8A8_UNORM, false, true},
+        {kLoadShaderIndexUnknown},
+        xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+constexpr VulkanTextureCache::HostFormatPair
+    VulkanTextureCache::kHostFormatDXT2_3Decompressed = {
+        {kLoadShaderIndexDXT3ToRGBA8, VK_FORMAT_R8G8B8A8_UNORM, false, true},
+        {kLoadShaderIndexUnknown},
+        xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+constexpr VulkanTextureCache::HostFormatPair
+    VulkanTextureCache::kHostFormatDXT4_5Decompressed = {
+        {kLoadShaderIndexDXT5ToRGBA8, VK_FORMAT_R8G8B8A8_UNORM, false, true},
+        {kLoadShaderIndexUnknown},
+        xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA};
+constexpr VulkanTextureCache::HostFormatPair
+    VulkanTextureCache::kHostFormatDXNDecompressed = {
+        {kLoadShaderIndexDXNToRG8, VK_FORMAT_R8G8_UNORM, false, true},
+        {kLoadShaderIndexUnknown},
+        xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG};
+constexpr VulkanTextureCache::HostFormatPair
+    VulkanTextureCache::kHostFormatDXT5ADecompressed = {
+        {kLoadShaderIndexDXT5AToR8, VK_FORMAT_R8_UNORM, false, true},
+        {kLoadShaderIndexUnknown},
+        xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR};
+
 VulkanTextureCache::~VulkanTextureCache() {
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -1250,6 +1277,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       texture_key.scaled_resolve ? draw_resolution_scale_x() : 1;
   uint32_t texture_resolution_scale_y =
       texture_key.scaled_resolve ? draw_resolution_scale_y() : 1;
+  bool has_border_y =
+      texture_key.border_size && dimension != xenos::DataDimension::k1D;
+  bool has_border_z = texture_key.border_size && is_3d;
 
   // The loop counter can mean two things depending on whether the packed mip
   // tail is stored as mip 0, because in this case, it would be ambiguous since
@@ -1313,10 +1343,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       level_guest_z_extent_texels = guest_layout_packed.z_extent;
     } else {
       level_guest_x_extent_texels_unscaled =
-          std::max(width >> level, UINT32_C(1));
+          std::max(width >> level, UINT32_C(1)) +
+          uint32_t(texture_key.border_size) * 2;
       level_guest_y_extent_texels_unscaled =
-          std::max(height >> level, UINT32_C(1));
-      level_guest_z_extent_texels = std::max(depth >> level, UINT32_C(1));
+          std::max(height >> level, UINT32_C(1)) + uint32_t(has_border_y) * 2;
+      level_guest_z_extent_texels =
+          std::max(depth >> level, UINT32_C(1)) + uint32_t(has_border_z) * 2;
     }
     level_host_layout.x_pitch_blocks = xe::round_up(
         (level_guest_x_extent_texels_unscaled * texture_resolution_scale_x +
@@ -1628,9 +1660,12 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
       level_height = level_guest_layout.y_extent_blocks * block_height;
       level_depth = level_guest_layout.z_extent;
     } else {
-      level_width = std::max(width >> level, UINT32_C(1));
-      level_height = std::max(height >> level, UINT32_C(1));
-      level_depth = std::max(depth >> level, UINT32_C(1));
+      level_width = std::max(width >> level, UINT32_C(1)) +
+                    uint32_t(texture_key.border_size) * 2;
+      level_height =
+          std::max(height >> level, UINT32_C(1)) + uint32_t(has_border_y) * 2;
+      level_depth =
+          std::max(depth >> level, UINT32_C(1)) + uint32_t(has_border_z) * 2;
     }
     load_constants.size_blocks[0] = (level_width + (block_width - 1)) /
                                     block_width * texture_resolution_scale_x;
@@ -1726,26 +1761,36 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level != 0 ? host_layout_mips[std::min(level, level_packed)]
                    : host_layout_base;
     copy_region.bufferOffset = level_host_layout.offset_bytes;
+    // A host mip chain can't keep the encoded border at every level.
+    uint32_t level_offset_host_blocks_x = 0;
+    uint32_t level_offset_host_blocks_y = 0;
+    uint32_t level_offset_z = 0;
     if (level >= level_packed) {
-      uint32_t level_offset_blocks_x, level_offset_blocks_y, level_offset_z;
-      texture_util::GetPackedMipOffset(width, height, depth, guest_format,
-                                       level, level_offset_blocks_x,
-                                       level_offset_blocks_y, level_offset_z);
-      uint32_t level_offset_host_blocks_x =
+      uint32_t level_offset_blocks_x;
+      uint32_t level_offset_blocks_y;
+      texture_util::GetPackedMipOffset(
+          width, height, depth, guest_format, level, texture_key.border_size,
+          is_3d, level_offset_blocks_x, level_offset_blocks_y, level_offset_z);
+      level_offset_host_blocks_x =
           texture_resolution_scale_x * level_offset_blocks_x;
-      uint32_t level_offset_host_blocks_y =
+      level_offset_host_blocks_y =
           texture_resolution_scale_y * level_offset_blocks_y;
       if (!host_format.block_compressed) {
         level_offset_host_blocks_x *= block_width;
         level_offset_host_blocks_y *= block_height;
       }
-      copy_region.bufferOffset +=
-          load_shader_info.bytes_per_host_block *
-          (level_offset_host_blocks_x +
-           level_host_layout.x_pitch_blocks *
-               (level_offset_host_blocks_y + level_host_layout.y_pitch_blocks *
-                                                 VkDeviceSize(level_offset_z)));
     }
+    level_offset_host_blocks_x +=
+        uint32_t(texture_key.border_size) * texture_resolution_scale_x;
+    level_offset_host_blocks_y +=
+        uint32_t(has_border_y) * texture_resolution_scale_y;
+    level_offset_z += uint32_t(has_border_z);
+    copy_region.bufferOffset +=
+        load_shader_info.bytes_per_host_block *
+        (level_offset_host_blocks_x +
+         level_host_layout.x_pitch_blocks *
+             (level_offset_host_blocks_y +
+              level_host_layout.y_pitch_blocks * VkDeviceSize(level_offset_z)));
     copy_region.bufferRowLength =
         level_host_layout.x_pitch_blocks * host_block_width;
     copy_region.bufferImageHeight =
@@ -2692,6 +2737,11 @@ bool VulkanTextureCache::Initialize() {
     load_shaders_needed[kHostFormatBGRGUnaligned.format_signed.load_shader] =
         true;
   }
+  load_shaders_needed[kLoadShaderIndexDXT1ToRGBA8] = true;
+  load_shaders_needed[kLoadShaderIndexDXT3ToRGBA8] = true;
+  load_shaders_needed[kLoadShaderIndexDXT5ToRGBA8] = true;
+  load_shaders_needed[kLoadShaderIndexDXNToRG8] = true;
+  load_shaders_needed[kLoadShaderIndexDXT5AToR8] = true;
 
   std::pair<const uint32_t*, size_t> load_shader_code[kLoadShaderCount] = {};
   load_shader_code[kLoadShaderIndex8bpb] = std::make_pair(
@@ -3137,12 +3187,31 @@ bool VulkanTextureCache::Initialize() {
 const VulkanTextureCache::HostFormatPair& VulkanTextureCache::GetHostFormatPair(
     TextureKey key) const {
   if (key.format == xenos::TextureFormat::k_Cr_Y1_Cb_Y0_REP &&
-      (key.GetWidth() & 1)) {
+      ((key.GetWidth() & 1) || key.border_size)) {
     return kHostFormatGBGRUnaligned;
   }
   if (key.format == xenos::TextureFormat::k_Y1_Cr_Y0_Cb_REP &&
-      (key.GetWidth() & 1)) {
+      ((key.GetWidth() & 1) || key.border_size)) {
     return kHostFormatBGRGUnaligned;
+  }
+  if (key.border_size) {
+    switch (key.format) {
+      case xenos::TextureFormat::k_DXT1:
+      case xenos::TextureFormat::k_DXT1_AS_16_16_16_16:
+        return kHostFormatDXT1Decompressed;
+      case xenos::TextureFormat::k_DXT2_3:
+      case xenos::TextureFormat::k_DXT2_3_AS_16_16_16_16:
+        return kHostFormatDXT2_3Decompressed;
+      case xenos::TextureFormat::k_DXT4_5:
+      case xenos::TextureFormat::k_DXT4_5_AS_16_16_16_16:
+        return kHostFormatDXT4_5Decompressed;
+      case xenos::TextureFormat::k_DXN:
+        return kHostFormatDXNDecompressed;
+      case xenos::TextureFormat::k_DXT5A:
+        return kHostFormatDXT5ADecompressed;
+      default:
+        break;
+    }
   }
   return host_formats_[uint32_t(key.format)];
 }

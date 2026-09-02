@@ -38,19 +38,21 @@ void GetSubresourcesFromFetchConstant(
     uint32_t* mip_min_level_out, uint32_t* mip_max_level_out);
 
 // Gets the number of the mipmap level where the packed mips are stored.
-inline uint32_t GetPackedMipLevel(uint32_t width, uint32_t height) {
-  uint32_t log2_size = xe::log2_ceil(std::min(width, height));
+inline uint32_t GetPackedMipLevel(uint32_t width, uint32_t height,
+                                  bool has_border) {
+  uint32_t log2_size =
+      xe::log2_ceil(std::min(width, height) + uint32_t(has_border) * 2);
   return log2_size > 4 ? log2_size - 4 : 0;
 }
 
 // Gets the offset of the mipmap within the tail in blocks, or zeros (and
 // returns false) if the mip level is not packed. Width, height and depth are in
-// texels. For non-3D textures, set depth to 1.
+// texels, excluding the border. For non-3D textures, set depth to 1.
 // The offset is always within the dimensions of the image rounded to 32.
 bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
                         xenos::TextureFormat format, uint32_t mip,
-                        uint32_t& x_blocks, uint32_t& y_blocks,
-                        uint32_t& z_blocks);
+                        bool has_border, bool is_3d, uint32_t& x_blocks,
+                        uint32_t& y_blocks, uint32_t& z_blocks);
 
 // Both tiled and linear textures, as it appears from Direct3D 9 texture
 // alignment disassembly (where the parameter indicating whether the texture is
@@ -135,6 +137,7 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
 // 10+ builds subresource indices, for instance). Each array slice or level is
 // aligned to 4 KB (but this doesn't apply to 3D texture slices within one
 // level).
+// Width, height and depth passed below don't include the encoded border.
 
 struct TextureGuestLayout {
   struct Level {
@@ -192,7 +195,7 @@ TextureGuestLayout GetGuestTextureLayout(
     xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32,
     uint32_t width_texels, uint32_t height_texels, uint32_t depth_or_array_size,
     bool is_tiled, xenos::TextureFormat format, bool has_packed_levels,
-    bool has_base, uint32_t max_level);
+    bool has_border, bool has_base, uint32_t max_level);
 
 // Returns the total size of memory the texture uses starting from its base and
 // mip addresses, in bytes (both are optional).
