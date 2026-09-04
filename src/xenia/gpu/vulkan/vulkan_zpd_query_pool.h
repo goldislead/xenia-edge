@@ -34,8 +34,7 @@ class DeferredCommandBuffer;
 // when no pass is open and segments split at pass boundaries.
 //
 // Requires VK_EXT_host_query_reset (1.2 core) so slots can be reset on the
-// CPU at release time, no paired vkCmdEndQuery needed, and also allows
-// DiscardZPDQuery work outside a pass.
+// CPU at release time, no paired vkCmdEndQuery needed.
 //
 // VK_QUERY_RESULT_WAIT_BIT in the copy removes the need for a separate
 // availability check. Transfer barrier before InvalidateReadback covers non-
@@ -91,8 +90,8 @@ class VulkanZPDQueryPool {
 
   void InvalidateReadback();
 
-  uint64_t GetQueryReadbackValue(uint32_t query_index,
-                                 bool uses_fsi_counter = false) const;
+  XenosZPDReport GetQueryReadbackValue(uint32_t query_index,
+                                        bool uses_fsi_counter = false) const;
 
  private:
   const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;

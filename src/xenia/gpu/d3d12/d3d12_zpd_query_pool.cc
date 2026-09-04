@@ -398,22 +398,22 @@ void D3D12ZPDQueryPool::FlushResolveBatch(
   deferred_command_list.D3DResourceBarrier(1, &barrier);
 }
 
-uint64_t D3D12ZPDQueryPool::GetQueryReadbackValue(uint32_t query_index,
-                                                  bool uses_rov_counter) const {
+XenosZPDReport D3D12ZPDQueryPool::GetQueryReadbackValue(
+    uint32_t query_index, bool uses_rov_counter) const {
   if (query_index >= capacity_) {
-    return 0;
+    return {};
   }
-
+  // Both paths only measure samples that passed depth and stencil.
+  uint64_t passed;
   if (uses_rov_counter) {
-    // ROV queries read back a translated 32 bit sample count. Widen here so
-    // paths feed the uint64_t resolve.
-    return rov_counter_readback_mapping_
-               ? static_cast<uint64_t>(
-                     rov_counter_readback_mapping_[query_index])
-               : 0;
+    passed =
+        rov_counter_readback_mapping_
+            ? static_cast<uint64_t>(rov_counter_readback_mapping_[query_index])
+            : 0;
+  } else {
+    passed = readback_mapping_ ? readback_mapping_[query_index] : 0;
   }
-
-  return readback_mapping_ ? readback_mapping_[query_index] : 0;
+  return XenosZPDReport::FromNativeQuery(passed);
 }
 
 }  // namespace d3d12

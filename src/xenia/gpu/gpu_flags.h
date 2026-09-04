@@ -32,10 +32,6 @@ DECLARE_int32(occlusion_query_fake_lower_threshold);
 
 DECLARE_int32(occlusion_query_fake_upper_threshold);
 
-DECLARE_int32(occlusion_query_querybatch_range);
-
-DECLARE_double(occlusion_query_saturation);
-
 DECLARE_int32(anisotropic_override);
 
 DECLARE_bool(disassemble_pm4);

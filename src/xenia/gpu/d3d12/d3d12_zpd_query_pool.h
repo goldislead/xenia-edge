@@ -92,8 +92,8 @@ class D3D12ZPDQueryPool {
   void FlushResolveBatch(DeferredCommandList& deferred_command_list,
                          bool submission_open);
 
-  uint64_t GetQueryReadbackValue(uint32_t query_index,
-                                 bool uses_rov_counter) const;
+  XenosZPDReport GetQueryReadbackValue(uint32_t query_index,
+                                        bool uses_rov_counter) const;
 
  private:
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap_;

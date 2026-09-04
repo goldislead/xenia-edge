@@ -501,9 +501,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   // ZPD occlusion queries backend.
   // BeginQuery/EndQuery must be in the same command list, segments split at
-  // EndSubmission, resume at BeginSubmission. Discarded queries still need
-  // EndQuery or the heap slot breaks on some drivers. RecordZPDResolveBatch
-  // emits coalesced ResolveQueryData and ROV counter copies at submit.
+  // EndSubmission, resume at BeginSubmission. RecordZPDResolveBatch emits
+  // coalesced ResolveQueryData and ROV counter copies at submit.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
@@ -529,7 +528,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
                                bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle,
                      uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;

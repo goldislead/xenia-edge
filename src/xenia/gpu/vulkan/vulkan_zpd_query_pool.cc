@@ -775,20 +775,22 @@ void VulkanZPDQueryPool::InvalidateReadback() {
   }
 }
 
-uint64_t VulkanZPDQueryPool::GetQueryReadbackValue(
+XenosZPDReport VulkanZPDQueryPool::GetQueryReadbackValue(
     uint32_t query_index, bool uses_fsi_counter) const {
   if (query_index >= capacity_) {
-    return 0;
+    return {};
   }
-
+  // Both paths only measure samples that passed depth and stencil.
+  uint64_t passed;
   if (uses_fsi_counter) {
-    return fsi_counter_readback_mapping_
-               ? static_cast<uint64_t>(
-                     fsi_counter_readback_mapping_[query_index])
-               : 0;
+    passed =
+        fsi_counter_readback_mapping_
+            ? static_cast<uint64_t>(fsi_counter_readback_mapping_[query_index])
+            : 0;
+  } else {
+    passed = readback_mapping_ ? readback_mapping_[query_index] : 0;
   }
-
-  return readback_mapping_ ? readback_mapping_[query_index] : 0;
+  return XenosZPDReport::FromNativeQuery(passed);
 }
 
 }  // namespace vulkan

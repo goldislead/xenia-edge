@@ -448,14 +448,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // ZPD occlusion queries backend.
   // vkCmdBeginQuery is only valid inside a render pass, so segments split at
   // pass end and resume at the next pass begin. If BEGIN fires outside a pass,
-  // segment_pending_begin waits for the next. Outside a render pass,
-  // DiscardZPDQuery defers the slot release until the submission completes.
-  // FSI queries clear a dedicated counter with vkCmdFillBuffer, so they may
-  // need to open before a pass begins or split an active pass around the clear.
+  // segment_pending_begin waits for the next. FSI queries clear a dedicated
+  // counter with vkCmdFillBuffer, so they may need to open before a pass
+  // begins or split an active pass around the clear.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
-    zpd_deferred_releases_.clear();
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_fsi_ = false;
@@ -473,7 +471,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
                                bool can_close_submission) override;
   bool CloseZPDQuery(ReportHandle report_handle,
                      uint64_t& out_submission) override;
-  bool DiscardZPDQuery() override;
   void PumpQueryResolves() override;
   bool AwaitQueryResolve(ReportHandle report_handle,
                          uint64_t wait_for_submission) override;
@@ -637,16 +634,6 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::unique_ptr<VulkanRenderTargetCache> render_target_cache_;
 
   std::unique_ptr<VulkanZPDQueryPool> zpd_host_query_pool_;
-
-  // Deferred query slot releases for discards that happen outside a render
-  // pass, where vkCmdEndQuery cannot be issued.  The slot is held until the
-  // submission containing the stale BeginQuery completes on the GPU.
-  struct DeferredQueryRelease {
-    uint64_t submission;
-    uint32_t query_index;
-    uint32_t query_generation;
-  };
-  std::deque<DeferredQueryRelease> zpd_deferred_releases_;
 
   std::unique_ptr<VulkanPipelineCache> pipeline_cache_;
 

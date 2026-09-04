@@ -2230,6 +2230,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  EndZPDFrame();
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -3559,8 +3560,9 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
 
   texture_cache_->CompletedSubmissionUpdated(completed_submission);
 
-  // Pull completed query resolves so logical ZPD reports can retire.
+  // Pull completed query resolves so ZPD intervals can retire.
   PumpQueryResolves();
+  PumpPendingRetire();
 }
 
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -3622,9 +3624,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     deferred_command_list_.Reset();
 
     // Resume the active query segment.
-    if (GetZPDMode() != ZPDMode::kFake && zpd_active_segment_.logical_active) {
-      OpenQuerySegment(false);
-    }
+    OpenQuerySegment(false);
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3767,7 +3767,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     // We can't close the command list with an active query - D3D12 requirement.
     // Close the active segment and emit ResolveQueryData before executing.
-    if (GetZPDMode() != ZPDMode::kFake) {
+    if (zpd_mode_ != ZPDMode::kFake) {
       CloseQuerySegment();
       RecordZPDResolveBatch();
     }
@@ -3815,8 +3815,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     submission_open_ = false;
 
     // Pump ZPD query process. This drains any resolves that became readable
-    // from completed work and retires reports unblocked by those resolves.
-    // Strict mode may block here before any guest visible progress continues.
+    // from completed work and retires records unblocked by those resolves.
     PumpQueryResolves();
     PumpPendingRetire();
 
@@ -5605,11 +5604,11 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
 }
 
 void D3D12CommandProcessor::EnsureZPDQueryResources() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
+  if (zpd_mode_ == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
 
-  bool can_recreate = !zpd_active_segment_.logical_active &&
+  bool can_recreate = zpd_current_report_.handle == kInvalidReportHandle &&
                       !zpd_active_segment_.segment_active &&
                       zpd_active_query_index_ == UINT32_MAX &&
                       !zpd_active_query_is_rov_ &&
@@ -5685,7 +5684,7 @@ CommandProcessor::QueryOpenResult D3D12CommandProcessor::OpenZPDQuery(
   bool waited_for_submission = false;
 
   if (is_pool_exhausted) {
-    if (GetZPDMode() == ZPDMode::kFast || GetZPDMode() == ZPDMode::kFastAlt) {
+    if (zpd_mode_ != ZPDMode::kStrict) {
       return QueryOpenResult::kPoolExhausted;
     }
 
@@ -5766,35 +5765,8 @@ bool D3D12CommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   return true;
 }
 
-bool D3D12CommandProcessor::DiscardZPDQuery() {
-  if (zpd_active_query_is_rov_) {
-    // The slot counter may be dirty if draws ran between OpenZPDQuery and here,
-    // but the next OpenZPDQuery will zero it before any new shader accumulates.
-    zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_,
-                                            zpd_active_query_generation_);
-    zpd_active_query_index_ = UINT32_MAX;
-    zpd_active_query_generation_ = 0;
-    zpd_active_query_is_rov_ = false;
-    return true;
-  }
-
-  // D3D12 requires a paired EndQuery before the slot can be released.
-  // EndSubmission flushes it so the slot can be freed without a resolve.
-  zpd_host_query_pool_->EndQuery(deferred_command_list_,
-                                 zpd_active_query_index_);
-  if (!EndSubmission(false)) {
-    return false;
-  }
-  zpd_host_query_pool_->ReleaseQueryIndex(zpd_active_query_index_,
-                                          zpd_active_query_generation_);
-  zpd_active_query_index_ = UINT32_MAX;
-  zpd_active_query_generation_ = 0;
-  zpd_active_query_is_rov_ = false;
-  return true;
-}
-
 void D3D12CommandProcessor::PumpQueryResolves() {
-  if (GetZPDMode() == ZPDMode::kFake || !zpd_host_query_pool_) {
+  if (zpd_mode_ == ZPDMode::kFake || !zpd_host_query_pool_) {
     return;
   }
 
@@ -5812,11 +5784,11 @@ void D3D12CommandProcessor::PumpQueryResolves() {
 
     if (zpd_host_query_pool_->GenerationMatches(resolve.query_index,
                                                 resolve.query_generation)) {
-      uint64_t raw_samples = zpd_host_query_pool_->GetQueryReadbackValue(
+      XenosZPDReport raw_counts = zpd_host_query_pool_->GetQueryReadbackValue(
           resolve.query_index, resolve.uses_rov_counter);
       zpd_host_query_pool_->ReleaseQueryIndex(resolve.query_index,
                                               resolve.query_generation);
-      OnZPDQueryResolved(resolve.report_handle, raw_samples,
+      OnZPDQueryResolved(resolve.report_handle, raw_counts,
                          resolve.scale_area);
     }
   }
@@ -5824,17 +5796,14 @@ void D3D12CommandProcessor::PumpQueryResolves() {
 
 bool D3D12CommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
                                               uint64_t wait_for_submission) {
-  if (GetZPDMode() == ZPDMode::kFake) {
+  if (zpd_mode_ == ZPDMode::kFake) {
     return false;
   }
 
   PumpQueryResolves();
 
-  auto it = logical_zpd_reports_.find(report_handle);
-  if (it == logical_zpd_reports_.end()) {
-    return true;
-  }
-  if (it->second.pending_segments == 0 && it->second.ended) {
+  const ZPDReport* report = FindZPDReport(report_handle);
+  if (!report || !report->pending_segments) {
     return true;
   }
   if (wait_for_submission == 0) {
@@ -5861,9 +5830,8 @@ bool D3D12CommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  it = logical_zpd_reports_.find(report_handle);
-  return it == logical_zpd_reports_.end() ||
-         (it->second.pending_segments == 0 && it->second.ended);
+  report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
 }
 
 void D3D12CommandProcessor::RecordZPDResolveBatch() {
