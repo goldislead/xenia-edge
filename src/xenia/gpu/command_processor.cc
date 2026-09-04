@@ -70,6 +70,27 @@ DEFINE_string(
     "GPU");
 
 DEFINE_string(
+    occlusion_query_full_counters, "off",
+    "Controls emulation of the ZFail, StencilFail and Total occlusion query "
+    "counters in addition to ZPass.\n"
+    "With host render targets, pixel shaders inside a query count their "
+    "coverage before the depth and stencil tests, Total is that coverage, and "
+    "the samples the tests rejected are reported as ZFail (StencilFail stays "
+    "zero).\n"
+    "With shader interlock render targets, the emulated depth and stencil "
+    "tests count every outcome exactly.\n"
+    "Hierarchical Z rejections are counted too, unlike on the real hardware.\n"
+    "Helps effects that compare passing samples to the total, such as lens "
+    "flare fading, at some GPU cost inside queries.\n"
+    " off: Only emulate ZPass. (default)\n"
+    " smart: Count only draws that look like query proxies (depth or stencil "
+    "tested without depth writes), preserving early depth rejection for scene "
+    "geometry.\n"
+    " all: Count every draw inside a query interval. This may improve "
+    "compatibility at a potentially significant GPU cost.",
+    "GPU");
+
+DEFINE_string(
     readback_resolve, "none",
     "Controls CPU readback of render-to-texture resolve results.\n"
     " fast: Read from previous frame (1 frame delay, no GPU stall, slight "
@@ -160,6 +181,19 @@ void SetZPDMode(const std::string& mode) {
   OVERRIDE_string(occlusion_query, mode);
 }
 
+ZPDFullCountersMode GetZPDFullCountersMode() {
+  const std::string& mode = cvars::occlusion_query_full_counters;
+  if (mode == "all") {
+    return ZPDFullCountersMode::kAll;
+  } else if (mode == "smart") {
+    return ZPDFullCountersMode::kSmart;
+  }
+  return ZPDFullCountersMode::kOff;
+}
+
+void SetZPDFullCountersMode(const std::string& mode) {
+  OVERRIDE_string(occlusion_query_full_counters, mode);
+}
 using namespace xe::gpu::xenos;
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
@@ -1016,6 +1050,22 @@ void CommandProcessor::UpdateZPDScale(uint32_t scale_area) {
     OpenQuerySegment(false);
   }
   zpd_active_segment_.scale_area = scale_area;
+}
+
+bool CommandProcessor::ShouldCountZPDTotal(
+    reg::RB_DEPTHCONTROL depth_control) const {
+  if (zpd_full_counters_mode_ == ZPDFullCountersMode::kOff ||
+      zpd_current_report_.handle == kInvalidReportHandle ||
+      !(zpd_active_segment_.hybrid ||
+        zpd_active_segment_.segment_pending_begin)) {
+    return false;
+  }
+  // Smart mode only counts draws that look like query proxies - depth or
+  // stencil tested without depth writes - so scene geometry keeps early depth
+  // rejection.
+  return zpd_full_counters_mode_ == ZPDFullCountersMode::kAll ||
+         (!depth_control.z_write_enable &&
+          (depth_control.z_enable || depth_control.stencil_enable));
 }
 
 void CommandProcessor::OnZPDQueryResolved(ReportHandle report_handle,

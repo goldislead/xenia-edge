@@ -104,7 +104,7 @@ class PipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader,
-      uint32_t bound_depth_and_color_render_target_bits,
+      bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_targets_formats,
       void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
 
@@ -225,6 +225,9 @@ class PipelineCache {
     uint32_t stencil_read_mask : 8;                   // 27
     // Native draw (scale threshold), keeps slope-scale unscaled.
     uint32_t resolution_scale_native : 1;  // 28
+    // Hybrid occlusion query draw. Also selects the counting depth-only pixel
+    // shader when there's no guest pixel shader.
+    uint32_t zpd_total : 1;  // 29
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -239,7 +242,7 @@ class PipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     inline bool operator==(const PipelineDescription& other) const;
-    static constexpr uint32_t kVersion = 0x20260815;
+    static constexpr uint32_t kVersion = 0x20260903;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {
@@ -311,7 +314,7 @@ class PipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool depth_bias_in_pixel_shader,
-      uint32_t bound_depth_and_color_render_target_bits,
+      bool zpd_total, uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_target_formats,
       PipelineRuntimeDescription& runtime_description_out,
       bool for_placeholder = false);
@@ -379,6 +382,11 @@ class PipelineCache {
   // Empty depth-only pixel shader for writing to depth buffer via ROV when no
   // Xenos pixel shader provided.
   std::vector<uint8_t> depth_only_pixel_shader_;
+  // Stand-ins for a missing guest pixel shader inside a hybrid occlusion
+  // query, counting the coverage. Float24 variants match float24_*_ps.
+  std::vector<uint8_t> zpd_total_depth_only_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_truncate_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_round_pixel_shader_;
 
   struct Pipeline {
     // nullptr if creation has failed or still pending.

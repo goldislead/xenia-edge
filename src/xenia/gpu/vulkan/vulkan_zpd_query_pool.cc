@@ -22,7 +22,7 @@ namespace vulkan {
 
 bool VulkanZPDQueryPool::EnsureInitialized(
     const ui::vulkan::VulkanDevice* vulkan_device, uint32_t requested_capacity,
-    bool can_recreate, bool initialize_fsi_counter) {
+    bool can_recreate, bool initialize_counter) {
   vulkan_device_ = vulkan_device;
   if (!vulkan_device_ || !requested_capacity) {
     return false;
@@ -30,13 +30,13 @@ bool VulkanZPDQueryPool::EnsureInitialized(
 
   if (capacity_ != 0 && capacity_ != requested_capacity) {
     if (!can_recreate) {
-      return fbo_initialized() || (initialize_fsi_counter && fsi_initialized());
+      return fbo_initialized() || (initialize_counter && counter_initialized());
     }
     Shutdown();
   }
 
   if (capacity_ == requested_capacity && fbo_initialized() &&
-      (!initialize_fsi_counter || fsi_initialized())) {
+      (!initialize_counter || counter_initialized())) {
     return true;
   }
 
@@ -58,8 +58,8 @@ bool VulkanZPDQueryPool::EnsureInitialized(
 
     resolve_batch_pending_.assign(requested_capacity, 0);
     resolve_batch_indices_.clear();
-    fsi_counter_resolve_batch_pending_.assign(requested_capacity, 0);
-    fsi_counter_resolve_batch_indices_.clear();
+    counter_resolve_batch_pending_.assign(requested_capacity, 0);
+    counter_resolve_batch_indices_.clear();
   };
 
   auto initialize_host_query_path = [&]() -> bool {
@@ -173,8 +173,8 @@ bool VulkanZPDQueryPool::EnsureInitialized(
     return true;
   };
 
-  auto initialize_fsi_counter_path = [&]() -> bool {
-    if (fsi_initialized()) {
+  auto initialize_counter_path = [&]() -> bool {
+    if (counter_initialized()) {
       return true;
     }
 
@@ -182,7 +182,8 @@ bool VulkanZPDQueryPool::EnsureInitialized(
     counter_buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     counter_buffer_info.pNext = nullptr;
     counter_buffer_info.flags = 0;
-    counter_buffer_info.size = sizeof(uint32_t) * requested_capacity;
+    counter_buffer_info.size =
+        XenosZPDReport::kCounterSizeBytes * requested_capacity;
     counter_buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -190,16 +191,16 @@ bool VulkanZPDQueryPool::EnsureInitialized(
     counter_buffer_info.queueFamilyIndexCount = 0;
     counter_buffer_info.pQueueFamilyIndices = nullptr;
     if (dfn.vkCreateBuffer(device, &counter_buffer_info, nullptr,
-                           &fsi_counter_buffer_) != VK_SUCCESS) {
+                           &counter_buffer_) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to create the ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to create the ZPD counter "
           "buffer, falling back to fake sample counts.");
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
     VkMemoryRequirements counter_mem_reqs;
-    dfn.vkGetBufferMemoryRequirements(device, fsi_counter_buffer_,
+    dfn.vkGetBufferMemoryRequirements(device, counter_buffer_,
                                       &counter_mem_reqs);
 
     VkMemoryAllocateInfo counter_alloc_info;
@@ -211,24 +212,24 @@ bool VulkanZPDQueryPool::EnsureInitialized(
         ui::vulkan::util::MemoryPurpose::kDeviceLocal);
     if (counter_alloc_info.memoryTypeIndex == UINT32_MAX ||
         dfn.vkAllocateMemory(device, &counter_alloc_info, nullptr,
-                             &fsi_counter_memory_) != VK_SUCCESS) {
+                             &counter_memory_) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to allocate ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to allocate ZPD counter "
           "memory, falling back to fake sample counts.");
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
-    if (dfn.vkBindBufferMemory(device, fsi_counter_buffer_, fsi_counter_memory_,
-                               0) != VK_SUCCESS) {
+    if (dfn.vkBindBufferMemory(device, counter_buffer_, counter_memory_, 0) !=
+        VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to bind ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to bind ZPD counter "
           "buffer memory, falling back to fake sample counts.");
-      dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
-      fsi_counter_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_memory_, nullptr);
+      counter_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
@@ -236,25 +237,26 @@ bool VulkanZPDQueryPool::EnsureInitialized(
     readback_buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     readback_buffer_info.pNext = nullptr;
     readback_buffer_info.flags = 0;
-    readback_buffer_info.size = sizeof(uint32_t) * requested_capacity;
+    readback_buffer_info.size =
+        XenosZPDReport::kCounterSizeBytes * requested_capacity;
     readback_buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     readback_buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     readback_buffer_info.queueFamilyIndexCount = 0;
     readback_buffer_info.pQueueFamilyIndices = nullptr;
     if (dfn.vkCreateBuffer(device, &readback_buffer_info, nullptr,
-                           &fsi_counter_readback_buffer_) != VK_SUCCESS) {
+                           &counter_readback_buffer_) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to create the ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to create the ZPD counter "
           "readback buffer, falling back to fake sample counts.");
-      dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
-      fsi_counter_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_memory_, nullptr);
+      counter_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
     VkMemoryRequirements readback_mem_reqs;
-    dfn.vkGetBufferMemoryRequirements(device, fsi_counter_readback_buffer_,
+    dfn.vkGetBufferMemoryRequirements(device, counter_readback_buffer_,
                                       &readback_mem_reqs);
 
     VkMemoryAllocateInfo readback_alloc_info;
@@ -266,60 +268,65 @@ bool VulkanZPDQueryPool::EnsureInitialized(
         ui::vulkan::util::MemoryPurpose::kReadback);
     if (readback_alloc_info.memoryTypeIndex == UINT32_MAX ||
         dfn.vkAllocateMemory(device, &readback_alloc_info, nullptr,
-                             &fsi_counter_readback_memory_) != VK_SUCCESS) {
+                             &counter_readback_memory_) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to allocate ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to allocate ZPD counter "
           "readback memory, falling back to fake sample counts.");
-      dfn.vkDestroyBuffer(device, fsi_counter_readback_buffer_, nullptr);
-      fsi_counter_readback_buffer_ = VK_NULL_HANDLE;
-      dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
-      fsi_counter_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_readback_buffer_, nullptr);
+      counter_readback_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_memory_, nullptr);
+      counter_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
-    fsi_counter_readback_is_coherent_ =
+    counter_readback_is_coherent_ =
         (vulkan_device_->memory_types().host_coherent &
          (1u << readback_alloc_info.memoryTypeIndex)) != 0;
 
-    if (dfn.vkBindBufferMemory(device, fsi_counter_readback_buffer_,
-                               fsi_counter_readback_memory_, 0) != VK_SUCCESS) {
+    if (dfn.vkBindBufferMemory(device, counter_readback_buffer_,
+                               counter_readback_memory_, 0) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to bind ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to bind ZPD counter "
           "readback buffer memory, falling back to fake sample counts.");
-      dfn.vkFreeMemory(device, fsi_counter_readback_memory_, nullptr);
-      fsi_counter_readback_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_readback_buffer_, nullptr);
-      fsi_counter_readback_buffer_ = VK_NULL_HANDLE;
-      dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
-      fsi_counter_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_readback_memory_, nullptr);
+      counter_readback_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_readback_buffer_, nullptr);
+      counter_readback_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_memory_, nullptr);
+      counter_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
-    void* fsi_counter_readback_mapping = nullptr;
-    if (dfn.vkMapMemory(device, fsi_counter_readback_memory_, 0, VK_WHOLE_SIZE,
-                        0, &fsi_counter_readback_mapping) != VK_SUCCESS) {
+    void* counter_readback_mapping = nullptr;
+    if (dfn.vkMapMemory(device, counter_readback_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &counter_readback_mapping) != VK_SUCCESS) {
       XELOGW(
-          "VulkanZPDQueryPool: Failed to map ZPD FSI counter "
+          "VulkanZPDQueryPool: Failed to map ZPD counter "
           "readback memory, falling back to fake sample counts.");
-      dfn.vkFreeMemory(device, fsi_counter_readback_memory_, nullptr);
-      fsi_counter_readback_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_readback_buffer_, nullptr);
-      fsi_counter_readback_buffer_ = VK_NULL_HANDLE;
-      dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
-      fsi_counter_memory_ = VK_NULL_HANDLE;
-      dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
-      fsi_counter_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_readback_memory_, nullptr);
+      counter_readback_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_readback_buffer_, nullptr);
+      counter_readback_buffer_ = VK_NULL_HANDLE;
+      dfn.vkFreeMemory(device, counter_memory_, nullptr);
+      counter_memory_ = VK_NULL_HANDLE;
+      dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
+      counter_buffer_ = VK_NULL_HANDLE;
       return false;
     }
 
-    fsi_counter_readback_mapping_ =
-        reinterpret_cast<uint32_t*>(fsi_counter_readback_mapping);
+    counter_readback_mapping_ =
+        reinterpret_cast<uint32_t*>(counter_readback_mapping);
 
     initialize_shared_capacity();
+    // The buffer's initial contents are undefined, so every slot starts out
+    // dirty and gets cleared before its first use.
+    counter_dirty_.assign(requested_capacity, 1);
+    counter_dirty_indices_ = std::move(free_indices_);
+    free_indices_.clear();
     return true;
   };
 
@@ -327,7 +334,7 @@ bool VulkanZPDQueryPool::EnsureInitialized(
   if (initialize_host_query_path()) {
     any_initialized = true;
   }
-  if (initialize_fsi_counter && initialize_fsi_counter_path()) {
+  if (initialize_counter && initialize_counter_path()) {
     any_initialized = true;
   }
   return any_initialized;
@@ -340,22 +347,22 @@ void VulkanZPDQueryPool::Shutdown() {
     readback_memory_ = VK_NULL_HANDLE;
     readback_mapping_ = nullptr;
     readback_is_coherent_ = true;
-    fsi_counter_buffer_ = VK_NULL_HANDLE;
-    fsi_counter_memory_ = VK_NULL_HANDLE;
-    fsi_counter_readback_buffer_ = VK_NULL_HANDLE;
-    fsi_counter_readback_memory_ = VK_NULL_HANDLE;
-    fsi_counter_readback_mapping_ = nullptr;
-    fsi_counter_readback_is_coherent_ = true;
+    counter_buffer_ = VK_NULL_HANDLE;
+    counter_memory_ = VK_NULL_HANDLE;
+    counter_readback_buffer_ = VK_NULL_HANDLE;
+    counter_readback_memory_ = VK_NULL_HANDLE;
+    counter_readback_mapping_ = nullptr;
+    counter_readback_is_coherent_ = true;
     capacity_ = 0;
     free_indices_.clear();
     index_generations_.clear();
     resolve_batch_pending_.clear();
     resolve_batch_indices_.clear();
-    fsi_counter_resolve_batch_pending_.clear();
-    fsi_counter_resolve_batch_indices_.clear();
+    counter_resolve_batch_pending_.clear();
+    counter_resolve_batch_indices_.clear();
     resolve_batch_ranges_.clear();
-    fsi_resolve_barrier_scratch_.clear();
-    fsi_resolve_copy_scratch_.clear();
+    counter_resolve_barrier_scratch_.clear();
+    counter_resolve_copy_scratch_.clear();
     return;
   }
 
@@ -366,41 +373,43 @@ void VulkanZPDQueryPool::Shutdown() {
   index_generations_.clear();
   resolve_batch_pending_.clear();
   resolve_batch_indices_.clear();
-  fsi_counter_resolve_batch_pending_.clear();
-  fsi_counter_resolve_batch_indices_.clear();
+  counter_resolve_batch_pending_.clear();
+  counter_resolve_batch_indices_.clear();
   resolve_batch_ranges_.clear();
-  fsi_resolve_barrier_scratch_.clear();
-  fsi_resolve_copy_scratch_.clear();
+  counter_resolve_barrier_scratch_.clear();
+  counter_resolve_copy_scratch_.clear();
+
+  counter_dirty_.clear();
+  counter_dirty_indices_.clear();
 
   capacity_ = 0;
   readback_is_coherent_ = true;
-  fsi_counter_readback_is_coherent_ = true;
+  counter_readback_is_coherent_ = true;
 
-  if (fsi_counter_readback_mapping_ &&
-      fsi_counter_readback_memory_ != VK_NULL_HANDLE) {
-    dfn.vkUnmapMemory(device, fsi_counter_readback_memory_);
+  if (counter_readback_mapping_ && counter_readback_memory_ != VK_NULL_HANDLE) {
+    dfn.vkUnmapMemory(device, counter_readback_memory_);
   }
-  fsi_counter_readback_mapping_ = nullptr;
+  counter_readback_mapping_ = nullptr;
 
-  if (fsi_counter_readback_buffer_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyBuffer(device, fsi_counter_readback_buffer_, nullptr);
+  if (counter_readback_buffer_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, counter_readback_buffer_, nullptr);
   }
-  fsi_counter_readback_buffer_ = VK_NULL_HANDLE;
+  counter_readback_buffer_ = VK_NULL_HANDLE;
 
-  if (fsi_counter_readback_memory_ != VK_NULL_HANDLE) {
-    dfn.vkFreeMemory(device, fsi_counter_readback_memory_, nullptr);
+  if (counter_readback_memory_ != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, counter_readback_memory_, nullptr);
   }
-  fsi_counter_readback_memory_ = VK_NULL_HANDLE;
+  counter_readback_memory_ = VK_NULL_HANDLE;
 
-  if (fsi_counter_buffer_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyBuffer(device, fsi_counter_buffer_, nullptr);
+  if (counter_buffer_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, counter_buffer_, nullptr);
   }
-  fsi_counter_buffer_ = VK_NULL_HANDLE;
+  counter_buffer_ = VK_NULL_HANDLE;
 
-  if (fsi_counter_memory_ != VK_NULL_HANDLE) {
-    dfn.vkFreeMemory(device, fsi_counter_memory_, nullptr);
+  if (counter_memory_ != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, counter_memory_, nullptr);
   }
-  fsi_counter_memory_ = VK_NULL_HANDLE;
+  counter_memory_ = VK_NULL_HANDLE;
 
   if (readback_mapping_ && readback_memory_ != VK_NULL_HANDLE) {
     dfn.vkUnmapMemory(device, readback_memory_);
@@ -425,14 +434,17 @@ void VulkanZPDQueryPool::Shutdown() {
 
 bool VulkanZPDQueryPool::AcquireQueryIndex(uint32_t& query_index,
                                            uint32_t& query_generation) {
-  if (free_indices_.empty()) {
+  // Clean slots first, so counter queries rarely have to clear in place.
+  std::vector<uint32_t>& indices =
+      free_indices_.empty() ? counter_dirty_indices_ : free_indices_;
+  if (indices.empty()) {
     query_index = UINT32_MAX;
     query_generation = 0;
     return false;
   }
 
-  query_index = free_indices_.back();
-  free_indices_.pop_back();
+  query_index = indices.back();
+  indices.pop_back();
 
   assert_true(query_index < index_generations_.size());
   // Bump before returning - invalidates in-flight copies from prior occupant.
@@ -463,7 +475,13 @@ void VulkanZPDQueryPool::ReleaseQueryIndex(uint32_t query_index,
     dfn.vkResetQueryPool(device, query_pool_, query_index, 1);
   }
 
-  free_indices_.push_back(query_index);
+  // The counter slot keeps the old occupant's counts until a clear lands.
+  if (query_index < counter_dirty_.size()) {
+    counter_dirty_[query_index] = 1;
+    counter_dirty_indices_.push_back(query_index);
+  } else {
+    free_indices_.push_back(query_index);
+  }
 }
 
 bool VulkanZPDQueryPool::GenerationMatches(uint32_t query_index,
@@ -495,17 +513,16 @@ void VulkanZPDQueryPool::EndQuery(
   deferred_command_buffer.CmdVkEndQuery(query_pool_, query_index);
 }
 
-void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index,
-                                           bool uses_fsi_counter) {
+void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index, bool counter) {
   if (query_index >= capacity_) {
     return;
   }
 
   // Guard against duplicates within the same submission.
-  if (uses_fsi_counter) {
-    if (!fsi_counter_resolve_batch_pending_[query_index]) {
-      fsi_counter_resolve_batch_pending_[query_index] = 1;
-      fsi_counter_resolve_batch_indices_.push_back(query_index);
+  if (counter) {
+    if (!counter_resolve_batch_pending_[query_index]) {
+      counter_resolve_batch_pending_[query_index] = 1;
+      counter_resolve_batch_indices_.push_back(query_index);
     }
     return;
   }
@@ -516,15 +533,18 @@ void VulkanZPDQueryPool::QueueQueryResolve(uint32_t query_index,
   }
 }
 
-void VulkanZPDQueryPool::ClearFSICounter(
-    DeferredCommandBuffer& deferred_command_buffer,
-    uint32_t query_index) const {
-  if (!fsi_initialized() || query_index >= capacity_) {
+void VulkanZPDQueryPool::ClearCounter(
+    DeferredCommandBuffer& deferred_command_buffer, uint32_t query_index) {
+  if (!counter_initialized() || query_index >= capacity_) {
     return;
   }
 
-  VkDeviceSize offset =
-      static_cast<VkDeviceSize>(query_index) * sizeof(uint32_t);
+  if (query_index < counter_dirty_.size()) {
+    counter_dirty_[query_index] = 0;
+  }
+
+  VkDeviceSize offset = static_cast<VkDeviceSize>(query_index) *
+                        XenosZPDReport::kCounterSizeBytes;
 
   VkBufferMemoryBarrier drain_barrier;
   drain_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -534,16 +554,16 @@ void VulkanZPDQueryPool::ClearFSICounter(
   drain_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   drain_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   drain_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  drain_barrier.buffer = fsi_counter_buffer_;
+  drain_barrier.buffer = counter_buffer_;
   drain_barrier.offset = offset;
-  drain_barrier.size = sizeof(uint32_t);
+  drain_barrier.size = XenosZPDReport::kCounterSizeBytes;
   deferred_command_buffer.CmdVkPipelineBarrier(
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &drain_barrier, 0,
       nullptr);
 
-  deferred_command_buffer.CmdVkFillBuffer(fsi_counter_buffer_, offset,
-                                          sizeof(uint32_t), 0);
+  deferred_command_buffer.CmdVkFillBuffer(counter_buffer_, offset,
+                                          XenosZPDReport::kCounterSizeBytes, 0);
 
   VkBufferMemoryBarrier ready_barrier;
   ready_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -553,10 +573,84 @@ void VulkanZPDQueryPool::ClearFSICounter(
       VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
   ready_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   ready_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  ready_barrier.buffer = fsi_counter_buffer_;
+  ready_barrier.buffer = counter_buffer_;
   ready_barrier.offset = offset;
-  ready_barrier.size = sizeof(uint32_t);
+  ready_barrier.size = XenosZPDReport::kCounterSizeBytes;
 
+  deferred_command_buffer.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+      0, nullptr, 1, &ready_barrier, 0, nullptr);
+}
+
+void VulkanZPDQueryPool::FlushCounterClears(
+    DeferredCommandBuffer& deferred_command_buffer) {
+  if (!counter_initialized() || counter_dirty_indices_.empty()) {
+    return;
+  }
+
+  // One barrier pair around all of the fills, since a released slot can have
+  // been written by shader atomics or by a previous fill.
+  VkBufferMemoryBarrier drain_barrier;
+  drain_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  drain_barrier.pNext = nullptr;
+  drain_barrier.srcAccessMask =
+      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  drain_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  drain_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  drain_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  drain_barrier.buffer = counter_buffer_;
+  drain_barrier.offset = 0;
+  drain_barrier.size = VK_WHOLE_SIZE;
+  deferred_command_buffer.CmdVkPipelineBarrier(
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &drain_barrier, 0,
+      nullptr);
+
+  // Coalesce the dirty slots into contiguous fills, then they're clean and
+  // free.
+  std::ranges::sort(counter_dirty_indices_);
+  uint32_t range_start = 0;
+  uint32_t range_count = 0;
+  auto fill_range = [&]() {
+    if (!range_count) {
+      return;
+    }
+    deferred_command_buffer.CmdVkFillBuffer(
+        counter_buffer_,
+        static_cast<VkDeviceSize>(range_start) *
+            XenosZPDReport::kCounterSizeBytes,
+        static_cast<VkDeviceSize>(range_count) *
+            XenosZPDReport::kCounterSizeBytes,
+        0);
+  };
+  for (uint32_t index : counter_dirty_indices_) {
+    if (index >= capacity_) {
+      continue;
+    }
+    counter_dirty_[index] = 0;
+    free_indices_.push_back(index);
+    if (range_count && index == range_start + range_count) {
+      ++range_count;
+      continue;
+    }
+    fill_range();
+    range_start = index;
+    range_count = 1;
+  }
+  fill_range();
+  counter_dirty_indices_.clear();
+
+  VkBufferMemoryBarrier ready_barrier;
+  ready_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  ready_barrier.pNext = nullptr;
+  ready_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  ready_barrier.dstAccessMask =
+      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+  ready_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  ready_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  ready_barrier.buffer = counter_buffer_;
+  ready_barrier.offset = 0;
+  ready_barrier.size = VK_WHOLE_SIZE;
   deferred_command_buffer.CmdVkPipelineBarrier(
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
       0, nullptr, 1, &ready_barrier, 0, nullptr);
@@ -564,7 +658,7 @@ void VulkanZPDQueryPool::ClearFSICounter(
 
 void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
   if (resolve_batch_indices_.empty() &&
-      fsi_counter_resolve_batch_indices_.empty()) {
+      counter_resolve_batch_indices_.empty()) {
     return;
   }
 
@@ -649,36 +743,36 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
     }
   }
 
-  if (fsi_counter_resolve_batch_indices_.empty()) {
+  if (counter_resolve_batch_indices_.empty()) {
     return;
   }
 
-  if (!fsi_initialized()) {
-    for (uint32_t index : fsi_counter_resolve_batch_indices_) {
-      fsi_counter_resolve_batch_pending_[index] = 0;
+  if (!counter_initialized()) {
+    for (uint32_t index : counter_resolve_batch_indices_) {
+      counter_resolve_batch_pending_[index] = 0;
     }
-    fsi_counter_resolve_batch_indices_.clear();
+    counter_resolve_batch_indices_.clear();
     return;
   }
 
-  build_ranges(fsi_counter_resolve_batch_indices_,
-               fsi_counter_resolve_batch_pending_);
+  build_ranges(counter_resolve_batch_indices_, counter_resolve_batch_pending_);
 
   VkDeviceSize readback_barrier_offset = VK_WHOLE_SIZE;
   VkDeviceSize readback_barrier_end = 0;
-  fsi_resolve_barrier_scratch_.clear();
-  fsi_resolve_copy_scratch_.clear();
-  fsi_resolve_barrier_scratch_.reserve(resolve_batch_ranges_.size());
-  fsi_resolve_copy_scratch_.reserve(resolve_batch_ranges_.size());
+  counter_resolve_barrier_scratch_.clear();
+  counter_resolve_copy_scratch_.clear();
+  counter_resolve_barrier_scratch_.reserve(resolve_batch_ranges_.size());
+  counter_resolve_copy_scratch_.reserve(resolve_batch_ranges_.size());
   for (const ResolveRange& range : resolve_batch_ranges_) {
     if (range.start >= capacity_) {
       continue;
     }
 
     uint32_t count = std::min(range.count, capacity_ - range.start);
-    VkDeviceSize offset =
-        static_cast<VkDeviceSize>(range.start) * sizeof(uint32_t);
-    VkDeviceSize size = static_cast<VkDeviceSize>(count) * sizeof(uint32_t);
+    VkDeviceSize offset = static_cast<VkDeviceSize>(range.start) *
+                          XenosZPDReport::kCounterSizeBytes;
+    VkDeviceSize size =
+        static_cast<VkDeviceSize>(count) * XenosZPDReport::kCounterSizeBytes;
 
     VkBufferMemoryBarrier counter_barrier;
     counter_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -691,34 +785,34 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
     counter_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     counter_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     counter_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    counter_barrier.buffer = fsi_counter_buffer_;
+    counter_barrier.buffer = counter_buffer_;
     counter_barrier.offset = offset;
     counter_barrier.size = size;
-    fsi_resolve_barrier_scratch_.push_back(counter_barrier);
+    counter_resolve_barrier_scratch_.push_back(counter_barrier);
 
     VkBufferCopy copy_region;
     copy_region.srcOffset = offset;
     copy_region.dstOffset = offset;
     copy_region.size = size;
-    fsi_resolve_copy_scratch_.push_back(copy_region);
+    counter_resolve_copy_scratch_.push_back(copy_region);
 
     readback_barrier_offset = std::min(readback_barrier_offset, offset);
     readback_barrier_end = std::max(readback_barrier_end, offset + size);
   }
 
-  if (!fsi_resolve_barrier_scratch_.empty()) {
+  if (!counter_resolve_barrier_scratch_.empty()) {
     // Source stage includes TRANSFER_BIT alongside FRAGMENT_SHADER_BIT so
     // that the barrier correctly covers the vkCmdFillBuffer clear case.
     dfn.vkCmdPipelineBarrier(
         command_buffer,
         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
-        uint32_t(fsi_resolve_barrier_scratch_.size()),
-        fsi_resolve_barrier_scratch_.data(), 0, nullptr);
-    dfn.vkCmdCopyBuffer(command_buffer, fsi_counter_buffer_,
-                        fsi_counter_readback_buffer_,
-                        uint32_t(fsi_resolve_copy_scratch_.size()),
-                        fsi_resolve_copy_scratch_.data());
+        uint32_t(counter_resolve_barrier_scratch_.size()),
+        counter_resolve_barrier_scratch_.data(), 0, nullptr);
+    dfn.vkCmdCopyBuffer(command_buffer, counter_buffer_,
+                        counter_readback_buffer_,
+                        uint32_t(counter_resolve_copy_scratch_.size()),
+                        counter_resolve_copy_scratch_.data());
   }
 
   if (readback_barrier_offset == VK_WHOLE_SIZE ||
@@ -733,7 +827,7 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
   readback_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
   readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  readback_barrier.buffer = fsi_counter_readback_buffer_;
+  readback_barrier.buffer = counter_readback_buffer_;
   readback_barrier.offset = readback_barrier_offset;
   readback_barrier.size = readback_barrier_end - readback_barrier_offset;
   dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -761,13 +855,13 @@ void VulkanZPDQueryPool::InvalidateReadback() {
       dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
     }
 
-    if (!fsi_counter_readback_is_coherent_ &&
-        fsi_counter_readback_memory_ != VK_NULL_HANDLE &&
-        fsi_counter_readback_mapping_) {
+    if (!counter_readback_is_coherent_ &&
+        counter_readback_memory_ != VK_NULL_HANDLE &&
+        counter_readback_mapping_) {
       VkMappedMemoryRange range;
       range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
       range.pNext = nullptr;
-      range.memory = fsi_counter_readback_memory_;
+      range.memory = counter_readback_memory_;
       range.offset = 0;
       range.size = VK_WHOLE_SIZE;
       dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
@@ -775,20 +869,25 @@ void VulkanZPDQueryPool::InvalidateReadback() {
   }
 }
 
-XenosZPDReport VulkanZPDQueryPool::GetQueryReadbackValue(
-    uint32_t query_index, bool uses_fsi_counter) const {
+XenosZPDReport VulkanZPDQueryPool::GetQueryReadbackValue(uint32_t query_index,
+                                                         bool counter,
+                                                         bool hybrid) const {
   if (query_index >= capacity_) {
     return {};
   }
-  // Both paths only measure samples that passed depth and stencil.
-  uint64_t passed;
-  if (uses_fsi_counter) {
-    passed =
-        fsi_counter_readback_mapping_
-            ? static_cast<uint64_t>(fsi_counter_readback_mapping_[query_index])
-            : 0;
-  } else {
-    passed = readback_mapping_ ? readback_mapping_[query_index] : 0;
+  const uint32_t* counter_slot =
+      counter_readback_mapping_
+          ? counter_readback_mapping_ +
+                query_index * XenosZPDReport::kCounterCount
+          : nullptr;
+  if (counter) {
+    return counter_slot ? XenosZPDReport::FromCounterSlot(counter_slot)
+                        : XenosZPDReport();
+  }
+  uint64_t passed = readback_mapping_ ? readback_mapping_[query_index] : 0;
+  if (hybrid && counter_slot) {
+    return XenosZPDReport::FromNativeQueryAndTotal(
+        passed, counter_slot[XenosZPDReport::kCounterTotal]);
   }
   return XenosZPDReport::FromNativeQuery(passed);
 }

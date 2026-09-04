@@ -38,10 +38,13 @@ class DeferredCommandList;
 // FlushResolveBatch coalesces pending indices into contiguous ranges to cut
 // down on ResolveQueryData call count.
 //
-// ROV queries use a separate path instead of normal D3D12 results. They write
-// surviving MSAA coverage into a dedicated buffer, one slot per active query.
-// QueueQueryResolve + ClearROVCounter are used instead of BeginQuery and
-// EndQuery.
+// ROV queries use a separate path instead of normal D3D12 results. The pixel
+// shaders count depth / stencil outcomes into a dedicated counter buffer, one
+// XenosZPDReport::kCounterCount lane slot per active query. QueueQueryResolve
+// + ClearCounter are used instead of BeginQuery and EndQuery.
+//
+// Hybrid queries use both: the native query for ZPass and the Total lane of
+// the counter slot for the coverage before the depth / stencil test.
 class D3D12ZPDQueryPool {
  public:
   D3D12ZPDQueryPool() = default;
@@ -51,7 +54,7 @@ class D3D12ZPDQueryPool {
 
   bool EnsureInitialized(const ui::d3d12::D3D12Provider& provider,
                          uint32_t requested_capacity, bool can_recreate,
-                         bool initialize_rov_counter);
+                         bool initialize_counter);
   void Shutdown();
 
   bool rtv_initialized() const {
@@ -63,17 +66,15 @@ class D3D12ZPDQueryPool {
 
   bool has_pending_resolve_batch() const {
     return !resolve_batch_indices_.empty() ||
-           !rov_counter_resolve_batch_indices_.empty();
+           !counter_resolve_batch_indices_.empty();
   }
 
-  bool rov_initialized() const {
-    return rov_counter_buffer_ && rov_counter_readback_buffer_ &&
-           rov_counter_readback_mapping_ != nullptr && capacity_ != 0;
+  bool counter_initialized() const {
+    return counter_buffer_ && counter_readback_buffer_ &&
+           counter_readback_mapping_ != nullptr && capacity_ != 0;
   }
 
-  ID3D12Resource* rov_counter_buffer() const {
-    return rov_counter_buffer_.Get();
-  }
+  ID3D12Resource* counter_buffer() const { return counter_buffer_.Get(); }
 
   bool has_free_indices() const { return !free_indices_.empty(); }
 
@@ -85,15 +86,15 @@ class D3D12ZPDQueryPool {
                   uint32_t query_index) const;
   void EndQuery(DeferredCommandList& deferred_command_list,
                 uint32_t query_index) const;
-  void QueueQueryResolve(uint32_t query_index, bool uses_rov_counter);
-  void ClearROVCounter(DeferredCommandList& deferred_command_list,
-                       uint32_t query_index) const;
+  void QueueQueryResolve(uint32_t query_index, bool counter);
+  void ClearCounter(DeferredCommandList& deferred_command_list,
+                    uint32_t query_index) const;
 
   void FlushResolveBatch(DeferredCommandList& deferred_command_list,
                          bool submission_open);
 
-  XenosZPDReport GetQueryReadbackValue(uint32_t query_index,
-                                        bool uses_rov_counter) const;
+  XenosZPDReport GetQueryReadbackValue(uint32_t query_index, bool counter,
+                                       bool hybrid) const;
 
  private:
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> query_heap_;
@@ -102,9 +103,9 @@ class D3D12ZPDQueryPool {
   Microsoft::WRL::ComPtr<ID3D12Resource> readback_buffer_;
   uint64_t* readback_mapping_ = nullptr;
 
-  Microsoft::WRL::ComPtr<ID3D12Resource> rov_counter_buffer_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> rov_counter_readback_buffer_;
-  uint32_t* rov_counter_readback_mapping_ = nullptr;
+  Microsoft::WRL::ComPtr<ID3D12Resource> counter_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> counter_readback_buffer_;
+  uint32_t* counter_readback_mapping_ = nullptr;
 
   uint32_t capacity_ = 0;
   std::vector<uint32_t> free_indices_;
@@ -116,8 +117,8 @@ class D3D12ZPDQueryPool {
   // Active indices with resolve_batch_pending_[i] == 1, so flush iterates
   // only the active entries instead of scanning the full capacity.
   std::vector<uint32_t> resolve_batch_indices_;
-  std::vector<uint8_t> rov_counter_resolve_batch_pending_;
-  std::vector<uint32_t> rov_counter_resolve_batch_indices_;
+  std::vector<uint8_t> counter_resolve_batch_pending_;
+  std::vector<uint32_t> counter_resolve_batch_indices_;
   // Reusable scratch for coalesced contiguous ranges during flush.
   std::vector<ResolveRange> resolve_batch_ranges_;
 };

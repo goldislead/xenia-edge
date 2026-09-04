@@ -53,12 +53,21 @@ enum class ZPDMode {
   kStrict,   // Real queries, waits before writeback (strict)
 };
 
+// Occlusion queries - ZFail / StencilFail / Total emulation.
+enum class ZPDFullCountersMode {
+  kOff,    // ZPass only (off)
+  kSmart,  // Count draws that look like query proxies (smart)
+  kAll,    // Count every draw inside a query (all)
+};
+
 void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 ReadbackResolveMode GetReadbackResolveMode();
 void SetReadbackResolveMode(const std::string& mode);
 ZPDMode GetZPDMode();
 void SetZPDMode(const std::string& mode);
+ZPDFullCountersMode GetZPDFullCountersMode();
+void SetZPDFullCountersMode(const std::string& mode);
 
 // Shared pool capacity for D3D12 and Vulkan.
 constexpr uint32_t kZPDQueryPoolCapacity = 8192;
@@ -343,6 +352,9 @@ class CommandProcessor {
     uint32_t scale_area = 0;
     bool segment_active = false;
     bool segment_pending_begin = false;
+    // RTV / FBO with full counters - native query plus the counter slot's
+    // Total lane.
+    bool hybrid = false;
   };
 
   virtual void EnsureZPDQueryResources() {}
@@ -386,6 +398,9 @@ class CommandProcessor {
   // Splits the open segment when the draw scale changes so each segment
   // normalizes with one scale. Also opens a pending segment, once per draw.
   void UpdateZPDScale(uint32_t scale_area);
+  // RTV / FBO draw that should count its coverage into the current query's
+  // Total lane.
+  bool ShouldCountZPDTotal(reg::RB_DEPTHCONTROL depth_control) const;
 
   // Called by backends when a host query resolve completes.  Accumulates
   // the normalized sample counts into the report.
@@ -420,6 +435,7 @@ class CommandProcessor {
 
   void ResetZPDState() {
     zpd_mode_ = GetZPDMode();
+    zpd_full_counters_mode_ = GetZPDFullCountersMode();
     zpd_active_segment_ = {};
     zpd_next_report_handle_ = 1;
     zpd_current_report_ = {};
@@ -463,6 +479,7 @@ class CommandProcessor {
   RegisterFile* XE_RESTRICT register_file_ = nullptr;
 
   ZPDMode zpd_mode_ = ZPDMode::kFast;
+  ZPDFullCountersMode zpd_full_counters_mode_ = ZPDFullCountersMode::kOff;
 
   ReportHandle zpd_next_report_handle_ = 1;
   // The report the next event will end. No handle means nothing is measuring.

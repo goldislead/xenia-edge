@@ -145,7 +145,7 @@ class VulkanPipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total,
       Pipeline** pipeline_out);
 
  private:
@@ -252,6 +252,9 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_pass_op : 3;           // 3
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
+    // Hybrid occlusion query draw. Also selects the counting depth-only
+    // fragment shader when there's no guest pixel shader.
+    uint32_t zpd_total : 1;  // 10
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
@@ -276,7 +279,7 @@ class VulkanPipelineCache {
       }
     };
 
-    static constexpr uint32_t kVersion = 0x20250118;
+    static constexpr uint32_t kVersion = 0x20260903;
   });
 
   // Pipeline storage constants.
@@ -357,7 +360,7 @@ class VulkanPipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total,
       PipelineDescription& description_out) const;
 
   // Whether the pipeline for the given description is supported by the device.
@@ -448,6 +451,12 @@ class VulkanPipelineCache {
   // backend's float24_{truncate,round}_ps.
   VkShaderModule float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule float24_round_fragment_shader_ = VK_NULL_HANDLE;
+
+  // Stand-ins for a missing guest pixel shader inside a hybrid occlusion
+  // query, counting the coverage. Float24 variants match float24_*.
+  VkShaderModule zpd_total_depth_only_fragment_shader_ = VK_NULL_HANDLE;
+  VkShaderModule zpd_total_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
+  VkShaderModule zpd_total_float24_round_fragment_shader_ = VK_NULL_HANDLE;
 
   // Placeholder pixel shader for pipeline hot-swap to reduce stutter.
   // Outputs transparent black while the real shader compiles in background.

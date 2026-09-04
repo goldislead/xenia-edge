@@ -21,9 +21,19 @@ namespace gpu {
 
 // One EVENT_WRITE_ZPD report. The hardware has no BEGIN or END, every event
 // dumps the free-running sample counters to RB_SAMPLE_COUNT_ADDR, and D3D and
-// QueryBatch subtract one report from another in software. Only ZPass can be
-// measured on the host, so the failure lanes stay zero.
+// QueryBatch subtract one report from another in software.
 struct XenosZPDReport {
+  // Host counter buffer slot layout, one slot per pool query index.
+  enum CounterIndex : uint32_t {
+    kCounterTotal,
+    kCounterZFail,
+    kCounterZPass,
+    kCounterStencilFail,
+    kCounterCount,
+  };
+  static constexpr uint32_t kCounterSizeBytes =
+      kCounterCount * sizeof(uint32_t);
+
   uint64_t z_fail = 0;
   uint64_t z_pass = 0;
   uint64_t stencil_fail = 0;
@@ -43,6 +53,26 @@ struct XenosZPDReport {
   static XenosZPDReport FromNativeQuery(uint64_t passed) {
     XenosZPDReport report;
     report.z_pass = passed;
+    return report;
+  }
+
+  // Counter slot filled by the ROV / FSI shaders, every outcome counted.
+  static XenosZPDReport FromCounterSlot(const uint32_t* slot) {
+    XenosZPDReport report;
+    report.z_fail = slot[kCounterZFail];
+    report.z_pass = slot[kCounterZPass];
+    report.stencil_fail = slot[kCounterStencilFail];
+    return report;
+  }
+
+  // Native query plus the RTV / FBO pre-test coverage from the Total lane.
+  // Rejected samples all land in ZFail since the host can't tell them from
+  // StencilFail.
+  static XenosZPDReport FromNativeQueryAndTotal(uint64_t passed,
+                                                uint64_t coverage) {
+    XenosZPDReport report;
+    report.z_pass = passed;
+    report.z_fail = std::max(coverage, passed) - passed;
     return report;
   }
 

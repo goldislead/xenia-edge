@@ -160,6 +160,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
         ->vulkan_device();
   }
 
+  // Whether hybrid occlusion queries can count coverage in fragment shaders
+  // on this device.
+  bool IsZPDHybridSupported() const { return zpd_hybrid_supported_; }
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
@@ -457,8 +461,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_fsi_ = false;
-    zpd_query_pool_needs_fsi_counter_ = false;
-    zpd_fsi_counter_index_force_update_ = true;
+    zpd_fsi_path_ = false;
+    zpd_counter_index_force_update_ = true;
     if (zpd_host_query_pool_) {
       zpd_host_query_pool_->Shutdown();
     }
@@ -522,21 +526,26 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
     uint32_t scale_area = 1;
-    bool uses_fsi_counter = false;
+    bool fsi = false;
+    // Native query plus the counter slot's Total lane.
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_fsi_ = false;
-  bool zpd_query_pool_needs_fsi_counter_ = false;
-  bool zpd_fsi_counter_index_force_update_ = true;
+  bool zpd_fsi_path_ = false;
+  // occlusion_query_full_counters with FBO and a device that can do the
+  // counting. Decided once in SetupContext.
+  bool zpd_hybrid_supported_ = false;
+  bool zpd_counter_index_force_update_ = true;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
-  // Fallback buffer for EDRAM descriptor binding 2.
-  VkBuffer zpd_fsi_counter_sink_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory zpd_fsi_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
+  // Fallback buffer keeping ZPD counter descriptor binding 2 valid.
+  VkBuffer zpd_counter_sink_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory zpd_counter_sink_buffer_memory_ = VK_NULL_HANDLE;
   // Currently installed binding 2 buffer.
-  VkBuffer zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
-  VkDeviceSize zpd_fsi_counter_descriptor_range_ = 0;
+  VkBuffer zpd_counter_descriptor_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize zpd_counter_descriptor_range_ = 0;
 
   ui::vulkan::VulkanGPUCompletionTimeline completion_timeline_;
   bool submission_open_ = false;

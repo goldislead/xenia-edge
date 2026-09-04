@@ -86,6 +86,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
         graphics_system_->provider());
   }
 
+  // Whether hybrid occlusion queries can count coverage in pixel shaders.
+  bool IsZPDHybridSupported() const { return zpd_hybrid_supported_; }
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandList& GetDeferredCommandList() {
@@ -172,7 +175,7 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
-    kZpdROVCounterRawUAV,
+    kZpdCounterRawUAV,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -496,22 +499,22 @@ class D3D12CommandProcessor final : public CommandProcessor {
   ID3D12Resource* RequestReadbackBuffer(uint32_t size);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
-  void WriteZPDROVCounterRawUAVDescriptor(
+  void WriteZPDCounterRawUAVDescriptor(
       D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   // ZPD occlusion queries backend.
   // BeginQuery/EndQuery must be in the same command list, segments split at
   // EndSubmission, resume at BeginSubmission. RecordZPDResolveBatch emits
-  // coalesced ResolveQueryData and ROV counter copies at submit.
+  // coalesced ResolveQueryData and counter copies at submit.
   void EnsureZPDQueryResources() override;
   void ShutdownZPDQueryResources() override {
     zpd_resolves_in_flight_.clear();
     zpd_active_query_index_ = UINT32_MAX;
     zpd_active_query_generation_ = 0;
     zpd_active_query_is_rov_ = false;
-    zpd_query_pool_needs_rov_counter_ = false;
-    bindful_zpd_rov_counter_buffer_ = nullptr;
-    bindful_zpd_rov_counter_capacity_ = 0;
+    zpd_rov_path_ = false;
+    bindful_zpd_counter_buffer_ = nullptr;
+    bindful_zpd_counter_capacity_ = 0;
     if (!bindless_resources_used_) {
       draw_view_bindful_heap_index_ =
           ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
@@ -543,13 +546,18 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint32_t query_index = UINT32_MAX;
     uint32_t query_generation = 0;
     uint32_t scale_area = 1;
-    bool uses_rov_counter = false;
+    bool rov = false;
+    // Native query plus the counter slot's Total lane.
+    bool hybrid = false;
     ReportHandle report_handle = kInvalidReportHandle;
   };
   uint32_t zpd_active_query_index_ = UINT32_MAX;
   uint32_t zpd_active_query_generation_ = 0;
   bool zpd_active_query_is_rov_ = false;
-  bool zpd_query_pool_needs_rov_counter_ = false;
+  bool zpd_rov_path_ = false;
+  // occlusion_query_full_counters with RTV and the CommandList2 needed to
+  // clear counter slots. Decided once in SetupContext.
+  bool zpd_hybrid_supported_ = false;
   std::deque<PendingQueryResolve> zpd_resolves_in_flight_;
 
   std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
@@ -596,8 +604,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
 
   std::unique_ptr<D3D12ZPDQueryPool> zpd_host_query_pool_;
-  ID3D12Resource* bindful_zpd_rov_counter_buffer_ = nullptr;
-  uint32_t bindful_zpd_rov_counter_capacity_ = 0;
+  ID3D12Resource* bindful_zpd_counter_buffer_ = nullptr;
+  uint32_t bindful_zpd_counter_capacity_ = 0;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
