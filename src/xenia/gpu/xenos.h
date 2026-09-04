@@ -944,6 +944,9 @@ enum class EdramMode : uint32_t {
   //   from the vertex shader) as no texture alpha cutout is involved.
   // - 5454082B also has kDepthOnly draws with pretty complex shaders clearly
   //   for use only in the color pass - even fetching and filtering a shadowmap.
+  // - D3D runtime selects kDepthOnly when any title sets a null pixel shader
+  //   (4541096E even explicitly does so in its shader flush), and nothing ever
+  //   ever seems to unload a previous pixel shader from the command processor.
   // For now, based on these, let's assume the pixel shader is never used with
   // kDepthOnly.
   kDepthOnly = 5,
