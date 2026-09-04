@@ -51,6 +51,12 @@ DEFINE_string(
     "always FB because the FSI path is much slower now).",
     "GPU");
 
+DEFINE_bool(
+    vulkan_xenos_sample_locations, false,
+    "Rasterize 2x and 4x MSAA at the Xenos sample positions if the GPU and "
+    "driver supports VK_EXT_sample_locations.",
+    "Vulkan");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -201,6 +207,80 @@ VulkanRenderTargetCache::VulkanRenderTargetCache(
       trace_writer_(trace_writer) {}
 
 VulkanRenderTargetCache::~VulkanRenderTargetCache() { Shutdown(true); }
+
+bool VulkanRenderTargetCache::AreCustomSampleLocationsUsed(
+    xenos::MsaaSamples msaa_samples, bool subpass_has_attachments) const {
+  if (msaa_samples == xenos::MsaaSamples::k1X ||
+      msaa_samples > xenos::MsaaSamples::k4X) {
+    return false;
+  }
+  if (!cvars::vulkan_xenos_sample_locations) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  if (!vulkan_device->extensions().ext_EXT_sample_locations) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice::Properties& device_properties =
+      vulkan_device->properties();
+  // Attachments only for now, render pass instances without them mix sample
+  // counts.
+  if (!subpass_has_attachments) {
+    return false;
+  }
+  uint32_t host_sample_count = (msaa_samples == xenos::MsaaSamples::k2X &&
+                                !IsMsaa2xSupported(subpass_has_attachments))
+                                   ? 4
+                                   : uint32_t(1) << uint32_t(msaa_samples);
+  return (device_properties.sampleLocationSampleCounts &
+          VkSampleCountFlags(host_sample_count)) != 0;
+}
+
+void VulkanRenderTargetCache::GetSampleLocationsInfo(
+    xenos::MsaaSamples msaa_samples, bool subpass_has_attachments,
+    VkSampleLocationEXT* locations_out,
+    VkSampleLocationsInfoEXT& info_out) const {
+  assert_true(
+      AreCustomSampleLocationsUsed(msaa_samples, subpass_has_attachments));
+  // The Xenos position each host sample gets, per the transfer and dump
+  // shader mapping: 4x is the guest sample, true 2x the guest sample XOR 1,
+  // 2x-as-4x uses 0 and 3 with the unused samples duplicating them. 0.5 +-
+  // 6/16 is within the [0, 15/16] range and the 1/16 grid the extension
+  // guarantees.
+  static constexpr uint32_t kGuestSampleForHostSample2xNative[2] = {1, 0};
+  static constexpr uint32_t kGuestSampleForHostSample2xAs4x[4] = {0, 1, 0, 1};
+  static constexpr uint32_t kGuestSampleForHostSample4x[4] = {0, 1, 2, 3};
+  const int8_t(*xenos_sample_positions)[2] =
+      msaa_samples >= xenos::MsaaSamples::k4X
+          ? draw_util::kXenosSamplePositions4x
+          : draw_util::kXenosSamplePositions2x;
+  const uint32_t* guest_sample_for_host_sample;
+  uint32_t host_sample_count;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    guest_sample_for_host_sample = kGuestSampleForHostSample4x;
+    host_sample_count = 4;
+  } else if (IsMsaa2xSupported(subpass_has_attachments)) {
+    guest_sample_for_host_sample = kGuestSampleForHostSample2xNative;
+    host_sample_count = 2;
+  } else {
+    guest_sample_for_host_sample = kGuestSampleForHostSample2xAs4x;
+    host_sample_count = 4;
+  }
+  for (uint32_t i = 0; i < host_sample_count; ++i) {
+    const int8_t* sample_position =
+        xenos_sample_positions[guest_sample_for_host_sample[i]];
+    locations_out[i].x = 0.5f + float(sample_position[0]) / 16.0f;
+    locations_out[i].y = 0.5f + float(sample_position[1]) / 16.0f;
+  }
+  info_out.sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
+  info_out.pNext = nullptr;
+  info_out.sampleLocationsPerPixel = VkSampleCountFlagBits(host_sample_count);
+  info_out.sampleLocationGridSize.width = 1;
+  info_out.sampleLocationGridSize.height = 1;
+  info_out.sampleLocationsCount = host_sample_count;
+  info_out.pSampleLocations = locations_out;
+}
 
 bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -1958,6 +2038,13 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
     image_create_info.format = GetDepthVulkanFormat(key.GetDepthFormat());
     transfer_format = image_create_info.format;
     image_create_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (AreCustomSampleLocationsUsed(key.msaa_samples, true)) {
+      // Depth may be stored as plane equations evaluated at the programmed
+      // locations, this keeps the depth aspect valid across layout
+      // transitions without passing the locations to every barrier.
+      image_create_info.flags |=
+          VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+    }
   } else {
     xenos::ColorRenderTargetFormat color_format = key.GetColorFormat();
     image_create_info.format = GetColorVulkanFormat(color_format);
@@ -4497,6 +4584,20 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(
     if (sample_mask != UINT32_MAX) {
       multisample_state.pSampleMask = &sample_mask;
     }
+  }
+  // Pipelines rendering to a depth buffer have to use the pattern of the
+  // destination's own draws.
+  VkSampleLocationEXT sample_locations[4];
+  VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_state;
+  if (AreCustomSampleLocationsUsed(key.shader_key.dest_msaa_samples, true)) {
+    GetSampleLocationsInfo(key.shader_key.dest_msaa_samples, true,
+                           sample_locations,
+                           sample_locations_state.sampleLocationsInfo);
+    sample_locations_state.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT;
+    sample_locations_state.pNext = nullptr;
+    sample_locations_state.sampleLocationsEnable = VK_TRUE;
+    multisample_state.pNext = &sample_locations_state;
   }
 
   // Whether the depth / stencil state is used depends on the presence of a

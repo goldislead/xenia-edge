@@ -2916,6 +2916,24 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     multisample_state.rasterizationSamples = VkSampleCountFlagBits(
         uint32_t(1) << uint32_t(description.render_pass_key.msaa_samples));
   }
+  // Place the host samples at the Xenos positions of the guest samples they
+  // are paired with where the device can.
+  VkSampleLocationEXT sample_locations[4];
+  VkPipelineSampleLocationsStateCreateInfoEXT sample_locations_state;
+  bool subpass_has_attachments =
+      !edram_fragment_shader_interlock &&
+      description.render_pass_key.depth_and_color_used != 0;
+  if (render_target_cache_.AreCustomSampleLocationsUsed(
+          description.render_pass_key.msaa_samples, subpass_has_attachments)) {
+    render_target_cache_.GetSampleLocationsInfo(
+        description.render_pass_key.msaa_samples, subpass_has_attachments,
+        sample_locations, sample_locations_state.sampleLocationsInfo);
+    sample_locations_state.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT;
+    sample_locations_state.pNext = nullptr;
+    sample_locations_state.sampleLocationsEnable = VK_TRUE;
+    multisample_state.pNext = &sample_locations_state;
+  }
 
   VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {};
   depth_stencil_state.sType =
