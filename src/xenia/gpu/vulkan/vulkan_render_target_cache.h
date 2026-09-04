@@ -176,6 +176,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                    : msaa_2x_no_attachments_supported_;
   }
 
+  // Whether pipelines at the guest sample count on the path place the host
+  // samples at the Xenos positions via VK_EXT_sample_locations.
+  bool AreCustomSampleLocationsUsed(xenos::MsaaSamples msaa_samples,
+                                    bool subpass_has_attachments) const;
+  // locations_out needs 4 elements and has to outlive info_out. Only when
+  // AreCustomSampleLocationsUsed.
+  void GetSampleLocationsInfo(xenos::MsaaSamples msaa_samples,
+                              bool subpass_has_attachments,
+                              VkSampleLocationEXT* locations_out,
+                              VkSampleLocationsInfoEXT& info_out) const;
+
   // Returns the render pass object, or VK_NULL_HANDLE if failed to create.
   // A render pass managed by the render target cache may be ended and resumed
   // at any time (to allow for things like copying and texture loading).
