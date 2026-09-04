@@ -1700,11 +1700,11 @@ spv::Id SpirvShaderTranslator::LoadMsaaSamplesFromFlags() {
 void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
   // On the Xbox 360, 2x MSAA doubles the storage height, 4x MSAA doubles the
   // storage width.
-  // The guest 4x sample numbering is the Vulkan one, bit 0 horizontal and
-  // bit 1 vertical, so 4x coverage passes through as is. Guest 2x puts
-  // sample 0 at the top while Vulkan counts from the bottom, so the guest
-  // samples map to Vulkan 1, 0 with native 2x MSAA and to 0, 3 with 2x
-  // emulated as 4x.
+  // Coverage comes from the host standard sample closest to each Xenos
+  // position (kXenosSamplePositions2x/4x), 2 and 1 for 2x-as-4x and 0, 3, 2,
+  // 1 at 4x, native 2x keeps 1, 0 with both host samples equidistant. With
+  // VK_EXT_sample_locations the pipelines move those samples to the Xenos
+  // positions, GetSampleLocationsInfo uses the same pairing.
 
   spv::Id const_uint_1 = builder_->makeUintConstant(1);
   spv::Id const_uint_2 = builder_->makeUintConstant(2);
@@ -1757,20 +1757,34 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
                                 input_sample_mask_value),
         builder_->makeUintConstant(32 - 2));
   } else {
-    // 0 and 3 to 0 and 1. Guest sample 1 comes from host sample 3.
+    // 2 and 1 to 0 and 1.
     sample_mask_2x = builder_->createQuadOp(
-        spv::OpBitFieldInsert, type_uint_, input_sample_mask_value,
+        spv::OpBitFieldInsert, type_uint_,
         builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
-                              input_sample_mask_value,
-                              builder_->makeUintConstant(3), const_uint_1),
+                              input_sample_mask_value, const_uint_2,
+                              const_uint_1),
+        builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                              input_sample_mask_value, const_uint_1,
+                              const_uint_1),
         const_uint_1, builder_->makeUintConstant(32 - 1));
   }
   builder_->createBranch(&block_msaa_merge);
 
-  // At 4x the guest and the Vulkan sample numbering match, so pass the
-  // coverage through.
+  // At 4x, guest samples 0 and 2 take coverage from host samples 0 and 2,
+  // guest samples 1 and 3 from host samples 3 and 1.
   builder_->setBuildPoint(&block_msaa_4x);
-  spv::Id sample_mask_4x = input_sample_mask_value;
+  spv::Id sample_mask_4x = builder_->createQuadOp(
+      spv::OpBitFieldInsert, type_uint_,
+      builder_->createQuadOp(
+          spv::OpBitFieldInsert, type_uint_, input_sample_mask_value,
+          builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                                input_sample_mask_value,
+                                builder_->makeUintConstant(3), const_uint_1),
+          const_uint_1, const_uint_1),
+      builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                            input_sample_mask_value, const_uint_1,
+                            const_uint_1),
+      builder_->makeUintConstant(3), const_uint_1);
   builder_->createBranch(&block_msaa_merge);
 
   // Select the result depending on the MSAA sample count.
@@ -2346,27 +2360,21 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
     // interpolateAtSample(gl_FragCoord) is not valid in GLSL because
     // gl_FragCoord is not an interpolator, calculating the depths at the
     // samples manually.
+    // Extrapolate to the Xenos position of the guest sample rather than the
+    // host position the coverage came from. Fragment 0 depth resolves hand
+    // the slot back for later comparisons, so it has to hold the depth where
+    // the guest expects it.
     std::array<spv::Id, 2> sample_location;
     switch (i) {
       case 0: {
-        // Center sample for no MSAA.
-        // Top-left sample for native 2x (top - 1 in Vulkan), 2x as 4x, 4x
-        // (0 in Vulkan).
-        // 4x on the host case.
+        // First Xenos sample at 2x or 4x, the center for no MSAA.
         for (uint32_t j = 0; j < 2; ++j) {
-          sample_location[j] = builder_->makeFloatConstant(
-              draw_util::kD3D10StandardSamplePositions4x[0][j] *
-              (1.0f / 16.0f));
-        }
-        if (native_2x_msaa_no_attachments_) {
-          // 2x on the host case.
-          for (uint32_t j = 0; j < 2; ++j) {
-            sample_location[j] = builder_->createTriOp(
-                spv::OpSelect, type_float_, msaa_is_4x, sample_location[j],
-                builder_->makeFloatConstant(
-                    draw_util::kD3D10StandardSamplePositions2x[1][j] *
-                    (1.0f / 16.0f)));
-          }
+          sample_location[j] = builder_->createTriOp(
+              spv::OpSelect, type_float_, msaa_is_4x,
+              builder_->makeFloatConstant(
+                  draw_util::kXenosSamplePositions4x[0][j] * (1.0f / 16.0f)),
+              builder_->makeFloatConstant(
+                  draw_util::kXenosSamplePositions2x[0][j] * (1.0f / 16.0f)));
         }
         // 1x case.
         for (uint32_t j = 0; j < 2; ++j) {
@@ -2376,28 +2384,22 @@ void SpirvShaderTranslator::FSI_DepthStencilTest(
         }
       } break;
       case 1: {
-        // For guest 2x this is the bottom sample, Vulkan 0 for native 2x and
-        // Vulkan 3 for 2x as 4x.
-        // For guest 4x this is the top-right sample since the horizontal
-        // sample bit is bit 0, Vulkan 1.
+        // The second Xenos sample at 2x, the top-right guest sample at 4x
+        // (the horizontal sample bit is bit 0).
         for (uint32_t j = 0; j < 2; ++j) {
           sample_location[j] = builder_->createTriOp(
               spv::OpSelect, type_float_, msaa_is_4x,
               builder_->makeFloatConstant(
-                  draw_util::kD3D10StandardSamplePositions4x[1][j] *
-                  (1.0f / 16.0f)),
+                  draw_util::kXenosSamplePositions4x[1][j] * (1.0f / 16.0f)),
               builder_->makeFloatConstant(
-                  (native_2x_msaa_no_attachments_
-                       ? draw_util::kD3D10StandardSamplePositions2x[0][j]
-                       : draw_util::kD3D10StandardSamplePositions4x[3][j]) *
-                  (1.0f / 16.0f)));
+                  draw_util::kXenosSamplePositions2x[1][j] * (1.0f / 16.0f)));
         }
       } break;
       default: {
         // Guest samples 2 and 3, bottom-left and bottom-right with the
-        // vertical sample bit being bit 1, map to Vulkan samples 2 and 3.
+        // vertical sample bit being bit 1 - only present at 4x.
         const int8_t* sample_location_int =
-            draw_util::kD3D10StandardSamplePositions4x[i];
+            draw_util::kXenosSamplePositions4x[i];
         for (uint32_t j = 0; j < 2; ++j) {
           sample_location[j] = builder_->makeFloatConstant(
               sample_location_int[j] * (1.0f / 16.0f));

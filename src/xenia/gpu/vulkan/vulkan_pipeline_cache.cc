@@ -2904,11 +2904,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       !render_target_cache_.IsMsaa2xSupported(
           !edram_fragment_shader_interlock &&
           description.render_pass_key.depth_and_color_used != 0)) {
-    // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
-    // sample locations, but still top-left and bottom-right - however, this can
-    // be adjusted with custom sample locations).
     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
-    sample_mask = 0b1001;
+    if (edram_fragment_shader_interlock) {
+      // Host samples 2 and 1 as guest 0 and 1, the closest standard positions
+      // to the Xenos ones, matching the translated shaders.
+      sample_mask = 0b0110;
+    } else {
+      // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
+      // sample locations, but still top-left and bottom-right, adjusted with
+      // custom sample locations where supported).
+      sample_mask = 0b1001;
+    }
     // TODO(Triang3l): Research sample mask behavior without attachments (in
     // Direct3D, it's completely ignored in this case).
     multisample_state.pSampleMask = &sample_mask;
