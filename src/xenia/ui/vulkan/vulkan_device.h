@@ -158,6 +158,7 @@ class VulkanDevice {
     // VK_EXT_sample_locations (#144)
 
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    bool variableSampleLocations = false;
 
     // VK_EXT_shader_demote_to_helper_invocation (#277, promoted to 1.3)
 

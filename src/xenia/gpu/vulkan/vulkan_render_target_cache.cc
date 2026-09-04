@@ -224,9 +224,9 @@ bool VulkanRenderTargetCache::AreCustomSampleLocationsUsed(
   }
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       vulkan_device->properties();
-  // Attachments only for now, render pass instances without them mix sample
-  // counts.
-  if (!subpass_has_attachments) {
+  // Render pass instances without attachments mix sample counts, so the
+  // locations vary within them.
+  if (!subpass_has_attachments && !device_properties.variableSampleLocations) {
     return false;
   }
   uint32_t host_sample_count = (msaa_samples == xenos::MsaaSamples::k2X &&
@@ -243,14 +243,17 @@ void VulkanRenderTargetCache::GetSampleLocationsInfo(
     VkSampleLocationsInfoEXT& info_out) const {
   assert_true(
       AreCustomSampleLocationsUsed(msaa_samples, subpass_has_attachments));
-  // The Xenos position each host sample gets, per the transfer and dump
-  // shader mapping: 4x is the guest sample, true 2x the guest sample XOR 1,
-  // 2x-as-4x uses 0 and 3 with the unused samples duplicating them. 0.5 +-
-  // 6/16 is within the [0, 15/16] range and the 1/16 grid the extension
-  // guarantees.
+  // The Xenos position each host sample gets. With attachments, per the
+  // transfer and dump shader mapping: 4x is the guest sample, true 2x the
+  // guest sample XOR 1, 2x-as-4x uses 0 and 3. Without attachments, per the
+  // interlock output: 0, 3, 2, 1 at 4x, the XOR at true 2x, 2 and 1 for
+  // 2x-as-4x. The unused 2x-as-4x samples duplicate the real ones through
+  // the same 0, 1, 0, 1 table. 0.5 +- 6/16 is within the [0, 15/16] range and
+  // the 1/16 grid the extension guarantees.
   static constexpr uint32_t kGuestSampleForHostSample2xNative[2] = {1, 0};
   static constexpr uint32_t kGuestSampleForHostSample2xAs4x[4] = {0, 1, 0, 1};
-  static constexpr uint32_t kGuestSampleForHostSample4x[4] = {0, 1, 2, 3};
+  static constexpr uint32_t kGuestSampleForHostSample4xFbo[4] = {0, 1, 2, 3};
+  static constexpr uint32_t kGuestSampleForHostSample4xFsi[4] = {0, 3, 2, 1};
   const int8_t(*xenos_sample_positions)[2] =
       msaa_samples >= xenos::MsaaSamples::k4X
           ? draw_util::kXenosSamplePositions4x
@@ -258,7 +261,9 @@ void VulkanRenderTargetCache::GetSampleLocationsInfo(
   const uint32_t* guest_sample_for_host_sample;
   uint32_t host_sample_count;
   if (msaa_samples >= xenos::MsaaSamples::k4X) {
-    guest_sample_for_host_sample = kGuestSampleForHostSample4x;
+    guest_sample_for_host_sample = subpass_has_attachments
+                                       ? kGuestSampleForHostSample4xFbo
+                                       : kGuestSampleForHostSample4xFsi;
     host_sample_count = 4;
   } else if (IsMsaa2xSupported(subpass_has_attachments)) {
     guest_sample_for_host_sample = kGuestSampleForHostSample2xNative;

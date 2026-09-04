@@ -732,6 +732,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (device->extensions_.ext_EXT_sample_locations) {
     XE_UI_VULKAN_PROPERTY_2(properties_EXT_sample_locations,
                             sampleLocationSampleCounts);
+    XE_UI_VULKAN_PROPERTY_2(properties_EXT_sample_locations,
+                            variableSampleLocations);
   }
 
   if (ext_EXT_non_seamless_cube_map) {
