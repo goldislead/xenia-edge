@@ -491,11 +491,14 @@ void GetScissor(const RegisterFile& XE_RESTRICT regs,
 // color pass at a negative offset rasterize identically, which EQUAL /
 // LESSEQUAL replay relies on. On hosts the offset goes through the float
 // viewport math and replayed depth wobbles by ULPs, carrying it in the bases
-// sends both passes through the same transform.
+// sends both passes through the same transform. A host render target only
+// holds one EDRAM addressing period past its base, host_render_targets_used
+// declines draws whose unoffset rows reach past it.
 int32_t GetWindowOffsetEdramBaseBiasTiles(
     const RegisterFile& XE_RESTRICT regs,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, bool pixel_shader_reads_position);
+    uint32_t normalized_color_mask, bool pixel_shader_reads_position,
+    bool host_render_targets_used);
 
 // Returns the color component write mask for the draw command taking into
 // account which color targets are written to by the pixel shader, as well as
