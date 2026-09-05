@@ -38,9 +38,10 @@ DEFINE_bool(
     "GPU");
 
 DEFINE_bool(
-    window_offset_relocation_wrap, false,
-    "Wrap bases going negative under the window offset relocation around the "
-    "end of EDRAM instead of declining the relocation for the draw.",
+    window_offset_relocation, true,
+    "Carry tile-aligned negative window offsets in the EDRAM bases instead of "
+    "the viewport so tiling replay rasterizes through the same transform as "
+    "the pass it replays.",
     "GPU");
 
 DEFINE_bool(
@@ -815,6 +816,9 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask, bool pixel_shader_reads_position,
     bool host_render_targets_used) {
+  if (!cvars::window_offset_relocation) {
+    return 0;
+  }
   // PsParamGen would report the unoffset position.
   if (pixel_shader_reads_position) {
     return 0;
@@ -885,33 +889,10 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
   // A base going negative (tile-local depth rebuilt at base 0 while the offset
   // points into a taller allocation) wraps into the previous EDRAM period,
   // ownership, transfers, dumps, and interlock addressing all wrap the same
-  // way. Without window_offset_relocation_wrap such draws decline.
-  if (!cvars::window_offset_relocation_wrap) {
-    if (depth_used) {
-      int32_t depth_base_tiles =
-          int32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base) +
-          bias_tiles_at_32bpp;
-      if (depth_base_tiles < 0) {
-        return 0;
-      }
-    }
-    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
-      if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
-        continue;
-      }
-      auto color_info = regs.Get<reg::RB_COLOR_INFO>(
-          reg::RB_COLOR_INFO::rt_register_indices[i]);
-      int32_t color_base_tiles =
-          int32_t(color_info.color_base) +
-          bias_tiles_at_32bpp *
-              (xenos::IsColorRenderTargetFormat64bpp(color_info.color_format)
-                   ? 2
-                   : 1);
-      if (color_base_tiles < 0) {
-        return 0;
-      }
-    }
-  } else if (host_render_targets_used) {
+  // way. The interlock addressing is modulo the EDRAM size per access anyway,
+  // declining there would only send the draw back through the offset
+  // viewport.
+  if (host_render_targets_used) {
     // A host render target only holds one EDRAM addressing period past its
     // base, tile row kEdramTileCount / pitch is the base row again, at a
     // different column phase unless the pitch divides the tile count, and
@@ -1387,9 +1368,17 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     uint32_t dest_addressing_base = rb_copy_dest_base;
     uint32_t dest_addr_x0 = uint32_t(x0);
     uint32_t dest_addr_y0 = uint32_t(y0);
+    // The dest point is only known to be the rect origin under tiling, where
+    // the runtime passes the tile origin as both and the offset is negative.
+    // An ordinary resolve from a source origin to some other point could
+    // match the phase in the low base bits by coincidence.
     if (cvars::resolve_dest_point_from_window_offset &&
         !rb_copy_dest_info.copy_dest_array &&
-        regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+        regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
+        pa_sc_window_offset.window_x_offset <= 0 &&
+        pa_sc_window_offset.window_y_offset <= 0 &&
+        (pa_sc_window_offset.window_x_offset |
+         pa_sc_window_offset.window_y_offset) != 0) {
       int32_t dest_point_x = x0 - pa_sc_window_offset.window_x_offset;
       int32_t dest_point_y = y0 - pa_sc_window_offset.window_y_offset;
       if ((dest_point_x | dest_point_y) >= 0 &&
