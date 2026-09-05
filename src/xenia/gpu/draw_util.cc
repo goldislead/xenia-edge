@@ -813,7 +813,8 @@ void GetScissor(const RegisterFile& XE_RESTRICT regs,
 int32_t GetWindowOffsetEdramBaseBiasTiles(
     const RegisterFile& XE_RESTRICT regs,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, bool pixel_shader_reads_position) {
+    uint32_t normalized_color_mask, bool pixel_shader_reads_position,
+    bool host_render_targets_used) {
   // PsParamGen would report the unoffset position.
   if (pixel_shader_reads_position) {
     return 0;
@@ -908,6 +909,38 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
                    : 1);
       if (color_base_tiles < 0) {
         return 0;
+      }
+    }
+  } else if (host_render_targets_used) {
+    // A host render target only holds one EDRAM addressing period past its
+    // base, tile row kEdramTileCount / pitch is the base row again, at a
+    // different column phase unless the pitch divides the tile count, and
+    // there's nothing to rasterize rows past it into. A wrapped base puts
+    // the unoffset rows there, 1440x1080 4x tiled in 224 rows has 56 rows
+    // of 36 tiles in the period and the third tile draws rows 56 to 83.
+    // Unwrapped bases always stay within it since the guest's own
+    // allocation fits.
+    int32_t scissor_bottom = std::min(int32_t(pa_sc_window_scissor_br.br_y),
+                                      int32_t(pa_sc_screen_scissor_br.br_y));
+    uint32_t rows_end_tiles_at_32bpp =
+        uint32_t((std::max(scissor_bottom, int32_t(0)) + tile_height_pixels -
+                  1) /
+                 tile_height_pixels) *
+        pitch_tiles_at_32bpp;
+    if (rows_end_tiles_at_32bpp > xenos::kEdramTileCount) {
+      return 0;
+    }
+    if (rows_end_tiles_at_32bpp * 2 > xenos::kEdramTileCount) {
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        if (!(normalized_color_mask & (uint32_t(0b1111) << (4 * i)))) {
+          continue;
+        }
+        if (xenos::IsColorRenderTargetFormat64bpp(
+                regs.Get<reg::RB_COLOR_INFO>(
+                        reg::RB_COLOR_INFO::rt_register_indices[i])
+                    .color_format)) {
+          return 0;
+        }
       }
     }
   }

@@ -2620,7 +2620,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   int32_t window_offset_edram_base_bias_tiles =
       draw_util::GetWindowOffsetEdramBaseBiasTiles(
           regs, normalized_depth_control, normalized_color_mask,
-          ps_param_gen_pos != UINT32_MAX);
+          ps_param_gen_pos != UINT32_MAX,
+          render_target_cache_->GetPath() ==
+              RenderTargetCache::Path::kHostRenderTargets);
 
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done,

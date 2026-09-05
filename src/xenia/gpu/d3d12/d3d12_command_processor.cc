@@ -2719,13 +2719,16 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                 normalized_depth_control, apply_host_depth_polygon_offset)
           : DxbcShaderTranslator::Modification(0);
 
+  bool host_render_targets_used = render_target_cache_->GetPath() ==
+                                  RenderTargetCache::Path::kHostRenderTargets;
+
   // Relocate the window offset into the EDRAM bases where possible. One
   // decision for the render targets, the viewport, the scissor and the ROV
   // constants.
   int32_t window_offset_edram_base_bias_tiles =
       draw_util::GetWindowOffsetEdramBaseBiasTiles(
           regs, normalized_depth_control, normalized_color_mask,
-          ps_param_gen_pos != UINT32_MAX);
+          ps_param_gen_pos != UINT32_MAX, host_render_targets_used);
 
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done,
@@ -2750,8 +2753,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   uint32_t bound_depth_and_color_render_target_bits;
   uint32_t bound_depth_and_color_render_target_formats
       [1 + xenos::kMaxColorRenderTargets];
-  bool host_render_targets_used = render_target_cache_->GetPath() ==
-                                  RenderTargetCache::Path::kHostRenderTargets;
   if (host_render_targets_used) {
     bound_depth_and_color_render_target_bits =
         render_target_cache_->GetLastUpdateBoundRenderTargets(
