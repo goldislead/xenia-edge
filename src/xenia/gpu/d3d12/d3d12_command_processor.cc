@@ -2728,7 +2728,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   int32_t window_offset_edram_base_bias_tiles =
       draw_util::GetWindowOffsetEdramBaseBiasTiles(
           regs, normalized_depth_control, normalized_color_mask,
-          ps_param_gen_pos != UINT32_MAX, host_render_targets_used);
+          host_render_targets_used);
 
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done,
@@ -4360,6 +4360,20 @@ XE_NOINLINE void D3D12CommandProcessor::UpdateSystemConstantValues_Impl(
 
     system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
     system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+  }
+
+  // The window offset carried in the EDRAM bases rather than the geometry,
+  // PsParamGen adds it back to the unoffset position.
+  float param_gen_window_offset[2] = {0.0f, 0.0f};
+  if (window_offset_edram_base_bias_tiles) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    param_gen_window_offset[0] = float(pa_sc_window_offset.window_x_offset);
+    param_gen_window_offset[1] = float(pa_sc_window_offset.window_y_offset);
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    update_dirty_floatmask(system_constants_.param_gen_window_offset[i],
+                           param_gen_window_offset[i]);
+    system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
   }
 
   // Point size.

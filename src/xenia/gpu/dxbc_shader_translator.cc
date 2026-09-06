@@ -745,6 +745,14 @@ void DxbcShaderTranslator::StartPixelShader() {
           dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
                         1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
     }
+    // The window offset carried in the EDRAM bases rather than the geometry,
+    // the hardware gives the shader the offset position.
+    a_.OpAdd(dxbc::Dest::R(param_gen_temp, 0b0011),
+             dxbc::Src::R(param_gen_temp),
+             LoadSystemConstant(
+                 SystemConstants::Index::kParamGenWindowOffset,
+                 offsetof(SystemConstants, param_gen_window_offset),
+                 dxbc::Src::kXYXY));
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
       // (the upper bit of Z is 0).
@@ -2149,6 +2157,9 @@ constexpr DxbcShaderTranslator::SystemConstantRdef
          sizeof(float) * 2},
         {"xe_point_screen_diameter_to_ndc_radius", ShaderRdefTypeIndex::kFloat2,
          sizeof(float) * 2},
+
+        {"xe_param_gen_window_offset", ShaderRdefTypeIndex::kFloat2,
+         sizeof(float) * 2, sizeof(uint32_t) * 2},
 
         {"xe_texture_swizzled_signs", ShaderRdefTypeIndex::kUint4Array2,
          sizeof(uint32_t) * 4 * 2},

@@ -324,6 +324,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // for the host viewport.
     float point_screen_diameter_to_ndc_radius[2];
 
+    // PA_SC_WINDOW_OFFSET the PsParamGen position needs added when the offset
+    // is carried in the EDRAM bases rather than the geometry, 0 when it's in
+    // the geometry.
+    float param_gen_window_offset[2];
+    uint32_t param_gen_window_offset_padding[2];
+
     // Each byte contains post-swizzle TextureSign values for each of the needed
     // components of each of the 32 used texture fetch constants.
     uint32_t texture_swizzled_signs[8];
@@ -444,6 +450,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
       kPointConstantDiameter,
       kPointScreenDiameterToNDCRadius,
+
+      kParamGenWindowOffset,
 
       kTextureSwizzledSigns,
 

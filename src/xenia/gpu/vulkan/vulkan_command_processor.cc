@@ -2620,7 +2620,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   int32_t window_offset_edram_base_bias_tiles =
       draw_util::GetWindowOffsetEdramBaseBiasTiles(
           regs, normalized_depth_control, normalized_color_mask,
-          ps_param_gen_pos != UINT32_MAX,
           render_target_cache_->GetPath() ==
               RenderTargetCache::Path::kHostRenderTargets);
 
@@ -5054,6 +5053,20 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
       }
       user_clip_plane_write_ptr += 4;
     }
+  }
+
+  // The window offset carried in the EDRAM bases rather than the geometry,
+  // PsParamGen adds it back to the unoffset position.
+  float param_gen_window_offset[2] = {0.0f, 0.0f};
+  if (window_offset_edram_base_bias_tiles) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    param_gen_window_offset[0] = float(pa_sc_window_offset.window_x_offset);
+    param_gen_window_offset[1] = float(pa_sc_window_offset.window_y_offset);
+  }
+  for (uint32_t i = 0; i < 2; ++i) {
+    dirty |= system_constants_.param_gen_window_offset[i] !=
+             param_gen_window_offset[i];
+    system_constants_.param_gen_window_offset[i] = param_gen_window_offset[i];
   }
 
   // Point size.

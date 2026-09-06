@@ -831,8 +831,7 @@ void GetScissor(const RegisterFile& XE_RESTRICT regs,
 int32_t GetWindowOffsetEdramBaseBiasTiles(
     const RegisterFile& XE_RESTRICT regs,
     reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, bool pixel_shader_reads_position,
-    bool host_render_targets_used) {
+    uint32_t normalized_color_mask, bool host_render_targets_used) {
   if (!cvars::window_offset_relocation) {
     return 0;
   }
@@ -866,11 +865,6 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
     }
     return 0;
   };
-  // PsParamGen would see the unoffset position, the hardware gives it the
-  // tile-local one.
-  if (pixel_shader_reads_position) {
-    return decline("PsParamGen reads the position");
-  }
   // A window scissor with window_offset_disable set can't follow the
   // geometry. The screen scissor cuts the offset window scissor on the
   // hardware, GetScissor moves the cut region over the unoffset geometry.
