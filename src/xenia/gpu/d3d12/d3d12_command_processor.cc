@@ -3682,6 +3682,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    if (cvars::render_target_ownership_log) {
+      XELOGI("EDRAM frame {}", frame_current_);
+    }
 
     // Swap all readback buffers for delayed sync (one frame behind)
     for (auto& pair : readback_buffers_) {

@@ -51,6 +51,8 @@ DEFINE_bool(
     "copy coordinates.",
     "GPU");
 
+DECLARE_bool(render_target_ownership_log);
+
 namespace xe {
 namespace gpu {
 namespace draw_util {
@@ -818,9 +820,15 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
   if (!cvars::window_offset_relocation) {
     return 0;
   }
-  // PsParamGen would see the unoffset position, the hardware gives it the
-  // tile-local one.
-  if (pixel_shader_reads_position) {
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  int32_t window_y_offset = pa_sc_window_offset.window_y_offset;
+  // Only negative Y offsets relocate. Base + row * pitch + column matches the
+  // hardware only while the unoffset columns stay within the pitch, and in
+  // column tiling (534307D5, three 480-wide columns) the pitch is the tile
+  // width. Tiling replay into an allocation ahead of the bases is always
+  // negative.
+  if (!regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable ||
+      pa_sc_window_offset.window_x_offset != 0 || window_y_offset >= 0) {
     return 0;
   }
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
@@ -833,18 +841,19 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
   if (!depth_used && !normalized_color_mask) {
     return 0;
   }
-  if (!regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+  // From here on the draw would relocate, the ownership log wants to know why
+  // one doesn't.
+  auto decline = [window_y_offset](const char* reason) -> int32_t {
+    if (cvars::render_target_ownership_log) {
+      XELOGI("EDRAM window offset {} kept in the geometry, {}", window_y_offset,
+             reason);
+    }
     return 0;
-  }
-  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-  int32_t window_y_offset = pa_sc_window_offset.window_y_offset;
-  // Only negative Y offsets relocate. Base + row * pitch + column matches the
-  // hardware only while the unoffset columns stay within the pitch, and in
-  // column tiling (534307D5, three 480-wide columns) the pitch is the tile
-  // width. Tiling replay into an allocation ahead of the bases is always
-  // negative.
-  if (pa_sc_window_offset.window_x_offset != 0 || window_y_offset >= 0) {
-    return 0;
+  };
+  // PsParamGen would see the unoffset position, the hardware gives it the
+  // tile-local one.
+  if (pixel_shader_reads_position) {
+    return decline("PsParamGen reads the position");
   }
   // A window scissor with window_offset_disable set can't follow the
   // geometry, and the screen scissor is never offset by the hardware, so it
@@ -852,7 +861,7 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
   // 9 leaves it at 0...8192.
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   if (pa_sc_window_scissor_tl.window_offset_disable) {
-    return 0;
+    return decline("the window scissor doesn't follow the offset");
   }
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
@@ -865,7 +874,7 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
           int32_t(pa_sc_window_scissor_br.br_x) ||
       int32_t(pa_sc_screen_scissor_br.br_y) <
           int32_t(pa_sc_window_scissor_br.br_y)) {
-    return 0;
+    return decline("the screen scissor can't hold both window scissors");
   }
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   uint32_t pitch_pixels = rb_surface_info.surface_pitch;
@@ -879,7 +888,7 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
   int32_t tile_height_pixels =
       int32_t(xenos::kEdramTileHeightSamples >> msaa_samples_y_log2);
   if (window_y_offset % tile_height_pixels) {
-    return 0;
+    return decline("not tile-aligned");
   }
   uint32_t pitch_tiles_at_32bpp = ((pitch_pixels << msaa_samples_x_log2) +
                                    (xenos::kEdramTileWidthSamples - 1)) /
@@ -907,7 +916,7 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
                  tile_height_pixels) *
         pitch_tiles_at_32bpp;
     if (rows_end_tiles_at_32bpp > xenos::kEdramTileCount) {
-      return 0;
+      return decline("past the host render target's period");
     }
     if (rows_end_tiles_at_32bpp * 2 > xenos::kEdramTileCount) {
       for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
@@ -918,7 +927,7 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
                 regs.Get<reg::RB_COLOR_INFO>(
                         reg::RB_COLOR_INFO::rt_register_indices[i])
                     .color_format)) {
-          return 0;
+          return decline("past the host render target's period at 64bpp");
         }
       }
     }

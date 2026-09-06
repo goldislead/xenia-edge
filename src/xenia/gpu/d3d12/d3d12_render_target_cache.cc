@@ -1551,6 +1551,19 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         if (clear_depth) {
           draw_util::ResolveClearShaderConstants depth_clear_constants;
           resolve_info.GetDepthClearShaderConstants(depth_clear_constants);
+          if (cvars::render_target_ownership_log) {
+            XELOGI(
+                "EDRAM ROV resolve clear: depth tiles base {}, offset {},{} "
+                "size {}x{}, value {:08X}",
+                resolve_info.depth_edram_info.base_tiles,
+                uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8)
+                    << 3,
+                uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8)
+                    << 3,
+                uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
+                uint32_t(resolve_info.height_div_8) << 3,
+                resolve_info.rb_depth_clear);
+          }
           command_list.D3DSetComputeRoot32BitConstants(
               0, sizeof(depth_clear_constants) / sizeof(uint32_t),
               &depth_clear_constants, 0);
@@ -1563,6 +1576,19 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
         if (clear_color) {
           draw_util::ResolveClearShaderConstants color_clear_constants;
           resolve_info.GetColorClearShaderConstants(color_clear_constants);
+          if (cvars::render_target_ownership_log) {
+            XELOGI(
+                "EDRAM ROV resolve clear: color tiles base {}, offset {},{} "
+                "size {}x{}, value {:08X} lo {:08X}",
+                resolve_info.color_edram_info.base_tiles,
+                uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8)
+                    << 3,
+                uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8)
+                    << 3,
+                uint32_t(resolve_info.coordinate_info.width_div_8) << 3,
+                uint32_t(resolve_info.height_div_8) << 3,
+                resolve_info.rb_color_clear, resolve_info.rb_color_clear_lo);
+          }
           if (clear_depth) {
             // Non-RT-specific constants have already been set.
             command_list.D3DSetComputeRoot32BitConstants(
@@ -4550,6 +4576,13 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       assert_not_zero(transfer_rectangle_count);
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
+        if (cvars::render_target_ownership_log) {
+          XELOGI("EDRAM host depth store: {} rect {},{} size {}x{}",
+                 dest_rt_key.GetDebugName(), transfer_rectangles[j].x_pixels,
+                 transfer_rectangles[j].y_pixels,
+                 transfer_rectangles[j].width_pixels,
+                 transfer_rectangles[j].height_pixels);
+        }
         uint32_t group_count_x, group_count_y;
         GetHostDepthStoreRectangleInfo(
             transfer_rectangles[j], dest_rt_key.msaa_samples,
@@ -5012,6 +5045,22 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         auto* host_depth_source_d3d12_rt =
             static_cast<D3D12RenderTarget*>(it->transfer.host_depth_source);
         TransferShaderKey transfer_shader_key = it->shader_key;
+        if (cvars::render_target_ownership_log) {
+          XELOGI(
+              "EDRAM transfer: tiles [{}, {}) {} -> {}, mode {}{}{}{}",
+              transfer_invocation_first.transfer.start_tiles,
+              it->transfer.end_tiles, source_d3d12_rt.key().GetDebugName(),
+              dest_rt_key.GetDebugName(), uint32_t(transfer_shader_key.mode),
+              host_depth_source_d3d12_rt
+                  ? (host_depth_source_d3d12_rt == &dest_d3d12_rt
+                         ? std::string(", host depth from own copy")
+                         : ", host depth from " + host_depth_source_d3d12_rt
+                                                      ->key()
+                                                      .GetDebugName())
+                  : std::string(),
+              resolve_clear_rectangle ? ", around a resolve clear" : "",
+              it != it_merged_first ? ", merged sources" : "");
+        }
         const TransferModeInfo& transfer_mode_info =
             kTransferModes[size_t(transfer_shader_key.mode)];
         TransferRootSignatureIndex transfer_root_signature_index =
@@ -5347,6 +5396,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
             break;
         }
+        if (cvars::render_target_ownership_log) {
+          XELOGI("EDRAM clear: {} rect {},{} to {},{}, depth {} stencil {}",
+                 dest_rt_key.GetDebugName(), clear_rect.left, clear_rect.top,
+                 clear_rect.right, clear_rect.bottom, depth_host_clear_value,
+                 uint32_t(clear_value) & 0xFF);
+        }
         // Depth clears take the pattern of the future rendering.
         command_processor_.UpdateSamplePositions(dest_rt_key.msaa_samples,
                                                  true);
@@ -5436,6 +5491,12 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               clear_via_drawing = true;
             }
           } break;
+        }
+        if (cvars::render_target_ownership_log) {
+          XELOGI("EDRAM clear: {} rect {},{} to {},{}, color {:X}{}",
+                 dest_rt_key.GetDebugName(), clear_rect.left, clear_rect.top,
+                 clear_rect.right, clear_rect.bottom, clear_value,
+                 clear_via_drawing ? " via drawing" : "");
         }
         command_processor_.PushTransitionBarrier(
             dest_d3d12_rt.resource(),
@@ -6494,6 +6555,14 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& d3d12_rt = *static_cast<D3D12RenderTarget*>(rectangle.render_target);
+    if (cvars::render_target_ownership_log) {
+      XELOGI(
+          "EDRAM dump for resolve: {} tile rows {}+{}, first row start {}, "
+          "last row end {}, dump range {}+{}x{} pitch {}",
+          d3d12_rt.key().GetDebugName(), rectangle.row_first, rectangle.rows,
+          rectangle.row_first_start, rectangle.row_last_end, dump_base,
+          dump_rows, dump_row_length_used, dump_pitch);
+    }
     if (d3d12_rt.key().is_depth &&
         d3d12_rt.key().msaa_samples != xenos::MsaaSamples::k1X) {
       // Leaving the depth-stencil state under the pattern the contents were
@@ -6663,6 +6732,14 @@ void D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base,
         dispatch_first_tile += xenos::kEdramTileCount;
       }
       offsets.dispatch_first_tile = dispatch_first_tile;
+      if (cvars::render_target_ownership_log) {
+        XELOGI("EDRAM dump dispatch: {} tiles {}+{}x{} from tile row {}",
+               rt_key.GetDebugName(),
+               (dump_base + dispatch.offset) & (xenos::kEdramTileCount - 1),
+               dispatch.width_tiles, dispatch.height_tiles,
+               (dispatch_first_tile - rt_key.base_tiles) /
+                   rt_key.GetPitchTiles());
+      }
       if (last_offsets != offsets) {
         last_offsets = offsets;
         root_parameters_set &= ~kDumpRootParameterOffsetsBit;

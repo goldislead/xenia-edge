@@ -36,6 +36,7 @@ DECLARE_bool(draw_resolution_scaled_texture_offsets);
 DECLARE_bool(gamma_render_target_as_unorm16);
 DECLARE_bool(native_stencil_value_output);
 DECLARE_bool(snorm16_render_target_full_range);
+DECLARE_bool(render_target_ownership_log);
 
 namespace xe {
 namespace gpu {

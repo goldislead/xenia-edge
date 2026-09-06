@@ -206,6 +206,10 @@ DEFINE_bool(
     "If this is enabled, excessive barriers may be eliminated when switching "
     "between different render targets in separate EDRAM locations.",
     "GPU.Debug");
+DEFINE_bool(
+    render_target_ownership_log, false,
+    "Very verbose.",
+    "GPU");
 
 namespace xe {
 namespace gpu {
@@ -935,6 +939,28 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
   }
 
+  if (cvars::render_target_ownership_log &&
+      window_offset_edram_base_bias_tiles) {
+    // What each claim covers, the estimated extent decides whether the rows
+    // the draw touches are owned at all.
+    std::string log_claims;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const std::pair<uint32_t, uint32_t>& rt_base_index =
+          edram_bases_sorted[i];
+      log_claims += ' ';
+      log_claims += rt_keys[rt_base_index.second].GetDebugName();
+      log_claims += " tiles ";
+      log_claims += std::to_string((rt_base_index.first + rt_starts_tiles[i]) &
+                                   (xenos::kEdramTileCount - 1));
+      log_claims += '+';
+      log_claims += std::to_string(rt_lengths_tiles[i] - rt_starts_tiles[i]);
+    }
+    XELOGI("EDRAM relocated draw: offset {} tiles, tile rows {} to {},{}",
+           window_offset_edram_base_bias_tiles,
+           start_used_tiles_at_32bpp / pitch_tiles_at_32bpp,
+           length_used_tiles_at_32bpp / pitch_tiles_at_32bpp, log_claims);
+  }
+
   if (interlock_barrier_only) {
     // Because a full pixel shader interlock barrier may clear the ownership map
     // (since it flushes all previous writes, and there's no need for another
@@ -1442,6 +1468,22 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     return false;
   }
 
+  if (cvars::render_target_ownership_log) {
+    XELOGI(
+        "EDRAM resolve clear: rect {},{} size {}x{}, depth {} tiles {}+{} "
+        "len {}, color {} tiles {}+{} len {}",
+        clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+        clear_rectangle.width_pixels, clear_rectangle.height_pixels,
+        depth_render_target ? depth_render_target_key.GetDebugName()
+                            : std::string("(none)"),
+        resolve_info.depth_original_base,
+        depth_clear_start_tiles_base_relative, depth_clear_length_tiles,
+        color_render_target ? color_render_target_key.GetDebugName()
+                            : std::string("(none)"),
+        resolve_info.color_original_base,
+        color_clear_start_tiles_base_relative, color_clear_length_tiles);
+  }
+
   clear_rectangle_out = clear_rectangle;
   depth_render_target_out = depth_render_target;
   depth_transfers_out.clear();
@@ -1743,6 +1785,22 @@ void RenderTargetCache::ChangeOwnership(
             }
           }
         }
+      }
+      if (cvars::render_target_ownership_log) {
+        RenderTargetKey log_host_depth_key =
+            it->second.host_depth_render_target_float24.IsEmpty()
+                ? it->second.host_depth_render_target_unorm24
+                : it->second.host_depth_render_target_float24;
+        XELOGI(
+            "EDRAM ownership: tiles [{}, {}) -> {}, was {}, host depth {}{}",
+            it->first, std::min(it->second.end_tiles, extent_end),
+            dest.GetDebugName(),
+            it->second.render_target.IsEmpty()
+                ? std::string("(none)")
+                : it->second.render_target.GetDebugName(),
+            log_host_depth_key.IsEmpty() ? std::string("(none)")
+                                         : log_host_depth_key.GetDebugName(),
+            resolve_clear_cutout ? ", within a resolve clear" : "");
       }
       // Claim the current range.
       it->second.render_target = dest;
