@@ -476,8 +476,9 @@ struct alignas(16) Scissor {
   uint32_t extent[2];
 };
 
-// window_offset_in_edram_bases skips the PA_SC_WINDOW_OFFSET addition, the
-// scissor selects the unoffset region the geometry is rasterized in.
+// With window_offset_in_edram_bases the geometry is unoffset, the region the
+// hardware rasterizes (the window scissor offset and cut by the screen
+// scissor) is moved back over it.
 void GetScissor(const RegisterFile& XE_RESTRICT regs,
                 Scissor& XE_RESTRICT scissor_out,
                 bool clamp_to_surface_pitch = true,

@@ -631,11 +631,6 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-  if (window_offset_in_edram_bases) {
-    // The offset is in the EDRAM bases, the scissor stays unoffset like the
-    // geometry.
-    pa_sc_window_offset.value = 0;
-  }
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
@@ -712,6 +707,15 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
 
   tmp1 = _mm_max_epi32(tmp1, _mm_setzero_si128());
 
+  if (window_offset_in_edram_bases) {
+    // The offset is in the EDRAM bases and the geometry is unoffset, move the
+    // region the hardware rasterizes back over it. The screen scissor cuts
+    // the offset window scissor, a one-pass Z pass records its window scissor
+    // without the tile intersection and lets the offset push the top below
+    // zero.
+    tmp1 = _mm_sub_epi32(tmp1, addend);
+  }
+
   __m128i tl_in_high = _mm_unpacklo_epi64(tmp1, tmp1);
 
   __m128i final_br = _mm_max_epi32(tmp1, tl_in_high);
@@ -722,9 +726,6 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
   auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-  if (window_offset_in_edram_bases) {
-    pa_sc_window_offset.value = 0;
-  }
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
@@ -758,11 +759,15 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   int32_t window_offset_disable_mask =
       ~(static_cast<int32_t>(pa_sc_window_scissor_tl.value) >> 31);
   // if (!pa_sc_window_scissor_tl.window_offset_disable) {
+  int32_t window_x_offset_applied =
+      int32_t(pa_sc_window_offset_window_x_offset & window_offset_disable_mask);
+  int32_t window_y_offset_applied =
+      int32_t(pa_sc_window_offset_window_y_offset & window_offset_disable_mask);
 
-  tl_x += pa_sc_window_offset_window_x_offset & window_offset_disable_mask;
-  tl_y += pa_sc_window_offset_window_y_offset & window_offset_disable_mask;
-  br_x += pa_sc_window_offset_window_x_offset & window_offset_disable_mask;
-  br_y += pa_sc_window_offset_window_y_offset & window_offset_disable_mask;
+  tl_x += window_x_offset_applied;
+  tl_y += window_y_offset_applied;
+  br_x += window_x_offset_applied;
+  br_y += window_y_offset_applied;
   //}
   // Screen scissor is not used by Direct3D 9 (always 0, 0 to 8192, 8192), but
   // still handled here for completeness.
@@ -793,6 +798,17 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   tl_y = std::max(tl_y, int32_t(0));
   br_x = std::max(br_x, tl_x);
   br_y = std::max(br_y, tl_y);
+  if (window_offset_in_edram_bases) {
+    // The offset is in the EDRAM bases and the geometry is unoffset, move the
+    // region the hardware rasterizes back over it. The screen scissor cuts
+    // the offset window scissor, a one-pass Z pass records its window scissor
+    // without the tile intersection and lets the offset push the top below
+    // zero.
+    tl_x -= window_x_offset_applied;
+    tl_y -= window_y_offset_applied;
+    br_x -= window_x_offset_applied;
+    br_y -= window_y_offset_applied;
+  }
   scissor_out.offset[0] = uint32_t(tl_x);
   scissor_out.offset[1] = uint32_t(tl_y);
   scissor_out.extent[0] = uint32_t(br_x - tl_x);
@@ -856,25 +872,10 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
     return decline("PsParamGen reads the position");
   }
   // A window scissor with window_offset_disable set can't follow the
-  // geometry, and the screen scissor is never offset by the hardware, so it
-  // has to contain both the offset and the unoffset window scissor. Direct3D
-  // 9 leaves it at 0...8192.
-  auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
-  if (pa_sc_window_scissor_tl.window_offset_disable) {
+  // geometry. The screen scissor cuts the offset window scissor on the
+  // hardware, GetScissor moves the cut region over the unoffset geometry.
+  if (regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>().window_offset_disable) {
     return decline("the window scissor doesn't follow the offset");
-  }
-  auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
-  auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
-  auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
-  if (int32_t(pa_sc_screen_scissor_tl.tl_x) >
-          int32_t(pa_sc_window_scissor_tl.tl_x) ||
-      int32_t(pa_sc_screen_scissor_tl.tl_y) >
-          int32_t(pa_sc_window_scissor_tl.tl_y) + window_y_offset ||
-      int32_t(pa_sc_screen_scissor_br.br_x) <
-          int32_t(pa_sc_window_scissor_br.br_x) ||
-      int32_t(pa_sc_screen_scissor_br.br_y) <
-          int32_t(pa_sc_window_scissor_br.br_y)) {
-    return decline("the screen scissor can't hold both window scissors");
   }
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   uint32_t pitch_pixels = rb_surface_info.surface_pitch;
@@ -908,8 +909,10 @@ int32_t GetWindowOffsetEdramBaseBiasTiles(
     // there, 1440x1080 4x tiled in 224 rows has 56 rows of 36 tiles per
     // period and its third tile draws rows 56 to 83. An unwrapped base never
     // does, the guest's own allocation fits.
-    int32_t scissor_bottom = std::min(int32_t(pa_sc_window_scissor_br.br_y),
-                                      int32_t(pa_sc_screen_scissor_br.br_y));
+    int32_t scissor_bottom =
+        std::min(int32_t(regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>().br_y),
+                 int32_t(regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>().br_y) -
+                     window_y_offset);
     uint32_t rows_end_tiles_at_32bpp =
         uint32_t((std::max(scissor_bottom, int32_t(0)) + tile_height_pixels -
                   1) /
