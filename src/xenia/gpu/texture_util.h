@@ -37,19 +37,48 @@ void GetSubresourcesFromFetchConstant(
     uint32_t* base_page_out, uint32_t* mip_page_out,
     uint32_t* mip_min_level_out, uint32_t* mip_max_level_out);
 
+// A bordered texture stores one extra texel on each side of every level along
+// each axis its dimension has, around the size given in the fetch constant.
+// Returns the border size along each axis, 0 or 1.
+inline void GetBorderSizes(xenos::DataDimension dimension, bool has_border,
+                           uint32_t& x_out, uint32_t& y_out, uint32_t& z_out) {
+  x_out = 0;
+  y_out = 0;
+  z_out = 0;
+  if (!has_border) {
+    return;
+  }
+  switch (dimension) {
+    case xenos::DataDimension::k3D:
+      z_out = 1;
+      [[fallthrough]];
+    case xenos::DataDimension::k2DOrStacked:
+    case xenos::DataDimension::kCube:
+      y_out = 1;
+      [[fallthrough]];
+    case xenos::DataDimension::k1D:
+      x_out = 1;
+      break;
+  }
+}
+
 // Gets the number of the mipmap level where the packed mips are stored.
-inline uint32_t GetPackedMipLevel(uint32_t width, uint32_t height) {
-  uint32_t log2_size = xe::log2_ceil(std::min(width, height));
+// The border doubles the stored size of every level.
+inline uint32_t GetPackedMipLevel(uint32_t width, uint32_t height,
+                                  bool has_border) {
+  uint32_t log2_size =
+      xe::log2_ceil(std::min(width, height)) + uint32_t(has_border);
   return log2_size > 4 ? log2_size - 4 : 0;
 }
 
 // Gets the offset of the mipmap within the tail in blocks, or zeros (and
 // returns false) if the mip level is not packed. Width, height and depth are in
-// texels. For non-3D textures, set depth to 1.
+// texels, without the border. For non-3D textures, set depth to 1.
 // The offset is always within the dimensions of the image rounded to 32.
-bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
-                        xenos::TextureFormat format, uint32_t mip,
-                        uint32_t& x_blocks, uint32_t& y_blocks,
+bool GetPackedMipOffset(xenos::DataDimension dimension, uint32_t width,
+                        uint32_t height, uint32_t depth,
+                        xenos::TextureFormat format, bool has_border,
+                        uint32_t mip, uint32_t& x_blocks, uint32_t& y_blocks,
                         uint32_t& z_blocks);
 
 // Both tiled and linear textures, as it appears from Direct3D 9 texture
@@ -135,6 +164,12 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
 // 10+ builds subresource indices, for instance). Each array slice or level is
 // aligned to 4 KB (but this doesn't apply to 3D texture slices within one
 // level).
+//
+// A bordered texture stores each level with a one-texel border around the size
+// in the fetch constant, along each axis its dimension has. The border doubles
+// the rounded size the mips and the packed tail are laid out with - Direct3D
+// takes log2 of the size without the border and adds one to it - so a bordered
+// 200 wide texture is stored 512 wide below the base, as is a bordered 256.
 
 struct TextureGuestLayout {
   struct Level {
@@ -192,7 +227,7 @@ TextureGuestLayout GetGuestTextureLayout(
     xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32,
     uint32_t width_texels, uint32_t height_texels, uint32_t depth_or_array_size,
     bool is_tiled, xenos::TextureFormat format, bool has_packed_levels,
-    bool has_base, uint32_t max_level);
+    bool has_border, bool has_base, uint32_t max_level);
 
 // Returns the total size of memory the texture uses starting from its base and
 // mip addresses, in bytes (both are optional).

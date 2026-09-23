@@ -202,8 +202,9 @@ class TextureCache {
 
     // Whether this texture is a resolution-scaled resolve target.
     uint32_t scaled_resolve : 1;  // 97
+    uint32_t border_size : 1;     // 98
     // Least important in ==, so placed last.
-    uint32_t is_valid : 1;  // 98
+    uint32_t is_valid : 1;  // 99
 
     TextureKey() { MakeInvalid(); }
     TextureKey(const TextureKey&) = default;
@@ -239,7 +240,8 @@ class TextureCache {
     texture_util::TextureGuestLayout GetGuestLayout() const {
       return texture_util::GetGuestTextureLayout(
           dimension, pitch, GetWidth(), GetHeight(), GetDepthOrArraySize(),
-          tiled, format, packed_mips, base_page != 0, mip_max_level);
+          tiled, format, packed_mips, border_size, base_page != 0,
+          mip_max_level);
     }
 
     static const char* GetLogDimensionName(xenos::DataDimension dimension);

@@ -80,7 +80,8 @@ void GetSubresourcesFromFetchConstant(
   // The rest of the tail is stored at the base address too.
   if (mip_page == 0 && base_page != 0 && fetch.packed_mips &&
       fetch.dimension != xenos::DataDimension::k1D &&
-      GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1) == 0) {
+      GetPackedMipLevel(width_minus_1 + 1, height_minus_1 + 1,
+                        fetch.border_size) == 0) {
     mip_page = base_page;
   }
 
@@ -121,9 +122,10 @@ void GetSubresourcesFromFetchConstant(
   }
 }
 
-bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
-                        xenos::TextureFormat format, uint32_t mip,
-                        uint32_t& x_blocks, uint32_t& y_blocks,
+bool GetPackedMipOffset(xenos::DataDimension dimension, uint32_t width,
+                        uint32_t height, uint32_t depth,
+                        xenos::TextureFormat format, bool has_border,
+                        uint32_t mip, uint32_t& x_blocks, uint32_t& y_blocks,
                         uint32_t& z_blocks) {
   // Tile size is 32x32, and once textures go <=16 they are packed into a
   // single tile together. The math here is insane. Most sourced from
@@ -157,8 +159,11 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
   // The minimum dimension is what matters most: if either width or height
   // is <= 16 this mode kicks in.
 
-  uint32_t log2_width = xe::log2_ceil(width);
-  uint32_t log2_height = xe::log2_ceil(height);
+  // The border doubles every stored level, another power-of-two.
+  uint32_t border_x, border_y, border_z;
+  GetBorderSizes(dimension, has_border, border_x, border_y, border_z);
+  uint32_t log2_width = xe::log2_ceil(width) + border_x;
+  uint32_t log2_height = xe::log2_ceil(height) + border_y;
   uint32_t log2_size = std::min(log2_width, log2_height);
   if (log2_size > 4 + mip) {
     // The shortest dimension is bigger than 16, not packed.
@@ -197,7 +202,7 @@ bool GetPackedMipOffset(uint32_t width, uint32_t height, uint32_t depth,
     }
     if (offset < 4) {
       // Pack 1x1 Z mipmaps along Z - not reached for 2D.
-      uint32_t log2_depth = xe::log2_ceil(depth);
+      uint32_t log2_depth = xe::log2_ceil(depth) + border_z;
       if (log2_depth > 1 + mip) {
         z_blocks = (log2_depth - mip) * 4;
       } else {
@@ -217,7 +222,7 @@ TextureGuestLayout GetGuestTextureLayout(
     xenos::DataDimension dimension, uint32_t base_pitch_texels_div_32,
     uint32_t width_texels, uint32_t height_texels, uint32_t depth_or_array_size,
     bool is_tiled, xenos::TextureFormat format, bool has_packed_levels,
-    bool has_base, uint32_t max_level) {
+    bool has_border, bool has_base, uint32_t max_level) {
   TextureGuestLayout layout;
 
   if (dimension == xenos::DataDimension::k1D) {
@@ -264,9 +269,18 @@ TextureGuestLayout GetGuestTextureLayout(
   max_level = std::min(max_level, max_level_for_dimensions);
   layout.max_level = max_level;
 
-  layout.packed_level = has_packed_levels
-                            ? GetPackedMipLevel(width_texels, height_texels)
-                            : UINT32_MAX;
+  layout.packed_level =
+      has_packed_levels
+          ? GetPackedMipLevel(width_texels, height_texels, has_border)
+          : UINT32_MAX;
+
+  // The border is one texel on each side of every level, and doubles the
+  // rounded size the mips are laid out with.
+  uint32_t border_x, border_y, border_z;
+  GetBorderSizes(dimension, has_border, border_x, border_y, border_z);
+  uint32_t width_pow2_texels = xe::next_pow2(width_texels) << border_x;
+  uint32_t height_pow2_texels = xe::next_pow2(height_texels) << border_y;
+  uint32_t depth_pow2 = xe::next_pow2(depth) << border_z;
 
   // Clear unused level layouts to zero strides/sizes.
   if (!has_base) {
@@ -332,13 +346,13 @@ TextureGuestLayout GetGuestTextureLayout(
       row_pitch_texels_unaligned = base_pitch_texels_div_32 << 5;
       // Level 0 packed tails use power-of-two dimensions like the other mips.
       z_slice_stride_texel_rows_unaligned = layout.packed_level == 0
-                                                ? xe::next_pow2(height_texels)
-                                                : height_texels;
+                                                ? height_pow2_texels
+                                                : height_texels + 2 * border_y;
     } else {
       row_pitch_texels_unaligned =
-          std::max(xe::next_pow2(width_texels) >> level, uint32_t(1));
+          std::max(width_pow2_texels >> level, uint32_t(1));
       z_slice_stride_texel_rows_unaligned =
-          std::max(xe::next_pow2(height_texels) >> level, uint32_t(1));
+          std::max(height_pow2_texels >> level, uint32_t(1));
     }
     uint32_t row_pitch_blocks_alignment = xenos::kTextureTileWidthHeight;
     if (!is_tiled && !is_base) {
@@ -365,8 +379,8 @@ TextureGuestLayout GetGuestTextureLayout(
     if (dimension == xenos::DataDimension::k3D) {
       level_layout.array_slice_stride_bytes *=
           xe::align(is_base && layout.packed_level != 0
-                        ? depth
-                        : std::max(xe::next_pow2(depth) >> level, uint32_t(1)),
+                        ? depth + 2 * border_z
+                        : std::max(depth_pow2 >> level, uint32_t(1)),
                     xenos::kTextureTileDepth);
     }
     level_layout.array_slice_stride_bytes =
@@ -399,38 +413,43 @@ TextureGuestLayout GetGuestTextureLayout(
         uint32_t packed_sublevel_x_blocks;
         uint32_t packed_sublevel_y_blocks;
         uint32_t packed_sublevel_z;
-        GetPackedMipOffset(width_texels, height_texels, depth, format,
-                           packed_sublevel, packed_sublevel_x_blocks,
-                           packed_sublevel_y_blocks, packed_sublevel_z);
+        GetPackedMipOffset(dimension, width_texels, height_texels, depth,
+                           format, has_border, packed_sublevel,
+                           packed_sublevel_x_blocks, packed_sublevel_y_blocks,
+                           packed_sublevel_z);
         level_layout.x_extent_blocks = std::max(
             level_layout.x_extent_blocks,
             packed_sublevel_x_blocks +
                 xe::align(
-                    std::max(width_texels >> packed_sublevel, uint32_t(1)),
+                    std::max(width_texels >> packed_sublevel, uint32_t(1)) +
+                        2 * border_x,
                     format_info->block_width) /
                     format_info->block_width);
         level_layout.y_extent_blocks = std::max(
             level_layout.y_extent_blocks,
             packed_sublevel_y_blocks +
                 xe::align(
-                    std::max(height_texels >> packed_sublevel, uint32_t(1)),
+                    std::max(height_texels >> packed_sublevel, uint32_t(1)) +
+                        2 * border_y,
                     format_info->block_height) /
                     format_info->block_height);
-        level_layout.z_extent =
-            std::max(level_layout.z_extent,
-                     packed_sublevel_z +
-                         std::max(depth >> packed_sublevel, uint32_t(1)));
+        level_layout.z_extent = std::max(
+            level_layout.z_extent,
+            packed_sublevel_z +
+                std::max(depth >> packed_sublevel, uint32_t(1)) + 2 * border_z);
       }
     } else {
       level_layout.x_extent_blocks =
-          xe::align(std::max(width_texels >> level, uint32_t(1)),
+          xe::align(std::max(width_texels >> level, uint32_t(1)) + 2 * border_x,
                     format_info->block_width) /
           format_info->block_width;
       level_layout.y_extent_blocks =
-          xe::align(std::max(height_texels >> level, uint32_t(1)),
-                    format_info->block_height) /
+          xe::align(
+              std::max(height_texels >> level, uint32_t(1)) + 2 * border_y,
+              format_info->block_height) /
           format_info->block_height;
-      level_layout.z_extent = std::max(depth >> level, uint32_t(1));
+      level_layout.z_extent =
+          std::max(depth >> level, uint32_t(1)) + 2 * border_z;
     }
     if (is_tiled) {
       uint32_t bytes_per_block_log2 = xe::log2_floor(bytes_per_block);
