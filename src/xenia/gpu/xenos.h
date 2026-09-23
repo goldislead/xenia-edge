@@ -1010,6 +1010,10 @@ enum class EdramMode : uint32_t {
 // of the register) that it exists purely to be able to go between 3D texture
 // slices.
 //
+// Later D3D uses copy_dest_height for the bottom of the level in surface
+// coordinates. For volume resolves it also writes pitch * level height in
+// blocks to RB_COPY_SURFACE_SLICE.
+//
 // Window scissor must also be applied - in the jigsaw puzzle in 58410955, there
 // are 1280x720 resolve rectangles, but only the scissored 1280x256 needs to be
 // copied, otherwise it overflows even beyond the EDRAM, and the depth buffer is
