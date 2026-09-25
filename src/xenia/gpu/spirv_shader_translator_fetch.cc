@@ -689,6 +689,21 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             ? xenos::FetchOpDimension::k2D
             : instr.dimension;
 
+    // The guest truncates coordinates, so a point sampled fetch returns
+    // floor(coord * size) and agrees with a frac(coord * size) the shader
+    // computes itself (virtual texture page tables, index maps). The host
+    // rounds, and the epsilon below pushes a 1.5/1024 texel band onto the next
+    // texel. Point sampled 2D fetches drop the epsilon and snap to the texel
+    // center instead, which holds under any host rounding and for point mip
+    // selection on power-of-two levels. Bit 26 of the integer scale bits says
+    // the fetch constant is point sampled.
+    bool point_snap = instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+                      instr.dimension == xenos::FetchOpDimension::k2D &&
+                      coordinate_dimension == xenos::FetchOpDimension::k2D &&
+                      !instr.attributes.unnormalized_coordinates &&
+                      instr.MayBePointSampled(use_computed_lod);
+    constexpr float kRoundingEpsilon = 1.5f / 1024.0f;
+
     spv::Id sampler = spv::NoResult;
     spv::Id image_2d_array_or_cube_unsigned = spv::NoResult;
     spv::Id image_2d_array_or_cube_signed = spv::NoResult;
@@ -798,7 +813,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // multiplication in texture sampling apparently round differently, so
       // `mul` gives a value that would be floored as expected, but the
       // left/upper pixel is still sampled instead.
-      constexpr float kRoundingOffset = 1.5f / 1024.0f;
+      const float kRoundingOffset = point_snap ? 0.0f : kRoundingEpsilon;
       switch (coordinate_dimension) {
         case xenos::FetchOpDimension::k1D:
           offset_values[0] = instr.attributes.offset_x + kRoundingOffset;
@@ -905,7 +920,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // A tfetch1D promoted by its source swizzle may still use a 1D fetch
           // constant. Its size interpretation is selected below at runtime.
           if (instr.dimension == xenos::FetchOpDimension::k1D ||
-              instr.attributes.unnormalized_coordinates) {
+              instr.attributes.unnormalized_coordinates || point_snap) {
             size_needed_components |= 0b0011;
           }
           break;
@@ -2056,6 +2071,59 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
+        if (point_snap) {
+          // Texel center snap, after the gradients so the LOD is unaffected.
+          // Resolution-scaled textures have a finer host grid where the guest
+          // texel center sits on a host texel edge, skip them.
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(
+              kSystemConstantTextureIntegerScaleBits));
+          id_vector_temp_.push_back(
+              builder_->makeIntConstant(int32_t(fetch_constant_index >> 2)));
+          id_vector_temp_.push_back(
+              builder_->makeIntConstant(int32_t(fetch_constant_index & 3)));
+          spv::Id point_snap_bits = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassUniform,
+                                          uniform_system_constants_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          spv::Id point_snap_active = builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, point_snap_bits,
+                  builder_->makeUintConstant(UINT32_C(1) << 26)),
+              const_uint_0_);
+          if (is_texture_resolved != spv::NoResult) {
+            point_snap_active = builder_->createBinOp(
+                spv::OpLogicalAnd, type_bool_, point_snap_active,
+                builder_->createUnaryOp(spv::OpLogicalNot, type_bool_,
+                                        is_texture_resolved));
+          }
+          spv::Id point_snap_half = builder_->makeFloatConstant(0.5f);
+          spv::Id point_snap_epsilon =
+              builder_->makeFloatConstant(kRoundingEpsilon);
+          for (uint32_t i = 0; i < 2; ++i) {
+            assert_true(size[i] != spv::NoResult);
+            spv::Id snapped = builder_->createNoContractionBinOp(
+                spv::OpFMul, type_float_, coordinates[i], size[i]);
+            snapped = builder_->createUnaryBuiltinCall(
+                type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor, snapped);
+            snapped = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, snapped, point_snap_half);
+            snapped = builder_->createNoContractionBinOp(
+                spv::OpFDiv, type_float_, snapped, size[i]);
+            // Filtered, or point through an instruction override, keeps the
+            // epsilon.
+            spv::Id unsnapped = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float_, coordinates[i],
+                builder_->createNoContractionBinOp(
+                    spv::OpFDiv, type_float_, point_snap_epsilon, size[i]));
+            coordinates[i] =
+                builder_->createTriOp(spv::OpSelect, type_float_,
+                                      point_snap_active, snapped, unsnapped);
+          }
+        }
+
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
             use_lod_bias ? spv::ImageOperandsBiasMask
@@ -2565,8 +2633,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         {
           // Uniform early out. Zero means leave the sample alone. Only integer
           // num_format on fixed textures has scale bits.
+          // Bit 26 is the coordinate snap, not a scale.
           spv::Id integer_scale_active = builder_->createBinOp(
-              spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                  builder_->makeUintConstant((UINT32_C(1) << 26) - 1)),
               builder_->makeUintConstant(0));
           SpirvBuilder::IfBuilder if_integer_scale(
               integer_scale_active, spv::SelectionControlMaskNone, *builder_);
@@ -2580,15 +2652,102 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 builder_->makeUintConstant(0));
             SpirvBuilder::IfBuilder if_normalized(
                 normalized, spv::SelectionControlMaskNone, *builder_);
-            spv::Id normalized_result = builder_->createNoContractionBinOp(
-                spv::OpVectorTimesScalar, type_float4_, integer_scale_result,
-                builder_->makeFloatConstant(65536.0f));
-            normalized_result = builder_->createUnaryBuiltinCall(
-                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
-                normalized_result);
-            normalized_result = builder_->createNoContractionBinOp(
-                spv::OpVectorTimesScalar, type_float4_, normalized_result,
-                builder_->makeFloatConstant(1.0f / 65536.0f));
+            // A point-sampled texel lands on the guest's conversion grid
+            // whatever the host's decode precision is. The guest converts a
+            // w-bit texel n as n * (2^w + 1) / 2^(2w), replicated once into 2w
+            // bits over a power of two, not n / (2^w - 1): 425307EC multiplies
+            // 5, 6 and 8 bit page table texels by 1024/33, 4096/65 and
+            // 65536/257 and floors or exponentiates the result. Lanes under 4
+            // bits keep n / (2^w - 1). Bit 25 says the fetch constant is
+            // point sampled.
+            bool snap_to_grid = instr.MayBePointSampled(use_computed_lod);
+            auto emit_snap_to_grid = [&]() -> spv::Id {
+              // Per-lane 2^width, with width - 1 in bits 0:3 of each 6-bit
+              // lane field (only unsigned lanes get here).
+              id_vector_temp_.clear();
+              for (uint32_t i = 0; i < 4; ++i) {
+                id_vector_temp_.push_back(builder_->makeUintConstant(i * 6));
+              }
+              spv::Id width = builder_->createBinOp(
+                  spv::OpShiftRightLogical, type_uint4_,
+                  builder_->smearScalar(spv::NoPrecision,
+                                        integer_scale_bits_packed, type_uint4_),
+                  builder_->makeCompositeConstant(type_uint4_,
+                                                  id_vector_temp_));
+              spv::Id snap_const_uint4_1 = builder_->smearScalar(
+                  spv::NoPrecision, builder_->makeUintConstant(1), type_uint4_);
+              width = builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint4_, width,
+                  builder_->smearScalar(spv::NoPrecision,
+                                        builder_->makeUintConstant(0xF),
+                                        type_uint4_));
+              width = builder_->createBinOp(spv::OpIAdd, type_uint4_, width,
+                                            snap_const_uint4_1);
+              spv::Id pow2_width = builder_->createUnaryOp(
+                  spv::OpConvertUToF, type_float4_,
+                  builder_->createBinOp(spv::OpShiftLeftLogical, type_uint4_,
+                                        snap_const_uint4_1, width));
+              spv::Id grid_float = builder_->createNoContractionBinOp(
+                  spv::OpFSub, type_float4_, pow2_width, const_float4_1_);
+              // The texel index n from the host's normalized value.
+              spv::Id texel = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float4_, integer_scale_result, grid_float);
+              texel = builder_->createUnaryBuiltinCall(
+                  type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                  texel);
+              // n / (2^w - 1) for narrow lanes.
+              spv::Id snapped_narrow = builder_->createNoContractionBinOp(
+                  spv::OpFDiv, type_float4_, texel, grid_float);
+              // n * (2^w + 1) / 2^(2w) for lanes of 4 bits and more.
+              spv::Id pow2_width_2 = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float4_, pow2_width, pow2_width);
+              spv::Id snapped_guest = builder_->createNoContractionBinOp(
+                  spv::OpFMul, type_float4_, texel,
+                  builder_->createNoContractionBinOp(
+                      spv::OpFDiv, type_float4_,
+                      builder_->createNoContractionBinOp(
+                          spv::OpFAdd, type_float4_, pow2_width,
+                          const_float4_1_),
+                      pow2_width_2));
+              spv::Id lane_is_wide = builder_->createBinOp(
+                  spv::OpFOrdGreaterThanEqual, type_bool4_, pow2_width_2,
+                  builder_->smearScalar(spv::NoPrecision,
+                                        builder_->makeFloatConstant(256.0f),
+                                        type_float4_));
+              return builder_->createTriOp(spv::OpSelect, type_float4_,
+                                           lane_is_wide, snapped_guest,
+                                           snapped_narrow);
+            };
+            auto emit_round_16_bits = [&]() -> spv::Id {
+              spv::Id rounded = builder_->createNoContractionBinOp(
+                  spv::OpVectorTimesScalar, type_float4_, integer_scale_result,
+                  builder_->makeFloatConstant(65536.0f));
+              rounded = builder_->createUnaryBuiltinCall(
+                  type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                  rounded);
+              return builder_->createNoContractionBinOp(
+                  spv::OpVectorTimesScalar, type_float4_, rounded,
+                  builder_->makeFloatConstant(1.0f / 65536.0f));
+            };
+            spv::Id normalized_result;
+            if (snap_to_grid) {
+              spv::Id point_sampled = builder_->createBinOp(
+                  spv::OpINotEqual, type_bool_,
+                  builder_->createBinOp(
+                      spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                      builder_->makeUintConstant(UINT32_C(1) << 25)),
+                  builder_->makeUintConstant(0));
+              SpirvBuilder::IfBuilder if_point_sampled(
+                  point_sampled, spv::SelectionControlMaskNone, *builder_);
+              spv::Id snapped_result = emit_snap_to_grid();
+              if_point_sampled.makeBeginElse();
+              spv::Id rounded_result = emit_round_16_bits();
+              if_point_sampled.makeEndIf();
+              normalized_result = if_point_sampled.createMergePhi(
+                  snapped_result, rounded_result);
+            } else {
+              normalized_result = emit_round_16_bits();
+            }
             if_normalized.makeBeginElse();
             spv::Id const_uint_1 = builder_->makeUintConstant(1);
             id_vector_temp_.clear();
@@ -2661,6 +2820,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                         scale_float)),
                 builder_->createNoContractionBinOp(
                     spv::OpFSub, type_float4_, scale_float, const_float4_1_));
+            // Host decode precision varies, bit replication turns 1/31 into
+            // 8/255 and the scale above into 0.9725. The guest value is an
+            // integer.
+            scaled_result = builder_->createUnaryBuiltinCall(
+                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                scaled_result);
             if_normalized.makeEndIf();
             integer_scale_result_converted =
                 if_normalized.createMergePhi(normalized_result, scaled_result);

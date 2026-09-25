@@ -536,6 +536,17 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  // Whether the fetch can return a single texel: no instruction override to
+  // linear or anisotropic filtering. The fetch constant decides the rest.
+  bool MayBePointSampled(bool use_computed_lod) const {
+    return attributes.mag_filter != xenos::TextureFilter::kLinear &&
+           attributes.min_filter != xenos::TextureFilter::kLinear &&
+           attributes.mip_filter != xenos::TextureFilter::kLinear &&
+           (!use_computed_lod ||
+            attributes.aniso_filter == xenos::AnisoFilter::kDisabled ||
+            attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst);
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(StringBuffer* out) const;
 };

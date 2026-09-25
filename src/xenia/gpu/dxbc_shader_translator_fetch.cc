@@ -759,6 +759,21 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     return;
   }
 
+  // The guest truncates coordinates, so a point sampled fetch returns
+  // floor(coord * size) and agrees with a frac(coord * size) the shader
+  // computes itself (virtual texture page tables, index maps). The host rounds,
+  // and the epsilon below pushes a 1.5/1024 texel band onto the next texel.
+  // Point sampled 2D fetches drop the epsilon and snap to the texel center
+  // instead, which holds under any host rounding and for point mip selection
+  // on power-of-two levels. Bit 26 of the integer scale bits says the fetch
+  // constant is point sampled.
+  bool point_snap = instr.opcode == FetchOpcode::kTextureFetch &&
+                    instr.dimension == xenos::FetchOpDimension::k2D &&
+                    coordinate_dimension == xenos::FetchOpDimension::k2D &&
+                    !instr.attributes.unnormalized_coordinates &&
+                    instr.MayBePointSampled(use_computed_lod);
+  constexpr float rounding_epsilon = 1.5f / 1024.0f;
+
   // Get offsets applied to the coordinates before sampling.
   // `offsets` is used for float4 literal construction,
   // FIXME(Triang3l): Offsets need to be applied at the LOD being fetched, not
@@ -785,7 +800,7 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // sampling apparently round differently, so `mul` gives a value that would
     // be floored as expected, but the left/upper pixel is still sampled
     // instead.
-    constexpr float rounding_offset = 1.5f / 1024.0f;
+    const float rounding_offset = point_snap ? 0.0f : rounding_epsilon;
     switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         offsets[0] = instr.attributes.offset_x + rounding_offset;
@@ -873,6 +888,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // Size needed for normalization (or, for stacked texture layers,
     // denormalization) and for offsets.
     size_needed_components |= offsets_not_zero;
+    if (point_snap) {
+      size_needed_components |= 0b0011;
+    }
     switch (coordinate_dimension) {
       case xenos::FetchOpDimension::k1D:
         // Always need size for 1D textures to handle wide 1D textures
@@ -1802,6 +1820,59 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
         sampler = dxbc::Src::S(0, dxbc::Index(coord_and_sampler_temp, 3));
       }
 
+      if (point_snap) {
+        // Texel center snap, after the gradients so the LOD is unaffected. XY
+        // only, W holds the sampler index.
+        uint32_t point_snap_temp = PushSystemTemp();
+        a_.OpAnd(dxbc::Dest::R(point_snap_temp, 0b0001),
+                 LoadSystemConstant(
+                     SystemConstants::Index::kTextureIntegerScaleBits,
+                     offsetof(SystemConstants, texture_integer_scale_bits) +
+                         sizeof(uint32_t) * tfetch_index,
+                     dxbc::Src::kXXXX),
+                 dxbc::Src::LU(UINT32_C(1) << 26));
+        a_.OpIf(true, dxbc::Src::R(point_snap_temp, dxbc::Src::kXXXX));
+        // Resolution-scaled textures have a finer host grid where the guest
+        // texel center sits on a host texel edge, skip them.
+        bool point_snap_check_scaled =
+            draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
+        if (point_snap_check_scaled) {
+          a_.OpAnd(dxbc::Dest::R(point_snap_temp, 0b0001),
+                   LoadSystemConstant(
+                       SystemConstants::Index::kTexturesResolutionScaled,
+                       offsetof(SystemConstants, textures_resolution_scaled),
+                       dxbc::Src::kXXXX),
+                   dxbc::Src::LU(uint32_t(1) << tfetch_index));
+          a_.OpIf(false, dxbc::Src::R(point_snap_temp, dxbc::Src::kXXXX));
+        }
+        assert_true((size_needed_components & 0b0011) == 0b0011);
+        a_.OpMul(dxbc::Dest::R(point_snap_temp, 0b0011),
+                 dxbc::Src::R(coord_and_sampler_temp),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpRoundNI(dxbc::Dest::R(point_snap_temp, 0b0011),
+                     dxbc::Src::R(point_snap_temp));
+        a_.OpAdd(dxbc::Dest::R(point_snap_temp, 0b0011),
+                 dxbc::Src::R(point_snap_temp), dxbc::Src::LF(0.5f));
+        a_.OpDiv(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                 dxbc::Src::R(point_snap_temp),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        if (point_snap_check_scaled) {
+          a_.OpEndIf();
+        }
+        a_.OpElse();
+        // Filtered, or point through an instruction override, keeps the
+        // epsilon.
+        a_.OpDiv(dxbc::Dest::R(point_snap_temp, 0b0011),
+                 dxbc::Src::LF(rounding_epsilon),
+                 dxbc::Src::R(size_and_is_3d_temp));
+        a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, 0b0011),
+                 dxbc::Src::R(coord_and_sampler_temp),
+                 dxbc::Src::R(point_snap_temp));
+        a_.OpEndIf();
+        // Release point_snap_temp.
+        PopSystemTemp();
+      }
+
       // Break result register dependencies because textures will be sampled
       // conditionally, including the primary signs.
       a_.OpMov(
@@ -2252,10 +2323,62 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
           dxbc::Src::kXXXX);
       // Uniform early out. Zero means leave the sample alone. Only integer
       // num_format on fixed textures has scale bits.
-      a_.OpIf(true, integer_scale_bits_packed);
+      // Bit 26 is the coordinate snap, not a scale.
+      a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
+               dxbc::Src::LU((UINT32_C(1) << 26) - 1));
+      a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
       a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
                dxbc::Src::LU(UINT32_C(1) << 24));
       a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
+      // A point-sampled texel lands on the guest's conversion grid whatever
+      // the host's decode precision is. The guest converts a w-bit texel n as
+      // n * (2^w + 1) / 2^(2w), replicated once into 2w bits over a power of
+      // two, not n / (2^w - 1): 425307EC multiplies 5, 6 and 8 bit page table
+      // texels by 1024/33, 4096/65 and 65536/257 and floors or exponentiates
+      // the result. Lanes under 4 bits keep n / (2^w - 1). Bit 25 says the
+      // fetch constant is point sampled.
+      bool snap_to_grid = instr.MayBePointSampled(use_computed_lod);
+      if (snap_to_grid) {
+        a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
+                 dxbc::Src::LU(UINT32_C(1) << 25));
+        a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
+        // Per-lane 2^width, with width - 1 in bits 0:3 of each 6-bit lane
+        // field (only unsigned lanes get here).
+        a_.OpUBFE(integer_scale_dest, dxbc::Src::LU(4),
+                  dxbc::Src::LU(0, 6, 12, 18), integer_scale_bits_packed);
+        a_.OpIAdd(integer_scale_dest, integer_scale_src, dxbc::Src::LU(1));
+        a_.OpIShL(integer_scale_dest, dxbc::Src::LU(1), integer_scale_src);
+        a_.OpUToF(integer_scale_dest, integer_scale_src);
+        uint32_t snap_temp = PushSystemTemp();
+        dxbc::Dest snap_dest(
+            dxbc::Dest::R(snap_temp, used_result_nonzero_components));
+        dxbc::Src snap_src(dxbc::Src::R(snap_temp));
+        // The texel index n from the host's normalized value.
+        a_.OpAdd(snap_dest, integer_scale_src, dxbc::Src::LF(-1.0f));
+        a_.OpMul(
+            dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+            dxbc::Src::R(system_temp_result_), snap_src);
+        a_.OpRoundNE(
+            dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+            dxbc::Src::R(system_temp_result_));
+        // n / (2^w - 1) for narrow lanes.
+        a_.OpDiv(snap_dest, dxbc::Src::R(system_temp_result_), snap_src);
+        // n * (2^w + 1) / 2^(2w) for lanes of 4 bits and more.
+        a_.OpAdd(integer_scale_flags_dest, integer_scale_src,
+                 dxbc::Src::LF(1.0f));
+        a_.OpMul(integer_scale_dest, integer_scale_src, integer_scale_src);
+        a_.OpDiv(integer_scale_flags_dest, integer_scale_flags_src,
+                 integer_scale_src);
+        a_.OpMul(integer_scale_flags_dest, dxbc::Src::R(system_temp_result_),
+                 integer_scale_flags_src);
+        a_.OpGE(integer_scale_dest, integer_scale_src, dxbc::Src::LF(256.0f));
+        a_.OpMovC(
+            dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+            integer_scale_src, integer_scale_flags_src, snap_src);
+        // Release snap_temp.
+        PopSystemTemp();
+        a_.OpElse();
+      }
       // Round normalized results to 16 fractional bits.
       a_.OpMul(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
@@ -2266,6 +2389,9 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       a_.OpMul(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
           dxbc::Src::R(system_temp_result_), dxbc::Src::LF(1.0f / 65536.0f));
+      if (snap_to_grid) {
+        a_.OpEndIf();
+      }
       a_.OpElse();
       a_.OpUBFE(integer_scale_dest, dxbc::Src::LU(4),
                 dxbc::Src::LU(0, 6, 12, 18), integer_scale_bits_packed);
@@ -2291,6 +2417,11 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
           dxbc::Src::R(system_temp_result_), integer_scale_src,
           integer_scale_flags_src);
+      // Host decode precision varies, bit replication turns 1/31 into 8/255
+      // and the scale above into 0.9725. The guest value is an integer.
+      a_.OpRoundNE(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_));
       a_.OpEndIf();
       a_.OpEndIf();
       PopSystemTemp();

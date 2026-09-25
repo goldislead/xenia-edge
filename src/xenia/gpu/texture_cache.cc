@@ -364,8 +364,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle =
         GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
-    binding.integer_scale_bits = GetIntegerScaleBits(
-        fetch.format, fetch.num_format, fetch.swizzle, binding.swizzled_signs);
+    binding.integer_scale_bits =
+        GetIntegerScaleBits(fetch, binding.swizzled_signs);
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -694,20 +694,28 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
 // last stored channel the same way the host swizzle expands the formats.
 // (k_16 has a 16 bit width in all four components, k_5_6_5 gives blue in W.)
 // Constant (0/1) lanes, gamma, and non-fixed formats have nothing to rescale
-// and stay 0. Bit 24 for normalized fixed fetches.
-uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
-                                           uint32_t num_format,
-                                           uint32_t guest_swizzle,
-                                           uint8_t swizzled_signs) {
-  const FormatInfo& format_info = *FormatInfo::Get(guest_format);
+// and stay 0. Bit 24 for normalized fixed fetches, bit 25 when the fetch
+// constant is also point sampled with a width in every lane (the shader snaps
+// to the guest's conversion grid), bit 26 when it's point sampled at all (the
+// coordinate snap, any format).
+uint32_t TextureCache::GetIntegerScaleBits(
+    const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t swizzled_signs) {
+  const FormatInfo& format_info = *FormatInfo::Get(fetch.format);
   uint32_t scale_bits = 0;
 
+  bool point_sampled = fetch.mag_filter == xenos::TextureFilter::kPoint &&
+                       fetch.min_filter == xenos::TextureFilter::kPoint &&
+                       (fetch.mip_filter == xenos::TextureFilter::kPoint ||
+                        fetch.mip_filter == xenos::TextureFilter::kBaseMap) &&
+                       fetch.aniso_filter == xenos::AnisoFilter::kDisabled;
+  const uint32_t point_bits = point_sampled ? UINT32_C(1) << 26 : 0;
+
   if (!format_info.fixed) {
-    return 0;
+    return point_bits;
   }
 
-  if (!num_format) {
-    return swizzled_signs == kSwizzledSignsUnsigned ? UINT32_C(1) << 24 : 0;
+  if (!fetch.num_format && swizzled_signs != kSwizzledSignsUnsigned) {
+    return point_bits;
   }
 
   uint32_t last_stored_component = 0;
@@ -717,8 +725,9 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
     }
   }
 
+  bool all_lanes_scaled = true;
   for (uint32_t i = 0; i < 4; ++i) {
-    uint32_t source_component = (guest_swizzle >> (i * 3)) & 0b111;
+    uint32_t source_component = (fetch.swizzle >> (i * 3)) & 0b111;
     if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
       continue;
     }
@@ -729,6 +738,7 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
 
     uint8_t width = format_info.component_bits[source_component];
     if (!width || width > 16 || sign == xenos::TextureSign::kGamma) {
+      all_lanes_scaled = false;
       continue;
     }
 
@@ -743,7 +753,16 @@ uint32_t TextureCache::GetIntegerScaleBits(xenos::TextureFormat guest_format,
     scale_bits |= component_scale << (i * 6);
   }
 
-  return scale_bits;
+  if (!fetch.num_format) {
+    // Normalized. Point sampled with a width in every lane snaps to the guest's
+    // conversion grid, anything else only rounds.
+    if (!(point_sampled && all_lanes_scaled)) {
+      return (UINT32_C(1) << 24) | point_bits;
+    }
+    return scale_bits | (UINT32_C(1) << 24) | (UINT32_C(1) << 25) | point_bits;
+  }
+
+  return scale_bits | point_bits;
 }
 
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {

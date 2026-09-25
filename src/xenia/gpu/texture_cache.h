@@ -604,12 +604,11 @@ class TextureCache {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];
   }
-  // Integer num_format on fixed textures. Returns the packed scale used by the
-  // shader to restore guest integer units from normalized host samples.
-  static uint32_t GetIntegerScaleBits(xenos::TextureFormat guest_format,
-                                      uint32_t num_format,
-                                      uint32_t guest_swizzle,
-                                      uint8_t swizzled_signs);
+  // Fixed textures. Returns the packed scale used by the shader to restore
+  // guest integer units from normalized host samples, or snap point sampled
+  // ones to the guest's own conversion grid.
+  static uint32_t GetIntegerScaleBits(
+      const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
   void LoadTexturesData(Texture** textures, uint32_t n_textures);
   // Writes the texture data (for base, mips or both - but not neither) from the
