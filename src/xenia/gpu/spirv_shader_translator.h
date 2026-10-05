@@ -314,10 +314,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     // Packed fixed texture conversion (see GetIntegerScaleBits).
     // Every component occupies 6 bits in bits 0:23
-    //   bits 0:3 = component_bits - 1
-    //   bits 4:5 = xenos::TextureSign
+    // bits 0:3 = component_bits - 1
+    // bits 4:5 = xenos::TextureSign
     // bit 24 = normalized num_format
+    // bit 25 = normalized, some component uses the guest conversion
     // bit 26 = point sampled fetch constant
+    // bits 27:30 = normalized, components that aren't rounded
     // Zero means no conversion.
     uint32_t texture_integer_scale_bits[32];
 

@@ -2404,16 +2404,21 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // Uniform early out. Zero means leave the sample alone. Bit 26 is the
       // coordinate snap, not a scale.
       a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
-               dxbc::Src::LU((UINT32_C(1) << 26) - 1));
+               dxbc::Src::LU(~(UINT32_C(1) << 26)));
       a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
       a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
                dxbc::Src::LU(UINT32_C(1) << 24));
+      a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
+      // Unless some component isn't rounded (bits 27:30) or uses the guest
+      // conversion (bit 25), rounding all of them is the only work.
+      a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
+               dxbc::Src::LU(UINT32_C(0xF) << 27 | UINT32_C(1) << 25));
       a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
       if (instr.AllowsPointSampling(use_computed_lod)) {
         // Reconstruct point sampled 4 to 7 bit unsigned components
         // using the guest conversion (see GetIntegerScaleBits).
         a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
-                 dxbc::Src::LU((UINT32_C(1) << 24) - 1));
+                 dxbc::Src::LU(UINT32_C(1) << 25));
         a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
         // 2^w per component.
         a_.OpUBFE(integer_scale_dest, dxbc::Src::LU(4),
@@ -2444,30 +2449,49 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
             dxbc::Src::R(system_temp_result_));
         a_.OpEndIf();
       }
-      // Only round unsigned normalized components to 16 fractional bits.
+      // Round to 16 fractional bits, except for the components marked in bits
+      // 27:30.
       a_.OpMul(integer_scale_dest, dxbc::Src::R(system_temp_result_),
                dxbc::Src::LF(65536.0f));
       a_.OpRoundNE(integer_scale_dest, integer_scale_src);
       a_.OpMul(integer_scale_dest, integer_scale_src,
                dxbc::Src::LF(1.0f / 65536.0f));
-      a_.OpUBFE(integer_scale_flags_dest, dxbc::Src::LU(2),
-                dxbc::Src::LU(4, 10, 16, 22), integer_scale_bits_packed);
+      a_.OpAnd(integer_scale_flags_dest, integer_scale_bits_packed,
+               dxbc::Src::LU(UINT32_C(1) << 27, UINT32_C(1) << 28,
+                             UINT32_C(1) << 29, UINT32_C(1) << 30));
       a_.OpMovC(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
           integer_scale_flags_src, dxbc::Src::R(system_temp_result_),
           integer_scale_src);
       // Clamp normalized unsigned-biased components to -1. Post-filtering
       // clamping can put mixtures with a stored value of 0 up to one component
-      // code below the result of clamping each texel before.
+      // code below the result of clamping each texel before. Only biased
+      // components set bit 5 of their field here.
       // TODO(boma): Guest clamping needs to be verified on real hardware.
-      a_.OpIEq(integer_scale_flags_dest, integer_scale_flags_src,
-               dxbc::Src::LU(uint32_t(xenos::TextureSign::kUnsignedBiased)));
+      a_.OpAnd(dxbc::Dest::R(signs_temp, 0b0001), integer_scale_bits_packed,
+               dxbc::Src::LU(UINT32_C(0x820820)));
+      a_.OpIf(true, dxbc::Src::R(signs_temp, dxbc::Src::kXXXX));
+      a_.OpAnd(integer_scale_flags_dest, integer_scale_bits_packed,
+               dxbc::Src::LU(UINT32_C(1) << 5, UINT32_C(1) << 11,
+                             UINT32_C(1) << 17, UINT32_C(1) << 23));
       a_.OpMax(integer_scale_dest, dxbc::Src::R(system_temp_result_),
                dxbc::Src::LF(-1.0f));
       a_.OpMovC(
           dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
           integer_scale_flags_src, integer_scale_src,
           dxbc::Src::R(system_temp_result_));
+      a_.OpEndIf();
+      a_.OpElse();
+      a_.OpMul(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_), dxbc::Src::LF(65536.0f));
+      a_.OpRoundNE(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_));
+      a_.OpMul(
+          dxbc::Dest::R(system_temp_result_, used_result_nonzero_components),
+          dxbc::Src::R(system_temp_result_), dxbc::Src::LF(1.0f / 65536.0f));
+      a_.OpEndIf();
       a_.OpElse();
       // Restore integer values with 2^w - 1 for unsigned components
       // and 2^(w - 1) - 1 for signed and unsigned-biased.

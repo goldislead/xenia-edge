@@ -699,10 +699,6 @@ uint32_t TextureCache::GetIntegerScaleBits(
     return scale_bits;
   }
 
-  if (!fetch.num_format) {
-    scale_bits |= UINT32_C(1) << 24;
-  }
-
   uint32_t last_stored_component = 0;
   for (uint32_t i = 1; i < 4; ++i) {
     if (format_info.component_bits[i]) {
@@ -710,6 +706,8 @@ uint32_t TextureCache::GetIntegerScaleBits(
     }
   }
 
+  uint32_t conversion_bits = 0;
+  bool any_rounded = false, any_biased = false;
   for (uint32_t i = 0; i < 4; ++i) {
     uint32_t source_component = (fetch.swizzle >> (i * 3)) & 0b111;
     if (source_component >= xenos::XE_GPU_TEXTURE_SWIZZLE_0) {
@@ -724,26 +722,41 @@ uint32_t TextureCache::GetIntegerScaleBits(
     if (!width || width > 16) {
       continue;
     }
+    uint32_t component_scale = uint32_t(sign) << 4 | uint32_t(width - 1);
+    component_scale <<= i * 6;
 
-    bool carries_width = true;
-    if (sign == xenos::TextureSign::kGamma) {
-      if (fetch.num_format) {
-        continue;
+    if (fetch.num_format) {
+      if (sign != xenos::TextureSign::kGamma) {
+        conversion_bits |= component_scale;
       }
-      carries_width = false;
-    } else if (!fetch.num_format && sign == xenos::TextureSign::kUnsigned) {
-      carries_width = point_sampled && width >= 4 && width <= 7;
+      continue;
     }
-
-    uint32_t component_scale = uint32_t(sign) << 4;
-    if (carries_width) {
-      component_scale |= uint32_t(width - 1);
+    if (sign == xenos::TextureSign::kUnsigned) {
+      any_rounded = true;
+      if (point_sampled && width >= 4 && width <= 7) {
+        conversion_bits |= component_scale | UINT32_C(1) << 25;
+      }
+      continue;
     }
-
-    scale_bits |= component_scale << (i * 6);
+    // Signed, biased and gamma components keep their value. Biased ones carry
+    // their field for the decode and the clamp.
+    conversion_bits |= UINT32_C(1) << (27 + i);
+    if (sign == xenos::TextureSign::kUnsignedBiased) {
+      any_biased = true;
+      conversion_bits |= component_scale;
+    }
   }
 
-  return scale_bits;
+  if (!fetch.num_format) {
+    // Signed and gamma components alone have nothing to convert.
+    if (!any_rounded && !any_biased) {
+      return scale_bits;
+    }
+
+    conversion_bits |= UINT32_C(1) << 24;
+  }
+
+  return scale_bits | conversion_bits;
 }
 
 void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {

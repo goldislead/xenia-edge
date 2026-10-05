@@ -2098,20 +2098,23 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 type_float_, ext_inst_glsl_std_450_, GLSLstd450Floor,
                 builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
                                                    coordinates[i], size[i]));
+            // Both sides of the select are evaluated, share the reciprocal.
+            spv::Id size_rcp = builder_->createNoContractionBinOp(
+                spv::OpFDiv, type_float_, const_float_1_, size[i]);
             snapped = builder_->createNoContractionBinOp(
-                spv::OpFDiv, type_float_,
+                spv::OpFMul, type_float_,
                 builder_->createNoContractionBinOp(
                     spv::OpFAdd, type_float_, snapped,
                     builder_->makeFloatConstant(0.5f)),
-                size[i]);
+                size_rcp);
             coordinates[i] = builder_->createTriOp(
                 spv::OpSelect, type_float_, snap, snapped,
                 builder_->createNoContractionBinOp(
                     spv::OpFAdd, type_float_, coordinates[i],
                     builder_->createNoContractionBinOp(
-                        spv::OpFDiv, type_float_,
+                        spv::OpFMul, type_float_,
                         builder_->makeFloatConstant(kTextureCoordEpsilon),
-                        size[i])));
+                        size_rcp)));
           }
         }
 
@@ -2646,7 +2649,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               spv::OpINotEqual, type_bool_,
               builder_->createBinOp(
                   spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
-                  builder_->makeUintConstant((UINT32_C(1) << 26) - 1)),
+                  builder_->makeUintConstant(~(UINT32_C(1) << 26))),
               const_uint_0_);
           SpirvBuilder::IfBuilder if_integer_scale(
               integer_scale_active, spv::SelectionControlMaskNone, *builder_);
@@ -2660,6 +2663,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 builder_->makeUintConstant(0));
             SpirvBuilder::IfBuilder if_normalized(
                 normalized, spv::SelectionControlMaskNone, *builder_);
+            // Unless some component isn't rounded (bits 27:30) or uses the
+            // guest conversion (bit 25), rounding all of them is the only work.
+            spv::Id per_component = builder_->createBinOp(
+                spv::OpINotEqual, type_bool_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                    builder_->makeUintConstant(UINT32_C(0xF) << 27 |
+                                               UINT32_C(1) << 25)),
+                const_uint_0_);
+            SpirvBuilder::IfBuilder if_per_component(
+                per_component, spv::SelectionControlMaskNone, *builder_);
             spv::Id normalized_result = integer_scale_result;
             if (instr.AllowsPointSampling(use_computed_lod)) {
               // Reconstruct point sampled 4 to 7 bit unsigned components
@@ -2668,7 +2682,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   spv::OpINotEqual, type_bool_,
                   builder_->createBinOp(
                       spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
-                      builder_->makeUintConstant((UINT32_C(1) << 24) - 1)),
+                      builder_->makeUintConstant(UINT32_C(1) << 25)),
                   const_uint_0_);
               SpirvBuilder::IfBuilder if_grid(
                   has_grid, spv::SelectionControlMaskNone, *builder_);
@@ -2737,7 +2751,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               normalized_result =
                   if_grid.createMergePhi(snapped, integer_scale_result);
             }
-            // Only round unsigned normalized components to 16 fractional bits.
+            // Round to 16 fractional bits, except for the components marked in
+            // bits 27:30.
             spv::Id rounded_result = builder_->createNoContractionBinOp(
                 spv::OpVectorTimesScalar, type_float4_, normalized_result,
                 builder_->makeFloatConstant(65536.0f));
@@ -2747,46 +2762,72 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             rounded_result = builder_->createNoContractionBinOp(
                 spv::OpVectorTimesScalar, type_float4_, rounded_result,
                 builder_->makeFloatConstant(1.0f / 65536.0f));
+            spv::Id integer_scale_bits_vector = builder_->smearScalar(
+                spv::NoPrecision, integer_scale_bits_packed, type_uint4_);
             id_vector_temp_.clear();
             for (uint32_t i = 0; i < 4; ++i) {
-              id_vector_temp_.push_back(builder_->makeUintConstant(i * 6 + 4));
+              id_vector_temp_.push_back(
+                  builder_->makeUintConstant(UINT32_C(1) << (27 + i)));
             }
-            spv::Id lane_signs = builder_->createBinOp(
-                spv::OpBitwiseAnd, type_uint4_,
-                builder_->createBinOp(
-                    spv::OpShiftRightLogical, type_uint4_,
-                    builder_->smearScalar(spv::NoPrecision,
-                                          integer_scale_bits_packed,
-                                          type_uint4_),
-                    builder_->makeCompositeConstant(type_uint4_,
-                                                    id_vector_temp_)),
-                builder_->smearScalar(spv::NoPrecision,
-                                      builder_->makeUintConstant(3),
-                                      type_uint4_));
             normalized_result = builder_->createTriOp(
                 spv::OpSelect, type_float4_,
-                builder_->createBinOp(spv::OpIEqual, type_bool4_, lane_signs,
-                                      const_uint4_0_),
-                rounded_result, normalized_result);
+                builder_->createBinOp(
+                    spv::OpINotEqual, type_bool4_,
+                    builder_->createBinOp(spv::OpBitwiseAnd, type_uint4_,
+                                          integer_scale_bits_vector,
+                                          builder_->makeCompositeConstant(
+                                              type_uint4_, id_vector_temp_)),
+                    const_uint4_0_),
+                normalized_result, rounded_result);
             // Clamp normalized unsigned-biased components to -1. Post-filtering
             // clamping can put mixtures with a stored value of 0 up to one
             // component code below the result of clamping each texel before.
+            // Only biased components set bit 5 of their field here.
             // TODO(boma): Guest clamping needs to be verified on real hardware.
-            normalized_result = builder_->createTriOp(
+            spv::Id any_biased = builder_->createBinOp(
+                spv::OpINotEqual, type_bool_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                    builder_->makeUintConstant(UINT32_C(0x820820))),
+                const_uint_0_);
+            SpirvBuilder::IfBuilder if_biased(
+                any_biased, spv::SelectionControlMaskNone, *builder_);
+            id_vector_temp_.clear();
+            for (uint32_t i = 0; i < 4; ++i) {
+              id_vector_temp_.push_back(
+                  builder_->makeUintConstant(UINT32_C(1) << (i * 6 + 5)));
+            }
+            spv::Id clamped_result = builder_->createTriOp(
                 spv::OpSelect, type_float4_,
                 builder_->createBinOp(
-                    spv::OpIEqual, type_bool4_, lane_signs,
-                    builder_->smearScalar(
-                        spv::NoPrecision,
-                        builder_->makeUintConstant(
-                            uint32_t(xenos::TextureSign::kUnsignedBiased)),
-                        type_uint4_)),
+                    spv::OpINotEqual, type_bool4_,
+                    builder_->createBinOp(spv::OpBitwiseAnd, type_uint4_,
+                                          integer_scale_bits_vector,
+                                          builder_->makeCompositeConstant(
+                                              type_uint4_, id_vector_temp_)),
+                    const_uint4_0_),
                 builder_->createBinBuiltinCall(
                     type_float4_, ext_inst_glsl_std_450_, GLSLstd450FMax,
                     normalized_result,
                     builder_->smearScalar(spv::NoPrecision, const_float_minus_1,
                                           type_float4_)),
                 normalized_result);
+            if_biased.makeEndIf();
+            normalized_result =
+                if_biased.createMergePhi(clamped_result, normalized_result);
+            if_per_component.makeBeginElse();
+            spv::Id all_rounded_result = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, integer_scale_result,
+                builder_->makeFloatConstant(65536.0f));
+            all_rounded_result = builder_->createUnaryBuiltinCall(
+                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                all_rounded_result);
+            all_rounded_result = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, all_rounded_result,
+                builder_->makeFloatConstant(1.0f / 65536.0f));
+            if_per_component.makeEndIf();
+            normalized_result = if_per_component.createMergePhi(
+                normalized_result, all_rounded_result);
             if_normalized.makeBeginElse();
             spv::Id const_uint_1 = builder_->makeUintConstant(1);
             id_vector_temp_.clear();

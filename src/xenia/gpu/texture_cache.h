@@ -606,8 +606,7 @@ class TextureCache {
   // samples of fixed formats to guest values. It's applied after signs/gamma,
   // before exp_adjust. Bits 0:23 hold four 6 bit fields: 0:3 contain the
   // component bit count minus 1 when needed, and bits 4:5 contain TextureSign.
-  // Constant 0/1 components and non-fixed formats have no scale. Gamma
-  // components only store TextureSign for normalized num_format.
+  // Constant 0/1 & gamma components, and non-fixed formats have no scale.
   //
   // Bit count w comes from FormatInfo for the source selected by the guest
   // swizzle, clamped to the last stored component, as with the host swizzle.
@@ -632,6 +631,9 @@ class TextureCache {
   // expect that precision when comparing filtered samples, and their SSAO masks
   // break without it. Signed components aren't rounded since no title depending
   // on that has been identified.
+  //
+  // Bits 27:30 mark the components that aren't rounded, and bit 25 is set when
+  // a component uses the conversion below.
   //
   // 425307EC's point sampled k_5_6_5 page table stores physical page x/y and
   // log2 of the mip width in pages. The shader multiplies by 1024/33 and
