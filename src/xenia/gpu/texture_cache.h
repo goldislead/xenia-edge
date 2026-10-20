@@ -637,8 +637,8 @@ class TextureCache {
   // log2 of the mip width in pages. The shader multiplies by 1024/33 and
   // 4096/65 (65536/257 for the 8 bit variant), then floors the coordinates
   // and applies exp2 to the mip field. Those constants support repeating the
-  // 5 and 6 bit components twice, giving n * (2^w + 1) / 2^(2w). 4 and 7 bit
-  // cases are extrapolated from this. The same page table calculation can be
+  // 5 and 6 bit components twice, giving n * (2^w + 1) / 2^(2w), and the 4 bit
+  // case is extrapolated from this. The same page table calculation can be
   // seen in appendix A.6 of id Software's Software Virtual Textures (2012),
   // with these 5 and 6 bit factors for RADEON_X1900 and a separate conversion
   // for GEFORCE_7800.
@@ -656,12 +656,12 @@ class TextureCache {
   // results in texture seams in 425307EC, more noticeably on AMD.
   //
   // TODO(boma): 1 and 2 bit unsigned components still need testing on real
-  // hardware. The 4 and 7 bit conversions are merely extrapolated from 5 and
-  // 6 bit cases right now. Repeating the bits twice never gets to 1.0, so
-  // 4 to 7 bit maximum values need checking too. Q16 rounding also needs
-  // testing, including whether it should apply to signed components. We also
-  // need to compare coordinate rounding for unnormalized, 3D, and cube point
-  // fetches between real hardware and different GPUs.
+  // hardware. The 4 bit conversion is merely extrapolated from 5 and 6 bit
+  // cases right now. Repeating the bits twice never gets to 1.0, so the 4 to 6
+  // bit maximum values need checking too. Q16 rounding also needs testing,
+  // including whether it should apply to signed components. We also need to
+  // compare coordinate rounding for unnormalized, 3D, and cube point fetches
+  // between real hardware and different GPUs.
   static uint32_t GetIntegerScaleBits(
       const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t swizzled_signs);
   bool LoadTextureData(Texture& texture);
